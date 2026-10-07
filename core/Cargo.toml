@@ -1,0 +1,10 @@
+[package]
+name = "worldcore"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+png = "0.17"
