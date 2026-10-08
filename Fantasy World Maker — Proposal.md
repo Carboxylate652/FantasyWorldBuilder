@@ -207,8 +207,9 @@ Nations come after cultures, and read them as input. The finished culture map is
 
 - **Polity formation:** from a set era, dense and well-connected clusters of bands found polities. The polity slot on each band is filled, and a capital province is picked by population and site value.
 - **Timeline:** Stage 4 runs on its own clock in years, not generations, from polity formation up to a **start date** chosen between 1910 and 1920 (default 1914). Eras unlock tools along the way: gunpowder states, ocean shipping, then railways and industrial mining in the last century before the start date.
-- **Ownership is per province:** a nation's border can cut through a Stage 2 state, so one state can be split between several nations, like Victoria 3's split states. States stay as geographic units and are never redrawn by Stage 4.
+- **Ownership is per province:** a nation's border can cut through a Stage 2 state, so one state can be split between several nations, like Victoria 3's split states. As in EU4, a nation's territory does not have to be connected: exclaves and detached territories (overseas colonies, a city held across a border) are allowed. States stay as geographic units and are never redrawn by Stage 4.
 - **Expansion and collapse:** polities grow over the province graph at a cost that rises with barriers, distance from the capital and cultural distance. Large, culturally mixed polities have a chance to break apart along culture lines.
+- **Railways:** in the industrial era, nations lay rail lines between their largest settlements along the cheapest land route (the same barrier-aware cost as Stage 2), with stations where lines meet or where a route needs water. Stations raise the carrying capacity around them, which is what grows railway towns in the desert. Output: `railways.csv` (line ID, owner, station provinces in order) and a `railways.png` reference layer.
 - **Feedback on culture:** while Stage 4 runs, contact inside one polity counts for more, so cultures slowly converge within borders. This is the only way Stage 4 changes culture, and locked cultures are exempt.
 - **Output:** owner per province at a chosen start date, a capital per nation, `nations.csv` (ID, name, primary culture, colour, capital) and a dated event log of foundings, conquests and splits for lore writing.
 
@@ -224,7 +225,8 @@ All hand editing comes together in one editor at the end, in the style of the in
 | States, regions | Paint, merge, split, re-group into regions and continents, rename, recolour |
 | Sites | Place, move or remove site pins with a target population |
 | Cultures | Merge (traits averaged by population, or as siblings under one group); split automatically (community detection into 2–n parts) or by line, lasso or province pick; paint; re-parent in the family tree; rename or regenerate names from the phonology; lock |
-| Nations | Paint ownership, set capital, merge, release a nation from another, rename, recolour, lock |
+| Nations | Paint ownership (exclaves allowed), set capital, merge, release a nation from another, rename, recolour, lock |
+| Railways | Add, move or delete stations; draw, reroute or delete rail lines between stations (snapped to the province graph); set the opening year of a line; lock a line so re-running Stage 4 keeps it |
 | All | Undo and redo; inspector panel for the hovered province; **continue sim** from the edited state, so edits become the new starting point |
 
 ## Suggested additions
@@ -252,7 +254,7 @@ There are seven milestones, each ending in something you can use and a pass/fail
 4. **M3 — States, provinces, export/import:** *Done when:* the exported package matches the CK3/Vic3-style layout, and an edit made in GIMP passes validation on re-import. Groundwater and the static site value land here as an addition to the habitability step.
 5. **M4 — Culture simulation:** includes the era-gated site bonuses and resources. *Done when:* 5,000 bands run 400 ticks in about a minute and give stable culture groups, and on an Earth-like test map at least one desert spring or route waypoint far from any river grows a settlement.
 6. **M5 — Nations and history:** *Done when:* a run gives nations whose borders mostly follow culture groups and barriers, the event log replays to the same final map, and re-running Stage 4 never changes a locked culture.
-7. **M6 — World editor and polish:** one editor for provinces, states, sites, cultures and nations; undo; continue sim. *Done when:* every layer can be edited, every edit survives re-running all four stages, and the edited world exports and re-imports cleanly.
+7. **M6 — World editor and polish:** one editor for provinces, states, sites, cultures, nations and railways; undo; continue sim. *Done when:* every layer can be edited, every edit survives re-running all four stages, and the edited world exports and re-imports cleanly.
 
 ## Risks
 
@@ -270,5 +272,5 @@ There are seven milestones, each ending in something you can use and a pass/fail
 - Is the recommended stack (Rust + Tauri + TypeScript) OK, or do you prefer one engine such as Godot? Resolved: Rust + Tauri + TypeScript, as built in M0–M3.
 - Flat export projection: equirectangular, or something like Miller that is kinder at high latitudes? Resolved: equirectangular with an optional latitude crop, as built.
 - Will nations or history come after cultures? Resolved: yes, as Stage 4. Bands carry an empty polity slot from M4 so the same simulation can continue into nations.
-- Can a nation's border cut through a Stage 2 state? Resolved: yes. Ownership is stored per province, and a state can be split between nations.
+- Can a nation's border cut through a Stage 2 state? Resolved: yes. Ownership is stored per province, a state can be split between nations, and exclaves are allowed, as in EU4.
 - How far should history run? Resolved: up to a start date between 1910 and 1920 (default 1914), so the exported map is an early-20th-century start in the spirit of Victoria 3's late game or HOI4's opening.
