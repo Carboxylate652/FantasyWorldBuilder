@@ -52,6 +52,10 @@ pub enum Tool {
     // that starts on a pin moves it; erase removes the nearest pin.
     BandPin,
     BandErase,
+    // Attraction (culture simulation only): value +1 draws people (a
+    // metropolis), −1 drives them away (a ghost town); erase removes it.
+    Attraction,
+    AttractionErase,
     // Settlement site pin (step 8): a town no model explains (a gambling city,
     // an oil port). The stroke's first point places it; `value` is the
     // population it should reach.
@@ -71,6 +75,7 @@ impl Tool {
             Tool::SitePin => EditLayer::Sites,
             Tool::FertilityPaint | Tool::FertilityErase => EditLayer::Fertility,
             Tool::BandPin | Tool::BandErase => EditLayer::Bands,
+            Tool::Attraction | Tool::AttractionErase => EditLayer::Attraction,
         }
     }
 }
@@ -88,6 +93,7 @@ pub enum EditLayer {
     Sites,
     Fertility,
     Bands,
+    Attraction,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -175,6 +181,7 @@ pub struct Overrides {
     pub sites: Vec<Stroke>,
     pub fertility: Vec<Stroke>,
     pub bands: Vec<Stroke>,
+    pub attraction: Vec<Stroke>,
 }
 
 /// How heightmap pixel values map to metres.
@@ -242,6 +249,7 @@ impl Edits {
             EditLayer::Sites => self.overrides.sites.push(s),
             EditLayer::Fertility => self.overrides.fertility.push(s),
             EditLayer::Bands => self.add_band_pin(s),
+            EditLayer::Attraction => self.overrides.attraction.push(s),
         }
     }
 
@@ -283,6 +291,7 @@ impl Edits {
             EditLayer::Sites => self.overrides.sites.clear(),
             EditLayer::Fertility => self.overrides.fertility.clear(),
             EditLayer::Bands => self.overrides.bands.clear(),
+            EditLayer::Attraction => self.overrides.attraction.clear(),
         }
     }
 }

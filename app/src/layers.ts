@@ -147,7 +147,7 @@ export type Legend = { title: string; items?: LegendItem[]; gradient?: { stops: 
 export type LayerId =
   | 'sketch' | 'plates' | 'crust' | 'boundaries' | 'elevation' | 'temperature' | 'precipitation'
   | 'continentality' | 'currents' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress'
-  | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population';
+  | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population' | 'attraction';
 
 export type LayerDef = {
   id: LayerId;
@@ -184,6 +184,7 @@ export const LAYERS: LayerDef[] = [
   { id: 'resources', label: 'Trade goods', fields: ['trade_good', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'cultures', label: 'Cultures', fields: ['culture', 'culture_group', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'culture_groups', label: 'Culture groups', fields: ['culture_group', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
+  { id: 'attraction', label: 'Attraction', fields: ['attraction', 'population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'population', label: 'Population density', fields: ['population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
 ];
 
@@ -478,6 +479,20 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
         { color: [20, 20, 20], label: 'Group border' },
         ...(id === 'cultures' ? [{ color: [90, 90, 90] as RGB, label: 'Thin line: culture border' }] : []),
         { color: [150, 146, 138], label: 'Unsettled land' },
+      ] };
+      break;
+    }
+    case 'attraction': {
+      const at = f['attraction'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const a = at ? at[i] : 0;
+        const c: RGB = a > 0 ? mix([200, 196, 186], [230, 150, 20], a) : mix([200, 196, 186], [90, 90, 160], -a);
+        put(i, c, 0.85 + 0.15 * sh(i));
+      }
+      legend = { title: 'Attraction (culture simulation)', items: [
+        { color: [230, 150, 20], label: 'Draws people (metropolis)' }, { color: [200, 196, 186], label: 'Neutral' }, { color: [90, 90, 160], label: 'Drives people away (ghost town)' },
       ] };
       break;
     }

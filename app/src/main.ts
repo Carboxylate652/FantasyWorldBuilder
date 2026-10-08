@@ -25,7 +25,7 @@ type Status = {
     elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_strokes: number; pins: any[]; arrows: any[];
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
     site_pins: number; sites: { lat: number; lon: number; population: number }[];
-    fertility_strokes: number; band_pins: { lat: number; lon: number; bands: number }[];
+    fertility_strokes: number; attraction_strokes: number; band_pins: { lat: number; lon: number; bands: number }[];
   };
   grid: { level: number; cells: number; spacing_km: number };
   path: string | null;
@@ -203,7 +203,7 @@ function stepOfLayer(id: LayerId): string {
     currents: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
     habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
     resources: 'Provinces',
-    cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures',
+    cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures', attraction: 'Cultures',
   };
   return m[id];
 }
@@ -800,7 +800,9 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
         ? `${pins.length} founding-band pins (${pins.reduce((a, b) => a + b.bands, 0)} bands) replace the random founders.`
         : `Random founders (hollow circles on the map). Pin them to move or resize them.`),
         !pins.length && founders.length ? h('button', { class: 'small', onclick: () => pinFounders(founders) }, 'Pin these') : null,
-        h('button', { class: 'small', disabled: !pins.length, onclick: () => mutate('clear_layer', { layer: 'bands' }, 'cultures') }, 'Clear pins')));
+        h('button', { class: 'small', disabled: !pins.length, onclick: () => mutate('clear_layer', { layer: 'bands' }, 'cultures') }, 'Clear pins')),
+      h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, `${e.attraction_strokes} attraction strokes`),
+        h('button', { class: 'small', disabled: !e.attraction_strokes, onclick: () => mutate('clear_layer', { layer: 'attraction' }, 'cultures') }, 'Clear attraction')));
   }
   if (ui.key === 'provinces') {
     const imp = e.province_import;
@@ -1112,9 +1114,9 @@ function renderToolbar() {
   const val = S.toolValue[t.id] ?? t.defaultValue ?? 0;
   const setVal = (v: number) => (S.toolValue[t.id] = v);
   if (t.value === 'metres') bb.append(h('label', {}, h('span', {}, S.tool === 'flatten' ? 'Target (m)' : 'Amount (m)'), h('input', { type: 'number', step: 50, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
-  if (t.value === 'fertility') {
+  if (t.value === 'fertility' || t.value === 'attraction') {
     const out = h('b', {}, (val > 0 ? '+' : '') + val.toFixed(2));
-    bb.append(h('label', {}, h('span', {}, 'Fertility (− barren, + fertile)'), h('input', { type: 'range', min: -1, max: 1, step: 0.05, value: val, oninput: (e: Event) => {
+    bb.append(h('label', {}, h('span', {}, t.value === 'fertility' ? 'Fertility (− barren, + fertile)' : 'Attraction (− ghost town, + metropolis)'), h('input', { type: 'range', min: -1, max: 1, step: 0.05, value: val, oninput: (e: Event) => {
       const v = Number((e.target as HTMLInputElement).value);
       setVal(v);
       out.textContent = (v > 0 ? '+' : '') + v.toFixed(2);

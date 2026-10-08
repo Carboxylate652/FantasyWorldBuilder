@@ -8,6 +8,10 @@
 //!   pin starts its number of bands in its province, all with the same
 //!   traits (one people), so a large pin gives a major origin and a small one
 //!   a minor one.
+//! - **Attraction** (a brush, −1 to +1) acts on the simulation alone: an
+//!   attractive province holds up to 5× the people and draws new bands and
+//!   migrants (a metropolis); a repellent one holds as few as none and is
+//!   shunned (a ghost town). Site pins still set their own population.
 //! - **Bands** are groups of people with a home province, a population, a
 //!   vector of cultural traits (Axelrod's model) and an empty polity slot that
 //!   Stage 4 will fill.
@@ -268,6 +272,34 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let mut capacity = base_capacity.clone();
     // Site pins: the province holding each pin and the population it should reach.
     let prov_field = ctx.input.u32("province");
+    // Attraction paint, per cell and as a mean per province.
+    let mut attr_cell = vec![0.0f32; ctx.grid.len()];
+    let mut attr = vec![0.0f64; np];
+    if !ctx.edits.overrides.attraction.is_empty() {
+        let mut scratch = Vec::new();
+        for s in &ctx.edits.overrides.attraction {
+            for (c, w) in crate::edits::stroke_coverage(ctx.grid, s, r_km, &mut scratch) {
+                let c = c as usize;
+                match s.tool {
+                    crate::edits::Tool::Attraction => attr_cell[c] = (attr_cell[c] + (s.value.clamp(-1.0, 1.0) * w as f64) as f32).clamp(-1.0, 1.0),
+                    crate::edits::Tool::AttractionErase => attr_cell[c] *= 1.0 - w,
+                    _ => {}
+                }
+            }
+        }
+        let mut cells = vec![0u32; np];
+        for (i, id) in prov_field.iter().enumerate() {
+            if let Some(&p) = index.get(id) {
+                attr[p] += attr_cell[i] as f64;
+                cells[p] += 1;
+            }
+        }
+        for p in 0..np {
+            attr[p] /= cells[p].max(1) as f64;
+        }
+    }
+    // Capacity multiplier: ×5 at +1, ×0 at −1.
+    let pull: Vec<f64> = attr.iter().map(|&a| if a >= 0.0 { 1.0 + 4.0 * a } else { (1.0 + a).powi(2) }).collect();
     let mut pin_pop = vec![0.0f64; np];
     for pin in ctx.input.meta("sites")["pins"].as_array().unwrap_or(&empty) {
         let cell = pin["cell"].as_u64().unwrap_or(0) as usize;
@@ -408,6 +440,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                     }
                     k = k.max(irr);
                 }
+                k *= pull[p];
                 if era >= 3 && pin_pop[p] > 0.0 {
                     k = k.max(pin_pop[p]);
                     why[p] |= 8;
@@ -481,7 +514,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 let q = q as usize;
                 let room = capacity[q] - pnow[q];
                 if room > 0.0 && q != p {
-                    let s = room * (-(c as f64) / scale).exp() * (0.5 + 0.5 * rng.f64());
+                    let s = room * (-(c as f64) / scale).exp() * (0.5 + 0.5 * rng.f64()) * (1.0 + attr[q]);
                     if s > any.0 {
                         any = (s, q);
                     }
@@ -795,6 +828,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 "id": provs[p].id, "name": prov_names[p], "population": total.round(),
                 "density_km2": (total / provs[p].area.max(1.0) * 100.0).round() / 100.0,
                 "culture": prov_major[p], "shares": shares, "growth": growth,
+                "attraction": (attr[p] * 100.0).round() / 100.0,
             })
         })
         .collect();
@@ -845,6 +879,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     f.put("culture", Field::U16(f_cult));
     f.put("culture_group", Field::U16(f_group));
     f.put("population", Field::F32(f_pop));
+    f.put("attraction", Field::F32(attr_cell));
     StepOutput {
         fields: f,
         meta: serde_json::json!({
@@ -1258,6 +1293,7 @@ fn empty_output(n: usize) -> StepOutput {
     f.put("culture", Field::U16(vec![0; n]));
     f.put("culture_group", Field::U16(vec![0; n]));
     f.put("population", Field::F32(vec![0.0; n]));
+    f.put("attraction", Field::F32(vec![0.0; n]));
     StepOutput {
         fields: f,
         meta: serde_json::json!({ "cultures": 0, "groups": 0, "bands": 0, "population": 0, "table": { "cultures": [], "groups": [], "events": [], "provinces": [], "states": [] } }),

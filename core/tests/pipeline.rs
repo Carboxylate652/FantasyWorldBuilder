@@ -441,3 +441,36 @@ fn map_editor_and_founders() {
     w.edits.add_stroke(stroke(Tool::BandErase, vec![pt(far)], 0.0, ""));
     assert_eq!(w.edits.overrides.bands.len(), 1);
 }
+
+/// Attraction paint: a metropolis province ends with more people than without
+/// it, a ghost-town province with almost none, and states and provinces stay
+/// the same (attraction acts on the culture simulation only).
+#[test]
+fn attraction_makes_metropolis_and_ghost_town() {
+    use worldcore::edits::{Stroke, Tool};
+    let mut p = WorldParams::default();
+    p.planet.seed = 4;
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 150;
+    let mut w = World::new(p);
+    w.run_to(LAST, &|_, _, _| {});
+    let pop = |w: &World| -> std::collections::HashMap<u64, f64> {
+        w.meta(Step::Cultures).unwrap()["table"]["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["population"].as_f64().unwrap())).collect()
+    };
+    let before = pop(&w);
+    let provs = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().clone();
+    // Two settled land provinces far apart.
+    let settled: Vec<&serde_json::Value> = provs.iter().filter(|p| p["kind"] == "land" && before.get(&p["id"].as_u64().unwrap()).copied().unwrap_or(0.0) > 1000.0).collect();
+    let (a, b) = (settled[0], settled[settled.len() / 2]);
+    let ll = |p: &serde_json::Value| [p["center"][0].as_f64().unwrap(), p["center"][1].as_f64().unwrap()];
+    let brush = |v: f64, at: [f64; 2]| Stroke { tool: Tool::Attraction, value: v, radius_km: 400.0, hardness: 0.9, points: vec![at], ..Default::default() };
+    w.edits.add_stroke(brush(1.0, ll(a)));
+    w.edits.add_stroke(brush(-1.0, ll(b)));
+    assert!(w.is_fresh(Step::Provinces) && !w.is_fresh(Step::Cultures), "attraction only invalidates cultures");
+    w.run_to(LAST, &|_, _, _| {});
+    let after = pop(&w);
+    let (ia, ib) = (a["id"].as_u64().unwrap(), b["id"].as_u64().unwrap());
+    assert!(after[&ia] > 1.5 * before[&ia], "metropolis: {} -> {}", before[&ia], after[&ia]);
+    assert!(after[&ib] < 0.2 * before[&ib], "ghost town: {} -> {}", before[&ib], after[&ib]);
+}

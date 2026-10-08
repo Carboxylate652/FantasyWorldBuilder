@@ -20,6 +20,7 @@ export type ToolId =
   | 'raise' | 'lower' | 'smooth' | 'flatten' | 'biome_paint' | 'biome_erase'
   | 'barrier_paint' | 'barrier_erase' | 'site_pin' | 'state_paint' | 'province_paint'
   | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase'
+  | 'attraction' | 'attraction_erase'
   | 'goods_paint' | 'province_merge' | 'state_merge' | 'province_to_state' | 'rename_province' | 'rename_state';
 
 export type ToolDef = {
@@ -29,7 +30,7 @@ export type ToolDef = {
   step: string; // step the edit belongs to (auto-run target)
   rust?: string; // core Tool name when it differs from the id
   scatter?: boolean; // noisy natural edge (scatter brush)
-  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people' | 'fertility' | 'bands' | 'goods';
+  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people' | 'fertility' | 'bands' | 'goods' | 'attraction';
   /** Click (or drag from a start to an end point) instead of painting with a brush. */
   gesture?: 'point' | 'link';
   /** Asks for a name when used. */
@@ -63,6 +64,8 @@ export const TOOLS: ToolDef[] = [
   { id: 'fertility_erase', label: 'Erase fertility', step: 'habitability', hint: 'Remove fertility paint under the brush.' },
   { id: 'band_pin', label: 'Founding band', key: 'j', step: 'cultures', gesture: 'link', value: 'bands', defaultValue: 3, hint: 'Click to place a founding people with this many bands (all one culture): more bands give a bigger head start. Drag from a pin to move it. Pins replace the random founders.' },
   { id: 'band_erase', label: 'Remove founder', step: 'cultures', gesture: 'point', hint: 'Click near a founding-band pin to remove it.' },
+  { id: 'attraction', label: 'Attraction', key: 'h', step: 'cultures', value: 'attraction', defaultValue: 0.8, hint: 'Paint where people are drawn (+, up to 5× as many: a metropolis) or driven away (−, down to none: a ghost town) during the culture simulation. States and provinces stay as they are.' },
+  { id: 'attraction_erase', label: 'Erase attraction', step: 'cultures', hint: 'Remove attraction paint under the brush.' },
   { id: 'goods_paint', label: 'Paint goods', key: 'q', step: 'provinces', value: 'goods', defaultValue: 1, hint: 'Provinces under the brush get this trade good, or gain or lose a deposit.' },
   { id: 'province_merge', label: 'Merge provinces', key: 'u', step: 'provinces', gesture: 'link', hint: 'Drag from a province (an island, a sliver) onto the province that should absorb it.' },
   { id: 'state_merge', label: 'Merge states', step: 'states', gesture: 'link', hint: 'Drag from a state onto the state that should absorb it.' },
@@ -252,7 +255,7 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'cultures', title: 'Cultures', layer: 'cultures', tools: ['band_pin', 'band_erase'],
+    key: 'cultures', title: 'Cultures', layer: 'cultures', tools: ['band_pin', 'band_erase', 'attraction', 'attraction_erase'],
     blurb: 'Bands of people spread over the provinces, grow, split and meet. Contact makes them alike, isolation and drift make them differ; where contact stays rare, cultures split. Groups are cultures that stay in touch.',
     params: [
       p('cultures', 'ticks', 'Generations', 20, 2000, 10, 'One generation is a tick of the simulation.'),
