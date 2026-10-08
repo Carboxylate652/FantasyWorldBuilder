@@ -280,7 +280,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     }
 
     // ------------------------------------------------------------ names & fields
-    let langs: Vec<Lang> = (0..n_cont as u64).map(|c| Lang::new(seed, c + 1)).collect();
+    let langs: Vec<Lang> = (0..n_cont as u32).map(|c| names::continent_lang(seed, c)).collect();
     let mut rng = Rng::new(seed, stream::NAMES);
     let mut used = HashSet::new();
     let cont_names: Vec<String> = langs.iter().map(|l| l.unique(&mut rng, &mut used)).collect();
@@ -288,9 +288,13 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     for &r in &region_order {
         region_names[r as usize] = langs[region_cont[r as usize] as usize].unique(&mut rng, &mut used);
     }
+    // States speak their region's dialect.
+    let dialects: Vec<Lang> = (0..region_cont.len()).map(|r| names::region_lang(seed, region_cont[r], region_id[r])).collect();
     let mut state_names = vec![String::new(); count];
     for &s in &state_order {
-        state_names[s as usize] = langs[s_cont[s as usize] as usize].unique(&mut rng, &mut used);
+        let r = s_region[s as usize];
+        let lang = if r == NONE { &langs[s_cont[s as usize] as usize] } else { &dialects[r as usize] };
+        state_names[s as usize] = lang.unique(&mut rng, &mut used);
     }
 
     let mut f_state = vec![0u16; n];

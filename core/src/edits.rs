@@ -31,6 +31,10 @@ pub enum Tool {
     // state or province that grows over the painted cells.
     StatePaint,
     ProvincePaint,
+    // Settlement site pin (step 8): a town no model explains (a gambling city,
+    // an oil port). The stroke's first point places it; `value` is the
+    // population it should reach.
+    SitePin,
 }
 
 impl Tool {
@@ -43,6 +47,7 @@ impl Tool {
             Tool::BarrierPaint | Tool::BarrierErase => EditLayer::Barriers,
             Tool::StatePaint => EditLayer::States,
             Tool::ProvincePaint => EditLayer::Provinces,
+            Tool::SitePin => EditLayer::Sites,
         }
     }
 }
@@ -57,6 +62,7 @@ pub enum EditLayer {
     Barriers,
     States,
     Provinces,
+    Sites,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -138,6 +144,7 @@ pub struct Overrides {
     pub barriers: Vec<Stroke>,
     pub states: Vec<Stroke>,
     pub provinces: Vec<Stroke>,
+    pub sites: Vec<Stroke>,
 }
 
 /// How heightmap pixel values map to metres.
@@ -202,6 +209,7 @@ impl Edits {
             EditLayer::Barriers => self.overrides.barriers.push(s),
             EditLayer::States => self.overrides.states.push(s),
             EditLayer::Provinces => self.overrides.provinces.push(s),
+            EditLayer::Sites => self.overrides.sites.push(s),
         }
     }
     pub fn clear_layer(&mut self, layer: EditLayer) {
@@ -217,6 +225,7 @@ impl Edits {
             EditLayer::Barriers => self.overrides.barriers.clear(),
             EditLayer::States => self.overrides.states.clear(),
             EditLayer::Provinces => self.overrides.provinces.clear(),
+            EditLayer::Sites => self.overrides.sites.clear(),
         }
     }
 }

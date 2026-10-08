@@ -70,6 +70,8 @@ impl Session {
                 "barrier_strokes": e.overrides.barriers.len(),
                 "state_strokes": e.overrides.states.len(),
                 "province_strokes": e.overrides.provinces.len(),
+                "site_pins": e.overrides.sites.len(),
+                "sites": e.overrides.sites.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "population": s.value }))).collect::<Vec<_>>(),
                 "elevation_import": e.imports.elevation,
                 "province_import": e.imports.provinces,
             },
@@ -356,8 +358,17 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
         "political" => {
             // States, regions, continents, provinces and straits of the latest run
             // (provinces when computed, else states only).
+            // With up-to-date cultures: their names, and the culture tables.
             let pick = |st: Step| s.world.meta(st).map(|m| m["table"].clone()).filter(|t| !t.is_null());
-            let t = pick(Step::Provinces).or_else(|| pick(Step::States)).unwrap_or(Value::Null);
+            let mut t = pick(Step::Provinces).or_else(|| pick(Step::States)).unwrap_or(Value::Null);
+            if s.world.is_fresh(Step::Cultures) && !t.is_null() {
+                if let Some(c) = pick(Step::Cultures) {
+                    crate::stages::cultures::apply_names(&mut t, &c);
+                    t["cultures"] = c["cultures"].clone();
+                    t["culture_groups"] = c["groups"].clone();
+                    t["culture_events"] = c["events"].clone();
+                }
+            }
             Ok(Reply::Json(t))
         }
         "undo" | "redo" => {

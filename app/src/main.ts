@@ -1,17 +1,20 @@
 import './style.css';
 import * as api from './api';
 import { Grid, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
-import { BOUNDARY, KOPPEN, LAYERS, MONTHS, TERRAIN, colorize, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
+import { BOUNDARY, KOPPEN, LAYERS, MONTHS, TERRAIN, colorize, cultureColor, groupColor, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
-import { STAGE2_START, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
+import { STAGE2_START, STAGE3_START, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
 
 // ------------------------------------------------------------------ state
 
-/** States, regions, continents, provinces and straits of the latest run, indexed by id. */
+/** States, regions, continents, provinces and straits of the latest run, plus
+ *  cultures when they are up to date, indexed by id. */
 type Political = {
   states: any[]; regions: any[]; continents: any[]; provinces: any[]; adjacencies: any[];
+  cultures: any[]; groups: any[]; events: any[];
   byState: Map<number, any>; byRegion: Map<number, any>; byProv: Map<number, any>; byCont: Map<number, any>;
+  byCulture: Map<number, any>; byGroup: Map<number, any>;
 };
 
 type StepStatus = { key: string; title: string; state: 'done' | 'stale' | 'empty'; millis: number; meta: any };
@@ -21,6 +24,7 @@ type Status = {
   edits: {
     elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_strokes: number; pins: any[]; arrows: any[];
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
+    site_pins: number; sites: { lat: number; lon: number; population: number }[];
   };
   grid: { level: number; cells: number; spacing_km: number };
   path: string | null;
@@ -136,7 +140,9 @@ async function political(): Promise<Political | null> {
     const idx = (a: any[] | undefined) => new Map<number, any>((a ?? []).map((x) => [x.id, x]));
     S.political = {
       states: t.states ?? [], regions: t.regions ?? [], continents: t.continents ?? [], provinces: t.provinces ?? [], adjacencies: t.adjacencies ?? [],
+      cultures: t.cultures ?? [], groups: t.culture_groups ?? [], events: t.culture_events ?? [],
       byState: idx(t.states), byRegion: idx(t.regions), byProv: idx(t.provinces), byCont: idx(t.continents),
+      byCulture: idx(t.cultures), byGroup: idx(t.culture_groups),
     };
   } catch {
     return null;
@@ -192,7 +198,9 @@ function stepOfLayer(id: LayerId): string {
     sketch: 'Continent sketch', plates: 'Plates', crust: 'Plates', boundaries: 'Tectonic relief', elevation: 'Tectonic relief',
     stress: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', continentality: 'Climate',
     currents: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
-    habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
+    habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
+    resources: 'Provinces',
+    cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures',
   };
   return m[id];
 }
@@ -305,9 +313,15 @@ async function refreshOverlays() {
   // state borders over any other layer with the Borders overlay.
   const lay = S.layer;
   const political = lay === 'states' || lay === 'provinces' || lay === 'regions';
-  const stf = political || S.overlays.borders ? await getField('state') : null;
+  const cultural = lay === 'cultures' || lay === 'culture_groups';
+  const stf = cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
   if (stf && !stf.stale) {
     const L = new Lines();
+    // Culture layers: culture borders as hairlines, group borders as ribbons.
+    if (lay === 'cultures') {
+      const cu = await getField('culture');
+      if (cu) for (const [a, b] of cellEdges(g, cu.values, (x, y) => x > 0 && y > 0)) L.seg(a, b, [0.05, 0.05, 0.05, 0.45], 0.0024);
+    }
     if (lay === 'states' || lay === 'provinces') {
       const pv = await getField('province'), pk = await getField('province_kind');
       if (pv && pk) {
@@ -388,6 +402,14 @@ function drawEditMarkers() {
     }
     L.seg(offset(p, e, n, -r * 0.5, 0), offset(p, e, n, r * 0.5, 0), col, 0.004);
     L.seg(offset(p, e, n, 0, -r * 0.5), offset(p, e, n, 0, r * 0.5), col, 0.004);
+  }
+  for (const s of st.edits.sites ?? []) {
+    const p = fromLatLon((s.lat * Math.PI) / 180, (s.lon * Math.PI) / 180);
+    const [e, n] = eastNorth(p);
+    const r = 0.018;
+    const col: [number, number, number, number] = [1, 0.25, 0.8, 1];
+    const pts = [[0, r], [r, 0], [0, -r], [-r, 0], [0, r]];
+    for (let k = 0; k < 4; k++) L.seg(offset(p, e, n, pts[k][0], pts[k][1]), offset(p, e, n, pts[k + 1][0], pts[k + 1][1]), col, 0.004);
   }
   for (const a of st.edits.arrows) {
     const p = fromLatLon((a.lat * Math.PI) / 180, (a.lon * Math.PI) / 180);
@@ -660,6 +682,7 @@ function renderSteps() {
       h('input', { type: 'checkbox', checked: S.autoRun, onchange: (e: Event) => (S.autoRun = (e.target as HTMLInputElement).checked) }), 'Auto-update')));
   STEPS.forEach((ui, idx) => {
     if (idx === STAGE2_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 2 · States and provinces')));
+    if (idx === STAGE3_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 3 · Cultures')));
     box.append(stepCard(ui, idx, st.steps[idx]));
   });
   box.scrollTop = scroll;
@@ -726,6 +749,8 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
   if (ui.key === 'habitability') {
     body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.barrier_strokes} barrier strokes`),
       h('button', { class: 'small', disabled: !e.barrier_strokes, onclick: () => mutate('clear_layer', { layer: 'barriers' }) }, 'Clear barriers')));
+    body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.site_pins} site pins`),
+      h('button', { class: 'small', disabled: !e.site_pins, onclick: () => mutate('clear_layer', { layer: 'sites' }) }, 'Clear pins')));
   }
   if (ui.key === 'states') {
     body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.state_strokes} state paint strokes`),
@@ -888,6 +913,7 @@ function summary(key: string, m: any): HTMLElement {
     case 'habitability':
       box.append(stat('Mean habitability', fmt(m.mean_habitability, 2)), stat('Habitable land (≥ 0.4)', `${fmt(m.habitable_share * 100)} %`),
         stat('Border rivers', `${fmt(m.border_river_km)} km`), stat('Backbone rivers', `${fmt(m.backbone_river_km)} km`));
+      if (m.springs !== undefined) box.append(stat('Springs in dry land', fmt(m.springs)));
       if (m.painted_cells) box.append(stat('Painted cells', fmt(m.painted_cells)));
       break;
     case 'states': {
@@ -910,9 +936,50 @@ function summary(key: string, m: any): HTMLElement {
       });
       break;
     }
+    case 'cultures': {
+      box.append(stat('Cultures', `${fmt(m.cultures)} in ${fmt(m.groups)} groups`), stat('Population', `${fmt(m.population / 1e6, 1)} M of ${fmt(m.capacity / 1e6, 1)} M possible`),
+        stat('History', `${fmt(m.years)} years: ${fmt(m.splits)} splits, ${fmt(m.merged)} merges, ${fmt(m.extinct)} died out`), stat('Bands', fmt(m.bands)));
+      if (m.desert_towns !== undefined) {
+        const by = Object.entries(m.desert_towns_by_cause ?? {}).map(([k, v]) => `${v} ${k}`).join(', ');
+        box.append(stat('Desert towns (dry, no river, ≥ 10,000 people)', `${fmt(m.desert_towns)}${by ? ' — ' + by : ''}`));
+      }
+      const list = h('div', { class: 'list' });
+      box.append(list);
+      political().then((P) => {
+        if (!P || !P.cultures.length) return;
+        const yr = (y: number) => `year ${fmt(y)}`;
+        for (const g of P.groups.slice(0, 12)) {
+          const gc = groupColor(g.id).map(Math.round);
+          list.append(h('div', { class: 'item' }, h('b', {}, h('i', { class: 'swatch', style: `background: rgb(${gc.join(',')})` }), g.name),
+            h('span', { class: 'muted' }, `${fmt(g.population / 1e6, 1)} M people`)));
+          const members = (g.cultures as number[]).map((c) => P.byCulture.get(c)).filter(Boolean).sort((a, b) => b.population - a.population);
+          for (const c of members) {
+            const cc = cultureColor(c.id, c.group).map(Math.round);
+            const parent = c.parent ? P.byCulture.get(c.parent) : null;
+            const origin = parent ? `Split from ${parent.name} in ${yr(c.founded_year)}` : `Emerged in ${yr(c.founded_year)}`;
+            list.append(h('div', { class: 'item', title: origin },
+              h('span', {}, '\u00a0\u00a0', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name),
+              h('span', { class: 'muted' }, `${fmt(c.population / 1e6, 2)} M · ${c.provinces} prov.${parent ? ' · from ' + parent.name : ''}`)));
+          }
+        }
+        const recent = P.events.filter((e) => e.kind !== 'emerged').slice(-8).reverse();
+        if (recent.length) list.append(h('div', { class: 'item' }, h('b', {}, 'Latest events')));
+        for (const e of recent) {
+          const a = P.byCulture.get(e.culture)?.name ?? `#${e.culture}`, b = P.byCulture.get(e.other)?.name ?? '';
+          const text = e.kind === 'split' ? `${a} split from ${b}` : e.kind === 'merged' ? `${a} merged into ${b}` : `${a} died out`;
+          list.append(h('div', { class: 'item' }, h('span', {}, text), h('span', { class: 'muted' }, yr(e.year))));
+        }
+      });
+      break;
+    }
     case 'provinces': {
       box.append(stat('Provinces', fmt(m.provinces)), stat('Land', fmt(m.land)), stat('Wasteland', fmt(m.wasteland)), stat('Lakes', fmt(m.lakes)),
         stat('Sea zones', fmt(m.sea)), stat('Median land province', `${fmt(m.median_land_km2 / 1000, 1)}k km²`), stat('Strait crossings', fmt(m.straits)));
+      if (m.borders) {
+        const b = m.borders;
+        box.append(stat('Land borders', `${fmt(b.land ?? 0)} open · ${fmt(b.river ?? 0)} river · ${fmt(b.impassable ?? 0)} impassable`),
+          stat('Coast and sea borders', `${fmt(b.coast ?? 0)} coast · ${fmt(b.sea ?? 0)} sea · ${fmt(b.lake ?? 0)} lake`));
+      }
       if (m.import?.error) box.append(h('div', { class: 'error' }, `Import failed, generated provinces shown: ${m.import.error}`));
       else if (m.import) {
         box.append(stat('Imported from', String(m.import.png).split(/[\\/]/).pop() ?? ''));
@@ -982,6 +1049,7 @@ function renderToolbar() {
   const val = S.toolValue[t.id] ?? t.defaultValue ?? 0;
   const setVal = (v: number) => (S.toolValue[t.id] = v);
   if (t.value === 'metres') bb.append(h('label', {}, h('span', {}, S.tool === 'flatten' ? 'Target (m)' : 'Amount (m)'), h('input', { type: 'number', step: 50, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
+  if (t.value === 'people') bb.append(h('label', {}, h('span', {}, 'Population'), h('input', { type: 'number', step: 1000, min: 0, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'barrier') bb.append(h('label', {}, h('span', {}, 'Barrier strength'), h('input', { type: 'number', step: 1, min: 0, max: 50, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'speed') bb.append(h('label', {}, h('span', {}, 'Speed (mm/yr)'), h('input', { type: 'number', step: 5, min: 1, max: 300, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'plate') {
@@ -1265,7 +1333,11 @@ function describe(d: any): string {
   const P = S.political;
   if (P && d.province) {
     const p = P.byProv.get(d.province);
-    if (p) parts.push(`${p.name} (province ${p.id}, ${p.kind}${p.band ? ' ' + p.band : ''}, ${Math.round(p.area_km2 / 1000)}k km²)`);
+    if (p) {
+      parts.push(`${p.name} (province ${p.id}, ${p.kind}${p.band ? ' ' + p.band : ''}, ${Math.round(p.area_km2 / 1000)}k km²)`);
+      const goods = [p.trade_good && p.trade_good !== 'none' ? p.trade_good : null, ...(p.resources ?? [])].filter(Boolean);
+      if (goods.length) parts.push(goods.join(', '));
+    }
   }
   if (P && d.state) {
     const s = P.byState.get(d.state);
@@ -1273,6 +1345,12 @@ function describe(d: any): string {
     const ct = s ? P.byCont.get(s.continent) : null;
     if (s) parts.push(`state ${s.name}${r ? ', ' + r.name : ''}${ct ? ', ' + ct.name : ''}`);
   }
+  if (P && d.culture) {
+    const c = P.byCulture.get(d.culture), g = c ? P.byGroup.get(c.group) : null;
+    if (c) parts.push(`${c.name} culture${g ? ' (' + g.name + ')' : ''}`);
+  }
+  if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
+  if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
   return parts.join('  ·  ');
 }
 

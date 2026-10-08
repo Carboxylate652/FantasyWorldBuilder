@@ -253,6 +253,16 @@ pub struct HabitabilityParams {
     /// Rivers through land drier than this (mm/yr, regional) hold their valley
     /// together instead (Nile).
     pub backbone_max_precip_mm: f64,
+    /// Share of rain above 150 mm/yr that soaks in and becomes groundwater.
+    pub groundwater_recharge: f64,
+    /// Groundwater flows downhill underground; this far (km) it keeps 1/e of its water.
+    pub groundwater_reach_km: f64,
+    /// Spring flow (m³/s) that makes a full oasis.
+    pub spring_flux_m3s: f64,
+    /// Springs only matter in land drier than this (mm/yr).
+    pub spring_max_precip_mm: f64,
+    /// Habitability of a full oasis.
+    pub spring_habitability: f64,
 }
 
 impl Default for HabitabilityParams {
@@ -269,6 +279,11 @@ impl Default for HabitabilityParams {
             river_border_width_m: 300.0,
             river_border_habitability: 0.3,
             backbone_max_precip_mm: 350.0,
+            groundwater_recharge: 0.15,
+            groundwater_reach_km: 400.0,
+            spring_flux_m3s: 1.0,
+            spring_max_precip_mm: 350.0,
+            spring_habitability: 0.7,
         }
     }
 }
@@ -363,6 +378,102 @@ impl Default for ProvinceParams {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CultureParams {
+    /// Bands placed at the start, weighted by carrying capacity.
+    pub initial_bands: u32,
+    /// Band count cap (never below the number of provinces that can hold people).
+    pub max_bands: u32,
+    /// Simulation length in ticks (one tick = one generation).
+    pub ticks: u32,
+    pub years_per_tick: f64,
+    /// Cultural traits per band (Axelrod features) and values per trait.
+    pub traits: u32,
+    pub trait_values: u32,
+    /// People per km² a fully habitable province supports.
+    pub density_per_km2: f64,
+    /// Logistic growth rate per tick.
+    pub growth_rate: f64,
+    /// Chance per trait that a band founded by fission starts with a changed value.
+    pub fission_mutation: f64,
+    /// Chance per trait and tick of a random change.
+    pub drift: f64,
+    /// Contacts each band tries per tick.
+    pub contacts_per_tick: u32,
+    /// A contact succeeds with probability similarity^homophily: higher values
+    /// make unlike bands avoid each other, so cultures form sharper borders.
+    pub homophily: f64,
+    /// Chance per tick that a band takes, for one trait, the value most of its
+    /// successful contacts share (conformist transmission).
+    pub conformity: f64,
+    /// Contact weight kept from one tick to the next.
+    pub contact_memory: f64,
+    /// Contact falls off as exp(−cost / scale): most contact is within about this distance.
+    pub contact_scale_km: f64,
+    /// Travel range (km of open land) in each of the four eras: the farthest a
+    /// new band settles or a contact reaches.
+    pub travel_range_km: [f64; 4],
+    /// Start of eras 2–4 (straits, coastal sailing, open sea) as a fraction of the run.
+    pub era_starts: [f64; 3],
+    /// Cost multiplier for barriers along a border.
+    pub barrier_weight: f64,
+    /// Cost per km at sea (relative to open land) once sailing is possible.
+    pub sea_cost: f64,
+    /// Ticks between culture checks.
+    pub check_every: u32,
+    /// Checks in a row a split, merge or change of culture must hold.
+    pub persistence: u32,
+    /// Community detection resolution for cultures (higher = more, smaller cultures).
+    pub culture_resolution: f64,
+    /// Resolution for culture groups (lower = fewer, larger groups).
+    pub group_resolution: f64,
+    /// Smallest share of world population a new culture can start with.
+    pub min_culture_share: f64,
+    /// From the second era: people a watered stop on the busiest caravan route
+    /// across dry land can hold (less on quieter routes).
+    pub caravan_people: f64,
+    /// From the third era: people each metal deposit draws to a mining town.
+    pub mining_people: f64,
+    /// From the fourth era: share of a dry province's land that irrigation
+    /// from its river turns into farmland.
+    pub irrigation_share: f64,
+}
+
+impl Default for CultureParams {
+    fn default() -> Self {
+        CultureParams {
+            initial_bands: 20,
+            max_bands: 5000,
+            ticks: 400,
+            years_per_tick: 25.0,
+            traits: 24,
+            trait_values: 4,
+            density_per_km2: 2.0,
+            growth_rate: 0.3,
+            fission_mutation: 0.03,
+            drift: 0.0005,
+            contacts_per_tick: 4,
+            homophily: 3.0,
+            conformity: 1.0,
+            contact_memory: 0.9,
+            contact_scale_km: 200.0,
+            travel_range_km: [500.0, 800.0, 1200.0, 1800.0],
+            era_starts: [0.25, 0.5, 0.75],
+            barrier_weight: 1.0,
+            sea_cost: 0.7,
+            check_every: 10,
+            persistence: 3,
+            culture_resolution: 4.0,
+            group_resolution: 0.05,
+            min_culture_share: 0.002,
+            caravan_people: 25_000.0,
+            mining_people: 4_000.0,
+            irrigation_share: 0.3,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct WorldParams {
@@ -376,6 +487,7 @@ pub struct WorldParams {
     pub habitability: HabitabilityParams,
     pub states: StateParams,
     pub provinces: ProvinceParams,
+    pub cultures: CultureParams,
 }
 
 impl WorldParams {

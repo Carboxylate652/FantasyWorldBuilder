@@ -4,6 +4,8 @@
 //!   Poisson-disc sampling whose radius follows habitability (small provinces
 //!   on fertile land, large ones in the steppe), grown with the barrier-aware
 //!   Dijkstra search at a lower barrier weight, and relaxed by Lloyd passes.
+//! - A strong spring in dry land gets a province seed of its own with a
+//!   fertile-land target area, so an oasis becomes a small, dense province.
 //! - Peaks, ice caps and deep desert (in large patches) become impassable
 //!   wasteland provinces, still inside their state.
 //! - Sea is split by depth band (coastal, shelf, open ocean) into sea zones of
@@ -14,16 +16,19 @@
 //!   province by majority pixel vote, and provinces join the state they overlap most.
 //!
 //! The step also lists strait crossings between provinces on different
-//! landmasses (adjacencies.csv) and the province adjacency graph.
+//! landmasses (adjacencies.csv) and every border between two provinces
+//! (province_adjacency.csv): its type (land, river, impassable, coast, lake,
+//! sea or strait), its length and how hard it is to cross.
 
 use super::biomes::{terrain, TERRAIN};
+use super::habitability::role;
 use super::hydrology::water;
 use super::partition::{self, NONE};
 use super::{Ctx, StepOutput};
 use crate::edits::{stroke_coverage, Tool};
 use crate::fields::{Field, Fields};
 use crate::graph;
-use crate::names::Lang;
+use crate::names::{self, Lang};
 use crate::rng::{hash_unit, stream, Rng};
 use crate::vec3::Vec3;
 use std::collections::{BTreeMap, HashSet};
@@ -66,6 +71,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let hab = ctx.input.f32("habitability");
     let bar = ctx.input.f32("barrier");
     let state = ctx.input.u16("state");
+    let river_role = ctx.input.u8("river_role");
     let region = ctx.input.u16("region");
     let cont = ctx.input.u8("continent");
     let area: Vec<f64> = g.area.iter().map(|a| a * r2).collect();
@@ -137,8 +143,10 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         }
         ctx.progress(0.1, "Seeding provinces");
         let a_land = |h: f64| pp.sparse_province_area_km2 * (pp.province_area_km2 / pp.sparse_province_area_km2.max(1.0)).powf(h.clamp(0.0, 1.0));
+        let spring_cell = ctx.input.f32("site");
         let target = |i: usize| -> f64 {
             let a = match group_kind(group[i]) {
+                kind::LAND if spring_cell[i] > 0.3 => a_land(hab[i] as f64).min(1.5 * pp.province_area_km2),
                 kind::LAND => a_land(hab[i] as f64),
                 kind::WASTELAND => pp.wasteland_area_km2,
                 kind::LAKE => pp.coastal_sea_km2,
@@ -147,7 +155,12 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             a.max(500.0)
         };
         let weight = |i: usize| 1.0 / target(i);
-        let order = partition::race_order((0..n).filter(|&i| group[i] != NONE), weight, seed, stream::PROVINCES);
+        let mut order = partition::race_order((0..n).filter(|&i| group[i] != NONE), weight, seed, stream::PROVINCES);
+        // Strong springs (the best cell of each) are seeded first.
+        let is_spring = |i: usize| {
+            group_kind(group[i]) == kind::LAND && spring_cell[i] > 0.5 && g.neighbors(i).iter().all(|&j| spring_cell[j as usize] <= spring_cell[i])
+        };
+        order.sort_by_key(|&c| !is_spring(c as usize));
         let mut seeds = partition::poisson(g, &order, &group, |i| (target(i) / 1.2).sqrt() / r_km);
         partition::seed_every_component(g, &group, &order, &mut seeds);
         let bw = pp.barrier_weight.max(0.0);
@@ -248,6 +261,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     struct Agg {
         area: f64,
         hab: f64,
+        hab15: f64,
         pos: Vec3,
         kinds: [f64; 4],
         bands: [f64; 3],
@@ -261,6 +275,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         Agg {
             area: 0.0,
             hab: 0.0,
+            hab15: 0.0,
             pos: Vec3::new(0.0, 0.0, 0.0),
             kinds: [0.0; 4],
             bands: [0.0; 3],
@@ -281,6 +296,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         let ar = area[i];
         a.area += ar;
         a.hab += ar * hab[i] as f64;
+        a.hab15 += ar * (hab[i].max(0.0) as f64).powf(1.5);
         a.pos += g.pos[i] * ar;
         let k = cell_kind(i);
         a.kinds[k as usize] += ar;
@@ -325,6 +341,51 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         })
         .collect();
 
+    // Resource signals, rainfall, rivers and springs per province.
+    let stress = ctx.input.f32("stress");
+    let crust = ctx.input.u8("crust");
+    let p_ann = ctx.input.f32("p_ann");
+    let lake_cls = ctx.input.u8("lake");
+    let recv = ctx.input.i32("receiver");
+    let rwidth = ctx.input.f32("river_width");
+    let site = ctx.input.f32("site");
+    let site_kind = ctx.input.u8("site_kind");
+    let mut sig = vec![super::resources::Signals::default(); count];
+    let mut river = vec![false; count];
+    let mut pinned = vec![false; count];
+    for i in 0..n {
+        let l = label[i];
+        if l == NONE {
+            continue;
+        }
+        let (s, a) = (&mut sig[l as usize], area[i] / agg[l as usize].area.max(1e-9));
+        s.abs_lat += a * g.lat[i].to_degrees().abs();
+        if !land(i) {
+            continue;
+        }
+        let e = elev[i] as f64;
+        s.rain_mm += a * p_ann[i] as f64;
+        s.orogen += a * (stress[i] as f64 * 2.0).min(1.0);
+        if crust[i] == 1 && stress[i] <= 0.0 {
+            s.shield += a * (1.0 - ((e - 600.0) / 1400.0).clamp(0.0, 1.0));
+        }
+        if crust[i] == 1 && stress[i] < 0.1 && e < 600.0 && p_ann[i] > 700.0 {
+            s.coal += a;
+        }
+        let dry_basin = lake_cls[i] == super::hydrology::lake::DRY
+            || g.neighbors(i).iter().any(|&j| lake_cls[j as usize] == super::hydrology::lake::SALT)
+            || (recv[i] < 0 && p_ann[i] < 400.0);
+        if dry_basin {
+            s.salt += a * 4.0;
+        }
+        s.site = s.site.max(site[i] as f64);
+        river[l as usize] |= rwidth[i] > 0.0;
+        pinned[l as usize] |= site_kind[i] == 3;
+    }
+    for s in sig.iter_mut() {
+        s.salt = s.salt.min(1.0);
+    }
+
     // ------------------------------------------------------------ ids, colours, names
     let mut ids = vec![0u32; count];
     let mut colors = vec![[0u8; 3]; count];
@@ -365,17 +426,70 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             };
         }
     }
-    // Generated names from each continent's language (kept from definition.csv on import).
-    let n_lang = provs.iter().map(|p| p.cont + 1).max().unwrap_or(1) as u64;
-    let langs: Vec<Lang> = (0..n_lang).map(|c| Lang::new(seed, c + 1)).collect();
+    // Capital province of each state: the land province holding the state's
+    // capital cell, else its most habitable land province (or wasteland).
+    let upstream = ctx.input.meta("table");
+    let mut states_json: Vec<serde_json::Value> = upstream["states"].as_array().cloned().unwrap_or_default();
+    let mut capital_of: BTreeMap<u16, usize> = BTreeMap::new();
+    for s in &states_json {
+        let sid = s["id"].as_u64().unwrap_or(0) as u16;
+        let by_cell = s["capital_cell"].as_u64().map(|c| c as usize).filter(|&c| c < n && label[c] != NONE).map(|c| label[c] as usize).filter(|&p| provs[p].state == sid && provs[p].kind == kind::LAND);
+        let most_habitable = |land_only: bool| {
+            order.iter().copied().filter(|&p| provs[p].state == sid && (!land_only || provs[p].kind == kind::LAND)).max_by(|&a, &b| {
+                (agg[a].hab / agg[a].area.max(1.0)).partial_cmp(&(agg[b].hab / agg[b].area.max(1.0))).unwrap().then(b.cmp(&a))
+            })
+        };
+        // States of only ice or desert fall back to their most habitable wasteland.
+        let cap = by_cell.or_else(|| most_habitable(true)).or_else(|| most_habitable(false));
+        if let Some(p) = cap {
+            capital_of.insert(sid, p);
+        }
+    }
+
+    // Generated names (kept from definition.csv on import): a state's capital
+    // takes the state's name; other land provinces speak their region's dialect,
+    // seas and lakes the nearest continent's language. No name is used twice.
+    let n_lang = provs.iter().map(|p| p.cont + 1).max().unwrap_or(1);
+    let langs: Vec<Lang> = (0..n_lang).map(|c| names::continent_lang(seed, c)).collect();
+    let mut dialects: BTreeMap<u16, Lang> = BTreeMap::new();
+    // The continent each region belongs to (0-based), as the states step used for its dialect.
+    let region_cont: BTreeMap<u16, u32> = upstream["regions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| Some((r["id"].as_u64()? as u16, (r["continent"].as_u64()? as u32).checked_sub(1)?)))
+        .collect();
     let mut rng = Rng::new(seed, stream::NAMES + 1);
-    let mut used_names = HashSet::new();
+    let mut used_names: HashSet<String> = HashSet::new();
+    for key in ["continents", "regions", "states"] {
+        for t in upstream[key].as_array().into_iter().flatten() {
+            if let Some(name) = t["name"].as_str() {
+                used_names.insert(name.to_string());
+            }
+        }
+    }
+    let state_name: BTreeMap<u16, String> =
+        states_json.iter().filter_map(|s| Some((s["id"].as_u64()? as u16, s["name"].as_str()?.to_string()))).collect();
+    for (&sid, &p) in &capital_of {
+        if pnames[p].is_empty() {
+            if let Some(name) = state_name.get(&sid) {
+                pnames[p] = name.clone();
+            }
+        }
+    }
     for &p in &order {
         if !pnames[p].is_empty() {
             continue;
         }
         let pr = &provs[p];
-        let w = langs[(pr.cont as usize).min(langs.len() - 1)].unique(&mut rng, &mut used_names);
+        let cont = pr.cont.min(n_lang - 1);
+        let lang = if pr.region > 0 && (pr.kind == kind::LAND || pr.kind == kind::WASTELAND) {
+            let rc = region_cont.get(&pr.region).copied().unwrap_or(cont);
+            dialects.entry(pr.region).or_insert_with(|| names::region_lang(seed, rc, pr.region))
+        } else {
+            &langs[cont as usize]
+        };
+        let w = lang.unique(&mut rng, &mut used_names);
         pnames[p] = match pr.kind {
             kind::SEA => match pr.band {
                 0 => ["{} Bay", "Gulf of {}", "{} Sound", "{} Coast"][rng.below(4)].replace("{}", &w),
@@ -407,18 +521,39 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         f_state[i] = p.state;
     }
 
+    // Provinces whose cells are not connected on the grid (islands, imports).
+    let (_, pieces) = partition::group_components(g, &label);
+    let mut piece_count = vec![0u32; count];
+    for c in &pieces {
+        piece_count[label[c[0] as usize] as usize] += 1;
+    }
+    let split_on_grid = piece_count.iter().filter(|&&k| k > 1).count();
+
     // ------------------------------------------------------------ adjacency
     ctx.progress(0.75, "Building the adjacency graph");
-    let mut nb_set: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    // Per border: shared cell edges, edges along a border river, summed barrier.
+    #[derive(Default)]
+    struct Border {
+        edges: u32,
+        river: u32,
+        barrier: f64,
+    }
+    let mut nb_set: BTreeMap<(u32, u32), Border> = BTreeMap::new();
     for i in 0..n {
         let a = label[i];
         if a == NONE {
             continue;
         }
         for &j in g.neighbors(i) {
-            let b = label[j as usize];
-            if b != NONE && a < b {
-                *nb_set.entry((a, b)).or_insert(0) += 1;
+            let j = j as usize;
+            let b = label[j];
+            if b != NONE && a != b {
+                let e = nb_set.entry((a.min(b), a.max(b))).or_default();
+                e.edges += 1;
+                e.barrier += 0.5 * (bar[i] + bar[j]) as f64;
+                if river_role[i] == role::BORDER || river_role[j] == role::BORDER {
+                    e.river += 1;
+                }
             }
         }
     }
@@ -487,11 +622,49 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         }));
     }
 
+    // Every border, typed. Each shared cell edge was counted from both sides;
+    // a hexagon edge is spacing / √3 long.
+    let edge_km = g.spacing * r_km / 3f64.sqrt();
+    let political = |k: u8| k == kind::LAND || k == kind::WASTELAND;
+    let mut adjacency_json = Vec::with_capacity(nb_set.len() + straits_json.len());
+    let mut by_type: BTreeMap<&str, usize> = BTreeMap::new();
+    for (&(a, b), e) in &nb_set {
+        let (ka, kb) = (provs[a as usize].kind, provs[b as usize].kind);
+        let ty = if political(ka) && political(kb) {
+            if ka == kind::WASTELAND || kb == kind::WASTELAND {
+                "impassable"
+            } else if e.river * 5 >= e.edges * 2 {
+                "river"
+            } else {
+                "land"
+            }
+        } else if political(ka) || political(kb) {
+            if ka == kind::LAKE || kb == kind::LAKE { "lake" } else { "coast" }
+        } else if ka == kind::LAKE || kb == kind::LAKE {
+            "lake"
+        } else {
+            "sea"
+        };
+        *by_type.entry(ty).or_insert(0) += 1;
+        let (fa, fb) = (ids[a as usize].min(ids[b as usize]), ids[a as usize].max(ids[b as usize]));
+        adjacency_json.push(serde_json::json!({
+            "from": fa, "to": fb, "type": ty,
+            "border_km": (e.edges as f64 / 2.0 * edge_km).round(),
+            "barrier": (e.barrier / e.edges as f64 * 100.0).round() / 100.0,
+        }));
+    }
+    for s in &straits_json {
+        *by_type.entry("strait").or_insert(0) += 1;
+        adjacency_json.push(serde_json::json!({ "from": s["from"], "to": s["to"], "type": "strait", "border_km": 0, "barrier": 0, "crossing_km": s["km"] }));
+    }
+    adjacency_json.sort_by_key(|a| (a["from"].as_u64().unwrap_or(0), a["to"].as_u64().unwrap_or(0)));
+
     // ------------------------------------------------------------ tables
     ctx.progress(0.92, "Writing tables");
     let mut provinces_json = Vec::with_capacity(count);
     let mut by_kind = [0usize; 4];
     let mut land_area = Vec::new();
+    let mut good = vec![0u8; count];
     for &p in &order {
         let (a, pr) = (&agg[p], &provs[p]);
         by_kind[pr.kind as usize] += 1;
@@ -508,19 +681,32 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "continent": if pr.kind == kind::LAND || pr.kind == kind::WASTELAND { pr.cont + 1 } else { 0 },
             "area_km2": a.area.round(),
             "habitability": (a.hab / a.area.max(1.0) * 1000.0).round() / 1000.0,
+            "capacity_factor": (a.hab15 / a.area.max(1.0) * 10000.0).round() / 10000.0,
             "terrain": TERRAIN[pr.terrain as usize].0,
             "coastal": a.coastal,
             "center": deg(pr.center),
             "neighbors": neighbors[p],
         });
+        let s = &sig[p];
+        good[p] = 0;
         if pr.kind == kind::SEA {
             j["band"] = serde_json::json!(BAND_NAMES[pr.band as usize]);
+            let fish = super::resources::sea_fish(seed, ids[p], pr.band, s.abs_lat);
+            j["resources"] = serde_json::json!(if fish { vec!["fish"] } else { vec![] });
+        } else if pr.kind == kind::LAND || pr.kind == kind::WASTELAND {
+            let dep = super::resources::deposits(seed, ids[p], s);
+            let tg = if pr.kind == kind::LAND { super::resources::trade_good(pr.terrain, s, &dep) } else { "none" };
+            good[p] = super::resources::good_index(tg);
+            j["trade_good"] = serde_json::json!(tg);
+            j["resources"] = serde_json::json!(dep);
+            j["rain_mm"] = serde_json::json!(s.rain_mm.round());
+            j["river"] = serde_json::json!(river[p]);
+            j["site"] = serde_json::json!((s.site * 100.0).round() / 100.0);
+            j["site_pin"] = serde_json::json!(pinned[p]);
         }
         provinces_json.push(j);
     }
     // States: add their provinces and capital province.
-    let upstream = ctx.input.meta("table");
-    let mut states_json: Vec<serde_json::Value> = upstream["states"].as_array().cloned().unwrap_or_default();
     let mut state_provs: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
     for &p in &order {
         if provs[p].state > 0 {
@@ -530,13 +716,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     for s in states_json.iter_mut() {
         let sid = s["id"].as_u64().unwrap_or(0) as u16;
         let list = state_provs.get(&sid).cloned().unwrap_or_default();
-        let capital = s["capital_cell"].as_u64().map(|c| c as usize).filter(|&c| c < n && f_state[c] == sid).map(|c| f_prov[c]);
-        let capital = capital.or_else(|| {
-            order.iter().copied().filter(|&p| provs[p].state == sid && provs[p].kind == kind::LAND).max_by(|&a, &b| {
-                (agg[a].hab / agg[a].area.max(1.0)).partial_cmp(&(agg[b].hab / agg[b].area.max(1.0))).unwrap().then(b.cmp(&a))
-            }).map(|p| ids[p])
-        });
-        s["capital_province"] = serde_json::json!(capital.unwrap_or(0));
+        s["capital_province"] = serde_json::json!(capital_of.get(&sid).map_or(0, |&p| ids[p]));
         s["province_count"] = serde_json::json!(list.len());
         s["provinces"] = serde_json::json!(list);
     }
@@ -547,6 +727,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let mut f = Fields::default();
     f.put("province", Field::U32(f_prov));
     f.put("province_kind", Field::U8(f_kind));
+    f.put("trade_good", Field::U8((0..n).map(|i| if label[i] == NONE { 0 } else { good[label[i] as usize] }).collect()));
     f.put("state", Field::U16(f_state));
     StepOutput {
         fields: f,
@@ -559,6 +740,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "mean_land_km2": mean.round(),
             "median_land_km2": median.round(),
             "straits": straits_json.len(),
+            "split_on_grid": split_on_grid,
+            "borders": by_type,
             "painted_cells": painted,
             "import": import_info,
             "table": {
@@ -567,6 +750,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 "regions": upstream["regions"].clone(),
                 "continents": upstream["continents"].clone(),
                 "adjacencies": straits_json,
+                "adjacency": adjacency_json,
             },
         }),
     }

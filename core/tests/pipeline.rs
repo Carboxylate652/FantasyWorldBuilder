@@ -157,6 +157,111 @@ fn scatter_noise_reference_values() {
     assert!(got.iter().all(|v| v.abs() <= 1.2));
 }
 
+/// Stage 3: cultures emerge and settle the land, the family tree is consistent
+/// (parents existed before their daughters, ended cultures have a fate),
+/// provinces carry cultures and populations, and the export writes the tables.
+#[test]
+fn cultures_emerge_and_are_consistent() {
+    use worldcore::fields::Field;
+    let mut p = WorldParams::default();
+    p.planet.seed = 4;
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 200;
+    p.cultures.max_bands = 600;
+    let mut w = World::new(p);
+    w.run_to(LAST, &|_, _, _| {});
+    let m = w.meta(Step::Cultures).unwrap();
+    let t = &m["table"];
+    let cultures = t["cultures"].as_array().unwrap();
+    let alive: Vec<&serde_json::Value> = cultures.iter().filter(|c| c["alive"] == true).collect();
+    assert!(alive.len() >= 3, "only {} cultures", alive.len());
+    assert!(m["population"].as_f64().unwrap() > 0.5 * m["capacity"].as_f64().unwrap(), "land barely settled: {m}");
+    let by_id: std::collections::HashMap<u64, &serde_json::Value> = cultures.iter().map(|c| (c["id"].as_u64().unwrap(), c)).collect();
+    let groups = t["groups"].as_array().unwrap().len() as u64;
+    for c in cultures {
+        let parent = c["parent"].as_u64().unwrap();
+        if parent > 0 {
+            assert!(by_id[&parent]["founded_year"].as_f64().unwrap() < c["founded_year"].as_f64().unwrap(), "culture {} older than its parent", c["id"]);
+        }
+        if c["alive"] == true {
+            assert!(c["population"].as_f64().unwrap() > 0.0);
+            assert!((1..=groups).contains(&c["group"].as_u64().unwrap()));
+        } else {
+            assert!(c["fate"] == "merged" || c["fate"] == "extinct");
+            assert!(c["ended_year"].as_f64().unwrap() >= c["founded_year"].as_f64().unwrap());
+        }
+    }
+    for e in t["events"].as_array().unwrap() {
+        assert!(by_id.contains_key(&e["culture"].as_u64().unwrap()));
+    }
+    // Province cultures agree with the cell field and are living cultures.
+    let cult = match w.field("culture") { Some((Field::U16(v), _, _)) => v.clone(), _ => panic!("culture field") };
+    let prov = match w.field("province") { Some((Field::U32(v), _, _)) => v.clone(), _ => panic!("province field") };
+    let pc: std::collections::HashMap<u64, u64> = t["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["culture"].as_u64().unwrap())).collect();
+    for i in 0..cult.len() {
+        if let Some(&c) = pc.get(&(prov[i] as u64)) {
+            assert_eq!(cult[i] as u64, c);
+            if c > 0 {
+                assert_eq!(by_id[&c]["alive"], true);
+            }
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("fwm-cult-{}", std::process::id()));
+    let opts = ExportOptions { width: 1024, height: 512, ..Default::default() };
+    let r = export(&mut w, &dir, &opts, &|_, _| {}).unwrap();
+    for f in ["cultures.png", "cultures.csv", "culture_groups.csv", "culture_events.csv", "province_cultures.csv"] {
+        assert!(r.files.iter().any(|x| x == f), "{f} not exported");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Settlement sites and resources: springs only appear in dry land, land
+/// provinces get trade goods and some deposits, and a site pin in a desert
+/// grows a town of about the population it asks for.
+#[test]
+fn springs_resources_and_site_pins() {
+    use worldcore::edits::{Stroke, Tool};
+    use worldcore::fields::Field;
+    let mut p = WorldParams::default();
+    p.planet.seed = 4;
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 200;
+    let mut w = World::new(p.clone());
+    w.run_to(LAST, &|_, _, _| {});
+    let f32f = |w: &World, n: &str| match w.field(n) { Some((Field::F32(v), _, _)) => v.clone(), _ => panic!("{n}") };
+    let site = f32f(&w, "site");
+    let rain = f32f(&w, "p_ann");
+    for i in 0..site.len() {
+        if site[i] > 0.0 {
+            assert!(rain[i] < p.habitability.spring_max_precip_mm as f32, "spring in wet land at cell {i}");
+        }
+    }
+    let provs = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().clone();
+    let land: Vec<&serde_json::Value> = provs.iter().filter(|p| p["kind"] == "land").collect();
+    assert!(land.iter().all(|p| p["trade_good"].is_string()));
+    let with_deposits = land.iter().filter(|p| !p["resources"].as_array().unwrap().is_empty()).count();
+    assert!(with_deposits > 0 && with_deposits < land.len(), "{with_deposits} of {} land provinces have deposits", land.len());
+    assert!(w.meta(Step::Cultures).unwrap()["desert_towns"].is_u64());
+
+    // Pin a town in the driest land province that has people around.
+    let dry = land.iter().filter(|p| !p["river"].as_bool().unwrap()).min_by(|a, b| a["rain_mm"].as_f64().partial_cmp(&b["rain_mm"].as_f64()).unwrap()).unwrap();
+    let (lat, lon) = (dry["center"][0].as_f64().unwrap(), dry["center"][1].as_f64().unwrap());
+    let pid = dry["id"].as_u64().unwrap();
+    w.edits.add_stroke(Stroke { tool: Tool::SitePin, value: 40_000.0, points: vec![[lat, lon]], ..Default::default() });
+    assert!(!w.is_fresh(Step::Habitability));
+    w.run_to(LAST, &|_, _, _| {});
+    let prov_field = match w.field("province") { Some((Field::U32(v), _, _)) => v.clone(), _ => panic!() };
+    // Provinces are regenerated around the pin: find the one holding it now.
+    let g = w.grid();
+    let cell = g.nearest(worldcore::vec3::Vec3::from_lat_lon_deg(lat, lon), None);
+    let now = prov_field[cell] as u64;
+    let c = &w.meta(Step::Cultures).unwrap()["table"]["provinces"];
+    let pop = c.as_array().unwrap().iter().find(|p| p["id"].as_u64() == Some(now)).map(|p| p["population"].as_f64().unwrap()).unwrap();
+    assert!(pop >= 0.8 * 40_000.0, "pinned town in province {now} (was {pid}) holds only {pop}");
+}
+
 /// Stage 2: every land cell is in a state and a province, ids and colours are
 /// unique, state tables agree with the cells, and an exported provinces.png
 /// imports back to (almost) the same cells.
@@ -191,12 +296,52 @@ fn states_and_provinces_round_trip() {
         assert!(ids.insert(p["id"].as_u64().unwrap()));
         assert!(colors.insert(p["color"].to_string()), "duplicate colour {}", p["color"]);
     }
+    let by_id: std::collections::HashMap<u64, &serde_json::Value> = provs.iter().map(|p| (p["id"].as_u64().unwrap(), p)).collect();
     for s in t["states"].as_array().unwrap() {
         for pid in s["provinces"].as_array().unwrap() {
             let p = provs.iter().find(|p| &p["id"] == pid).unwrap();
             assert_eq!(p["state"], s["id"]);
         }
+        // Every state has a capital in it; a land capital carries the state's name.
+        let cap = by_id[&s["capital_province"].as_u64().unwrap()];
+        assert_eq!(cap["state"], s["id"], "capital of state {} is outside it", s["id"]);
+        if cap["kind"] == "land" {
+            assert_eq!(cap["name"], s["name"]);
+        }
     }
+    let mut names = std::collections::HashSet::new();
+    for p in provs {
+        assert!(names.insert(p["name"].as_str().unwrap()), "province name {} used twice", p["name"]);
+    }
+
+    // Every pair of neighbouring provinces has one typed border, and the type fits the kinds.
+    let adj = t["adjacency"].as_array().unwrap();
+    let mut borders = std::collections::HashMap::new();
+    for a in adj {
+        let (f, to, ty) = (a["from"].as_u64().unwrap(), a["to"].as_u64().unwrap(), a["type"].as_str().unwrap());
+        assert!(f < to);
+        assert!(borders.insert((f, to, ty == "strait"), ty).is_none(), "border {f}-{to} listed twice");
+        let kinds = [by_id[&f]["kind"].as_str().unwrap(), by_id[&to]["kind"].as_str().unwrap()];
+        let land = |k: &str| k == "land" || k == "wasteland";
+        let ok = match ty {
+            "land" | "river" => kinds == ["land", "land"],
+            "impassable" => land(kinds[0]) && land(kinds[1]) && kinds.contains(&"wasteland"),
+            "coast" => kinds.contains(&"sea") && kinds.iter().any(|k| land(k)),
+            "lake" => kinds.contains(&"lake"),
+            "sea" => kinds == ["sea", "sea"],
+            "strait" => true,
+            _ => false,
+        };
+        assert!(ok, "border {f}-{to} of type {ty} between {kinds:?}");
+    }
+    for p in provs {
+        let a = p["id"].as_u64().unwrap();
+        for b in p["neighbors"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()) {
+            assert!(borders.contains_key(&(a.min(b), a.max(b), false)), "neighbours {a} and {b} have no border");
+        }
+    }
+
+    let n_provs = provs.len();
 
     let dir = std::env::temp_dir().join(format!("fwm-prov-{}", std::process::id()));
     let opts = ExportOptions { width: 2048, height: 1024, ..Default::default() };
@@ -205,6 +350,14 @@ fn states_and_provinces_round_trip() {
     let csv = dir.join("definition.csv").display().to_string();
     let (imp, rep) = worldcore::province_import::describe(&png, Some(&csv), None, None).unwrap();
     assert!(rep.ok, "{:?}", rep.errors);
+    // The export clean-up leaves every province some pixels, no X-crossings and
+    // (almost) no provinces in pieces.
+    for warning in &rep.warnings {
+        assert!(!warning.contains("no pixels") && !warning.contains("X-crossings"), "{warning}");
+    }
+    let pkg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap()).unwrap();
+    let split = pkg["province_cleanup"]["split_provinces"].as_u64().unwrap() as usize;
+    assert!(split * 100 <= n_provs, "{split} of {n_provs} provinces are in pieces");
     w.edits.imports.provinces = Some(imp);
     assert!(!w.is_fresh(Step::Provinces) && w.is_fresh(Step::States));
     w.run_to(LAST, &|_, _, _| {});

@@ -3,8 +3,10 @@
 //! for the planet (Stage 1) and three for states and provinces (Stage 2).
 
 pub mod api;
+pub mod community;
 pub mod edits;
 pub mod export;
+pub mod export_clean;
 pub mod fields;
 pub mod graph;
 pub mod grid;

@@ -1,7 +1,8 @@
 //! Placeholder place names. Each continent gets a small random "language" (a
 //! subset of onsets, vowels and codas plus a few favourite endings), so names on
-//! one continent sound related. Stage 3 replaces these with names from the
-//! simulated cultures' phonologies.
+//! one continent sound related. Each region speaks a dialect of it (a few sounds
+//! and endings swapped), so neighbouring regions sound related but distinct.
+//! Stage 3 replaces these with names from the simulated cultures' phonologies.
 
 use crate::rng::{stream, Rng};
 use std::collections::HashSet;
@@ -49,6 +50,21 @@ impl Lang {
         }
     }
 
+    /// A dialect: the same language with a few onsets, a coda, an ending and
+    /// sometimes a vowel swapped for others.
+    pub fn dialect(&self, seed: u64, id: u64) -> Lang {
+        let mut rng = Rng::new(seed ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15), stream::NAMES + 2);
+        let mut d = self.clone();
+        swap_some(&mut rng, &mut d.onsets, &ONSETS, 2);
+        swap_some(&mut rng, &mut d.codas, &CODAS, 1);
+        let k = 1 + rng.below(2);
+        swap_some(&mut rng, &mut d.endings, &ENDINGS, k);
+        if rng.f64() < 0.3 {
+            swap_some(&mut rng, &mut d.vowels, &VOWELS, 1);
+        }
+        d
+    }
+
     pub fn word(&self, rng: &mut Rng) -> String {
         let syl = 1 + rng.below(self.max_syllables);
         let mut s = String::new();
@@ -86,6 +102,27 @@ impl Lang {
         used.insert(w.clone());
         w
     }
+}
+
+/// Replace up to `k` entries of `set` with entries of `from` it does not have yet.
+fn swap_some(rng: &mut Rng, set: &mut [&'static str], from: &[&'static str], k: usize) {
+    for _ in 0..k {
+        let i = rng.below(set.len());
+        let c = from[rng.below(from.len())];
+        if !set.contains(&c) {
+            set[i] = c;
+        }
+    }
+}
+
+/// The language of a continent (0-based index).
+pub fn continent_lang(seed: u64, continent: u32) -> Lang {
+    Lang::new(seed, continent as u64 + 1)
+}
+
+/// The dialect spoken in a region (its 1-based id) of a continent (0-based index).
+pub fn region_lang(seed: u64, continent: u32, region: u16) -> Lang {
+    continent_lang(seed, continent).dialect(seed, region as u64)
 }
 
 /// No letter three times in a row, no more than three consonants or vowels in a row.

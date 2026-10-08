@@ -29,7 +29,7 @@ USAGE:
   worldgen serve [--port 8765] [--static DIR] [--project DIR] [--debug]
 
 STEPS: planet, sketch, plates, relief, climate, hydrology, biomes (Stage 1),
-       habitability, states, provinces (Stage 2; default: provinces)
+       habitability, states, provinces (Stage 2), cultures (Stage 3; default: cultures)
 ";
 
 struct Args {
@@ -150,6 +150,11 @@ fn summary(w: &World) {
             "provinces" => format!(
                 "{} provinces: {} land (median {:.0}k km²), {} wasteland, {} lakes, {} sea; {} straits",
                 m["provinces"], m["land"], m["median_land_km2"].as_f64().unwrap_or(0.0) / 1000.0, m["wasteland"], m["lakes"], m["sea"], m["straits"]
+            ),
+            "cultures" => format!(
+                "{} cultures in {} groups ({} ever: {} splits, {} merged, {} extinct), {} bands, {:.1} M people over {} years",
+                m["cultures"], m["groups"], m["cultures_ever"], m["splits"], m["merged"], m["extinct"], m["bands"],
+                m["population"].as_f64().unwrap_or(0.0) / 1e6, m["years"]
             ),
             _ => String::new(),
         };

@@ -4,21 +4,24 @@ Oct 4, 2026 · @Yunseok Shin
 
 ## Overview
 
-The proposal: build a desktop world generator that goes from planet to provinces to cultures in three stages. Each stage can be inspected, hand-edited and locked before the next stage runs. The output is a Paradox-style map package (PNG layers plus `definition.csv`), so you can keep working on it in GIMP, Photoshop or a map editor and load it back in.
+The proposal: build a desktop world generator that goes from planet to provinces to cultures to nations in four stages. Each stage can be inspected, hand-edited and locked before the next stage runs, and a single world editor at the end lets you change any layer the way in-game editors do. The output is a Paradox-style map package (PNG layers plus `definition.csv`), so you can keep working on it in GIMP, Photoshop or a map editor and load it back in.
 
 **Goals**
 
 - An Earth-sized planet (radius 6,371 km by default, adjustable) built from a rough continent sketch, with relief shaped by plate tectonics rather than noise alone.
 - A simple physically based climate (energy balance by latitude), turned into biomes.
 - States drawn along natural barriers such as ridges, major rivers, straits and deserts, then split into provinces whose size follows how habitable the land is.
-- Cultures that emerge from an agent simulation, plus an editor for merging, splitting and renaming them.
+- Cultures that emerge from an agent simulation.
+- Nations and a short history that grow on top of the finished cultures.
+- A world editor, like the in-game editors of HOI4 or Victoria 3, for provinces, states, cultures and nations in one place.
 - Round-trip editing: export, change it in an external tool, re-import, then re-run the later stages.
 
 **Non-goals for v1**
 
 - Fine local geography such as coastline detail below about 10 km. The data model leaves room for it later.
 - Full general circulation or ocean-current physics.
-- Running nations, wars or history. Cultures are the last stage in v1.
+- A playable grand-strategy game. Stage 4 produces a starting map and a history log, not a running game with diplomacy or battles.
+- Anything after the start date. History ends at a start date between 1910 and 1920, so later causes of growth (big dams of the 1930s, legal gambling, tourism, oil wealth) are not simulated; cities that owe their size to them are placed by hand (see *Settlement sites*).
 
 **Principles**
 
@@ -30,7 +33,7 @@ The proposal: build a desktop world generator that goes from planet to provinces
 
 The simulation runs on a geodesic sphere grid, and flat PNGs are produced only at export time. Because the grid is spherical, there are no polar distortion or seam problems during simulation. The flat map is just a projection of the result.
 
-&#91;embedded content: generation pipeline · 3 stages, override layers, export\]
+&#91;embedded content: generation pipeline · 4 stages, override layers, export\]
 
 Changing an earlier stage only marks the later stages as stale. The override layer is reapplied each time, and the exported package can be edited outside the app and loaded back in.
 
@@ -103,7 +106,23 @@ States grow outward from seeds, and crossing a natural barrier is made expensive
 ### Inputs computed per cell
 
 - **Habitability (0–1):** combines temperature, precipitation, nearness to rivers and coast, slope and biome. It sets how many provinces a state gets and, later, where agents live.
+- **Site value:** extra habitability at points the climate score misses (next subsection). It is added to habitability before states are seeded.
 - **Barrier cost** for each edge between cells: ridge crests (high cells that are higher than their neighbours), major rivers (by discharge rank), straits and open sea, deserts, ice and marsh. The barrier map is shown as its own layer, and you can paint on it to add or remove barriers by hand.
+
+### Settlement sites (cities in the desert)
+
+Habitability from climate alone puts nobody in a desert unless a river runs through it (the Nile case, already handled by backbone rivers). Real desert cities exist for other reasons, and most of them can be derived from data the pipeline already has:
+
+| Cause | Earth example | Built from | Where |
+| --- | --- | --- | --- |
+| Springs and groundwater | Las Vegas (named for its spring-fed meadows), Siwa, oases of the Sahara | New `groundwater` field in hydrology: recharge from rain on nearby uplands, flowing downhill under the surface and surfacing at basin floors and mountain feet | Stage 2, static |
+| Route waypoints | Palmyra, Timbuktu, Silk Road oases | Crossing value: how many shortest paths between fertile regions pass through a cell, times the cost of the desert around it | Stage 3, emerges from band travel |
+| Mineral wealth | Kalgoorlie, Chuquicamata | Resource deposits (see *Suggested additions*) | Stage 3, after the era that unlocks mining |
+| Large-scale water works | Phoenix (canals, Roosevelt Dam 1911) | Era-gated: a river within reach of a dry basin can irrigate it | Stage 3, later eras |
+| Railway stops | Las Vegas (founded 1905 as a railway town at its springs) | Industrial era: route waypoints with water get a bonus once railways exist | Stage 4, industrial era |
+| Things no model explains, or that come after the start date | Las Vegas as a gambling city, Dubai | A **site pin** placed by hand: a point with a target population | Override layer |
+
+The static part adds a site value that is large in a few cells and zero elsewhere, so a spring in the desert gets a small, dense cluster of provinces, not a wide fertile region. The dynamic parts raise the carrying capacity of those cells during the culture simulation, so a desert city can appear, grow and fade with the eras.
 
 ### States
 
@@ -157,11 +176,12 @@ The simulation uses 500–5,000 **bands**. A band is an abstract group of people
 
 - a home province and a population;
 - a trait vector (default 24 traits with a few values each), which works like Axelrod's model of cultural spread;
-- a phonology (sound inventory and syllable rules) used to generate names.
+- a phonology (sound inventory and syllable rules) used to generate names;
+- an empty **polity** slot. Stage 3 never fills it; it is there so Stage 4 can continue the same simulation without changing the band layout or the save format.
 
 ### One tick (default one generation, about 25 years)
 
-1. **Growth:** population grows logistically toward the province's carrying capacity, which comes from habitability.
+1. **Growth:** population grows logistically toward the province's carrying capacity, which comes from habitability plus the site value. Route, mining and water-works bonuses (see *Settlement sites*) switch on with the eras.
 2. **Fission and migration:** a band over capacity splits in two. The new band moves to the nearby province with the best habitability after subtracting travel cost. It inherits its parent's traits with small mutations.
 3. **Interaction:** each band picks partners within its travel range. The chance of contact falls off with travel cost and rises with similarity. When two bands interact, one copies a trait the other has. Each contact adds weight to a contact graph, and old weight fades over time.
 4. **Drift:** each trait has a small random chance of changing every tick.
@@ -175,24 +195,41 @@ The simulation uses 500–5,000 **bands**. A band is an abstract group of people
 - Each split and merge is logged, which builds a **family tree** of cultures with dates.
 - A province's culture is the majority by population. Minority shares are kept too, which helps with Victoria-style pops.
 
+**As built (M4).** Two additions turned out to be needed for clear cultures. *Homophily*: a contact succeeds with probability similarity³, not similarity, so unlike bands avoid each other. *Conformity*: a band may take the value most of its successful contacts share. Without them, each trait spreads on its own and neighbours agree on only about half their traits. Contact falls off over a fixed distance (200 km); the era's travel range only caps it. A new band always settles an unsettled province, so there is about one band per province. Community detection uses Louvain rather than Leiden; the persistence rule handles flicker.
+
 ### Names
 
 Each culture's phonology drifts along with its traits, and a daughter culture starts from a changed copy of its parent's. Names for cultures, provinces and states are generated from these phonologies, so related cultures have related-sounding names.
 
-### Culture editor
+Export adds `cultures.csv` (ID, name, group, colour, parent) and per-province culture shares to the package. Cultures are edited in the world editor (below).
 
-| Tool | What it does |
+## Stage 4 — Nations and history
+
+Nations come after cultures, and read them as input. The finished culture map is the ground they grow on, so a nation forms inside a culture group first and spreads outward, and its borders tend to follow the cultural and natural ones already in the map.
+
+- **Polity formation:** from a set era, dense and well-connected clusters of bands found polities. The polity slot on each band is filled, and a capital province is picked by population and site value.
+- **Timeline:** Stage 4 runs on its own clock in years, not generations, from polity formation up to a **start date** chosen between 1910 and 1920 (default 1914). Eras unlock tools along the way: gunpowder states, ocean shipping, then railways and industrial mining in the last century before the start date.
+- **Ownership is per province:** a nation's border can cut through a Stage 2 state, so one state can be split between several nations, like Victoria 3's split states. As in EU4, a nation's territory does not have to be connected: exclaves and detached territories (overseas colonies, a city held across a border) are allowed. States stay as geographic units and are never redrawn by Stage 4.
+- **Expansion and collapse:** polities grow over the province graph at a cost that rises with barriers, distance from the capital and cultural distance. Large, culturally mixed polities have a chance to break apart along culture lines.
+- **Railways:** in the industrial era, nations lay rail lines between their largest settlements along the cheapest land route (the same barrier-aware cost as Stage 2), with stations where lines meet or where a route needs water. Stations raise the carrying capacity around them, which is what grows railway towns in the desert. Output: `railways.csv` (line ID, owner, station provinces in order) and a `railways.png` reference layer.
+- **Feedback on culture:** while Stage 4 runs, contact inside one polity counts for more, so cultures slowly converge within borders. This is the only way Stage 4 changes culture, and locked cultures are exempt.
+- **Output:** owner per province at a chosen start date, a capital per nation, `nations.csv` (ID, name, primary culture, colour, capital) and a dated event log of foundings, conquests and splits for lore writing.
+
+Keeping this order makes each stage simple to re-run: changing a nation never re-runs cultures, and changing cultures marks Stage 4 as stale like any other stage.
+
+## World editor
+
+All hand editing comes together in one editor at the end, in the style of the in-game map editors of Paradox games. It works on any layer, reads the current map and writes only to the override layer, so re-running a stage keeps every edit. The Stage 2 brushes (barrier, grow state, grow province) stay where they are as quick tools and move into the editor as well.
+
+| Layer | Tools |
 | --- | --- |
-| Merge | Combine two or more cultures; their traits are averaged, weighted by population. Can also merge them as siblings under one group. |
-| Split (auto) | Re-run community detection on one culture's bands, asking for 2–n parts. |
-| Split (manual) | Draw a line or lasso on the map, or pick provinces. |
-| Paint | Brush culture onto provinces. |
-| Re-parent | Drag a culture to a new place in the family tree. |
-| Rename / recolour | Edit by hand or generate new names from the culture's phonology. |
-| Lock | Keep a culture fixed when the simulation is re-run or continued. |
-| Continue sim | Keep simulating from the edited state, so edits become the new starting point. |
-
-Every edit goes into the override layer and supports undo and redo. Export adds `cultures.csv` (ID, name, group, colour, parent) and per-province culture shares to the package.
+| Provinces | Paint, split by line, merge, move to another state, rename, mark as wasteland / lake / sea zone |
+| States, regions | Paint, merge, split, re-group into regions and continents, rename, recolour |
+| Sites | Place, move or remove site pins with a target population |
+| Cultures | Merge (traits averaged by population, or as siblings under one group); split automatically (community detection into 2–n parts) or by line, lasso or province pick; paint; re-parent in the family tree; rename or regenerate names from the phonology; lock |
+| Nations | Paint ownership (exclaves allowed), set capital, merge, release a nation from another, rename, recolour, lock |
+| Railways | Add, move or delete stations; draw, reroute or delete rail lines between stations (snapped to the province graph); set the opening year of a line; lock a line so re-running Stage 4 keeps it |
+| All | Undo and redo; inspector panel for the hovered province; **continue sim** from the edited state, so edits become the new starting point |
 
 ## Suggested additions
 
@@ -202,23 +239,24 @@ These go beyond the brief. Each one reuses data the pipeline already produces, s
 | --- | --- | --- | --- |
 | Override layers | Regenerating never wipes manual work, and edits stay valid when you change the seed | Edit log keyed by cell and ID | Core, M0 |
 | Game-ready export profiles (CK3, Vic3) | Only if you later want to load the world in a game | Neutral package + per-game writers | M3 |
-| Religions | Same mechanism as cultures, on a slower clock, spread along trade and contact | Stage 3 engine, second trait vector | After M5 |
-| Resources and trade goods | Ore near mountain belts and old shields, grain on fertile plains, fish on shelves | Tectonics, biome, hydrology | After M5 |
+| Religions | Same mechanism as cultures, on a slower clock, spread along trade and contact; Stage 4 polities can adopt one | Stage 3 engine, second trait vector | M5 |
+| Resources and trade goods | Ore near mountain belts and old shields, grain on fertile plains, fish on shelves; also drives mining towns in *Settlement sites* | Tectonics, biome, hydrology | M4 |
 | Population and development per province | A ready-made starting value for each province | Agent populations | M4 |
 | Culture family tree export | Lore writing, flavour text | Split and merge event log | M4 |
-| GeoJSON / Azgaar-style JSON export | Use with GIS tools and other generators | Province polygons | After M5 |
+| GeoJSON / Azgaar-style JSON export | Use with GIS tools and other generators | Province polygons | After M6 |
 | Headless CLI | Batch generation, seed sweeps, automated tests | Rust core | M0 |
 
 ## Roadmap
 
-There are six milestones, each ending in something you can use and a pass/fail check. Durations will be set once the stack and the target game are decided.
+There are seven milestones, each ending in something you can use and a pass/fail check. Durations will be set once the stack and the target game are decided.
 
 1. **M0 — Foundations:** sphere grid, globe and flat-map viewer, project file, headless CLI, seeds. *Done when:* a 655,362-cell globe renders smoothly and save/load gives back the identical project.
 2. **M1 — Sketch and tectonics:** sketch tools, plates, boundary relief, hotspots. *Done when:* an Earth-like sketch puts trenches, island arcs and mountain belts in plausible places.
 3. **M2 — Climate, hydrology, biomes:** *Done when:* given Earth's real elevation data as input, the Köppen map broadly matches the real one. This is the same check the geometrian tool uses.
-4. **M3 — States, provinces, export/import:** *Done when:* the exported package matches the CK3/Vic3-style layout, and an edit made in GIMP passes validation on re-import.
-5. **M4 — Culture simulation:** *Done when:* 5,000 bands run 400 ticks in about a minute and give stable culture groups.
-6. **M5 — Culture editor and polish:** merge, split, paint, family tree, locking, undo.
+4. **M3 — States, provinces, export/import:** *Done when:* the exported package matches the CK3/Vic3-style layout, and an edit made in GIMP passes validation on re-import. Groundwater and the static site value land here as an addition to the habitability step.
+5. **M4 — Culture simulation:** includes the era-gated site bonuses and resources. *Done when:* 5,000 bands run 400 ticks in about a minute and give stable culture groups, and on an Earth-like test map at least one desert spring or route waypoint far from any river grows a settlement.
+6. **M5 — Nations and history:** *Done when:* a run gives nations whose borders mostly follow culture groups and barriers, the event log replays to the same final map, and re-running Stage 4 never changes a locked culture.
+7. **M6 — World editor and polish:** one editor for provinces, states, sites, cultures, nations and railways; undo; continue sim. *Done when:* every layer can be edited, every edit survives re-running all four stages, and the edited world exports and re-imports cleanly.
 
 ## Risks
 
@@ -233,6 +271,8 @@ There are six milestones, each ending in something you can use and a pass/fail c
 ## Open questions
 
 - Which Paradox game is the first export target? Resolved: no game target. The package is a guideline that follows CK3 and Victoria 3 conventions for the `definition.csv` layout, map size and heightmap.
-- Is the recommended stack (Rust + Tauri + TypeScript) OK, or do you prefer one engine such as Godot?
-- Flat export projection: equirectangular, or something like Miller that is kinder at high latitudes?
-- Will nations or history come after cultures? If so, the agent model should leave room for politics.
+- Is the recommended stack (Rust + Tauri + TypeScript) OK, or do you prefer one engine such as Godot? Resolved: Rust + Tauri + TypeScript, as built in M0–M3.
+- Flat export projection: equirectangular, or something like Miller that is kinder at high latitudes? Resolved: equirectangular with an optional latitude crop, as built.
+- Will nations or history come after cultures? Resolved: yes, as Stage 4. Bands carry an empty polity slot from M4 so the same simulation can continue into nations.
+- Can a nation's border cut through a Stage 2 state? Resolved: yes. Ownership is stored per province, a state can be split between nations, and exclaves are allowed, as in EU4.
+- How far should history run? Resolved: up to a start date between 1910 and 1920 (default 1914), so the exported map is an early-20th-century start in the spirit of Victoria 3's late game or HOI4's opening.
