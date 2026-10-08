@@ -302,6 +302,11 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
             pw.finish().map_err(|e| e.to_string())?;
             sw.finish().map_err(|e| e.to_string())?;
             files.extend(["provinces.png".to_string(), "states.png".to_string()]);
+            if let Some(cm) = w.meta(Step::Cultures).filter(|_| fresh(Step::Cultures)) {
+                progress(0.33, "Writing cultures.png");
+                write_cultures_png(dir, &r, &cm["table"], &prov_info, wpx, hpx)?;
+                files.push("cultures.png".into());
+            }
             Some(r)
         }
         _ => None,
@@ -421,11 +426,18 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         files.push("rivers.geojson".into());
     }
 
-    // Stage 2 tables.
+    // Stage 2 tables (with Stage 3 names when cultures are up to date) and Stage 3 tables.
     if layers.province.is_some() {
         progress(0.95, "Writing province tables");
-        let table = &w.meta(Step::Provinces).ok_or("no provinces")?["table"];
-        files.extend(write_tables(dir, table, wpx, hpx, opts)?);
+        let mut table = w.meta(Step::Provinces).ok_or("no provinces")?["table"].clone();
+        let cultures = w.meta(Step::Cultures).filter(|_| fresh(Step::Cultures));
+        if let Some(cm) = cultures {
+            crate::stages::cultures::apply_names(&mut table, &cm["table"]);
+        }
+        files.extend(write_tables(dir, &table, wpx, hpx, opts)?);
+        if let Some(cm) = cultures {
+            files.extend(write_culture_tables(dir, &cm["table"])?);
+        }
     }
 
     progress(0.97, "Writing package description");
@@ -453,6 +465,11 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
             "regions.csv": "id;key;name;continent;states",
             "continents.csv": "id;name;area_km2;states;regions",
             "adjacencies.csv": "CK3 layout: From;To;Type;Through;start_x;start_y;stop_x;stop_y;Comment — sea crossings between provinces on different landmasses",
+            "cultures.png": "reference map: provinces coloured by majority culture (group hue), culture borders dark, culture group borders black, unsettled land grey",
+            "cultures.csv": "id;name;group;color;parent;alive;population;provinces;founded_year;ended_year;fate;fate_other — every culture that ever existed (the family tree: parent, and for ended ones whether they merged into fate_other or died out)",
+            "culture_groups.csv": "id;name;color;population;cultures",
+            "culture_events.csv": "year;event (emerged, split, merged, extinct);culture;other (parent of a split, culture a merge went into)",
+            "province_cultures.csv": "province;population;culture (majority);shares (culture:share, shares ≥ 5%)",
             "province_adjacency.csv": "from;to;type;border_km;barrier;crossing_km — every border between two provinces; type: land, river (along a border river), impassable (wasteland), coast (land–sea), lake, sea, strait (crossing_km = width); barrier = mean crossing cost of the border (0 = open)",
         },
         "province_cleanup": clean_report,
@@ -774,6 +791,98 @@ fn write_tables(dir: &Path, t: &serde_json::Value, wpx: usize, hpx: usize, o: &E
     }
     write("province_adjacency.csv", pa)?;
     Ok(["definition.csv", "provinces.csv", "states.csv", "regions.csv", "continents.csv", "adjacencies.csv", "province_adjacency.csv"].map(String::from).to_vec())
+}
+
+/// cultures.png: provinces coloured by majority culture, culture borders dark,
+/// culture group borders black, empty land grey, water blue.
+fn write_cultures_png(dir: &Path, r: &clean::ProvRaster, t: &serde_json::Value, info: &std::collections::HashMap<u32, (u8, u16)>, wpx: usize, hpx: usize) -> Result<(), String> {
+    let mut cult_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for p in t["provinces"].as_array().into_iter().flatten() {
+        cult_of.insert(p["id"].as_u64().unwrap_or(0) as u32, p["culture"].as_u64().unwrap_or(0) as u32);
+    }
+    let mut look: std::collections::HashMap<u32, ([u8; 3], u32)> = std::collections::HashMap::new();
+    for c in t["cultures"].as_array().into_iter().flatten() {
+        let col = &c["color"];
+        let rgb = [col[0].as_u64().unwrap_or(0) as u8, col[1].as_u64().unwrap_or(0) as u8, col[2].as_u64().unwrap_or(0) as u8];
+        look.insert(c["id"].as_u64().unwrap_or(0) as u32, (rgb, c["group"].as_u64().unwrap_or(0) as u32));
+    }
+    // (culture, group, class) per province id: class 0 land, 1 empty land, 2 lake, 3 sea.
+    let key = |id: u32| -> (u32, u32, u8) {
+        let k = info.get(&id).map_or(3, |x| x.0);
+        if k >= 2 {
+            return (0, 0, k);
+        }
+        let c = cult_of.get(&id).copied().unwrap_or(0);
+        match look.get(&c) {
+            Some(&(_, g)) if c > 0 => (c, g, 0),
+            _ => (0, 0, 1),
+        }
+    };
+    let file = File::create(dir.join("cultures.png")).map_err(|e| format!("cultures.png: {e}"))?;
+    let mut e = png::Encoder::new(BufWriter::new(file), wpx as u32, hpx as u32);
+    e.set_color(png::ColorType::Rgb);
+    e.set_depth(png::BitDepth::Eight);
+    e.set_compression(png::Compression::Fast);
+    let mut wr = e.write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?;
+    let mut line = vec![0u8; wpx * 3];
+    let mut prev: Vec<(u32, u32, u8)> = Vec::new();
+    for y in 0..hpx {
+        let row: Vec<(u32, u32, u8)> = r.ids[y * wpx..(y + 1) * wpx].iter().map(|&id| key(id)).collect();
+        for x in 0..wpx {
+            let (c, g, k) = row[x];
+            let mut rgb = match k {
+                0 => look[&c].0,
+                1 => [150, 146, 138],
+                2 => [110, 160, 215],
+                _ => [40, 70, 120],
+            };
+            let nbs = [if x > 0 { Some(row[x - 1]) } else { None }, prev.get(x).copied()];
+            for nb in nbs.into_iter().flatten() {
+                if k <= 1 && nb.2 <= 1 && nb.0 != c {
+                    rgb = if nb.1 != g { [15, 15, 15] } else { rgb.map(|v| (v as f64 * 0.6) as u8) };
+                }
+            }
+            line[x * 3..x * 3 + 3].copy_from_slice(&rgb);
+        }
+        wr.write_all(&line).map_err(|e| e.to_string())?;
+        prev = row;
+    }
+    wr.finish().map_err(|e| e.to_string())
+}
+
+/// cultures.csv, culture_groups.csv, culture_events.csv, province_cultures.csv.
+fn write_culture_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>, String> {
+    let empty = vec![];
+    let arr = |k: &str| t[k].as_array().unwrap_or(&empty);
+    let write = |name: &str, text: String| std::fs::write(dir.join(name), text).map_err(|e| format!("{name}: {e}"));
+    let hexc = |c: &serde_json::Value| format!("x{:02X}{:02X}{:02X}", c[0].as_u64().unwrap_or(0), c[1].as_u64().unwrap_or(0), c[2].as_u64().unwrap_or(0));
+    let opt = |v: &serde_json::Value| if v.is_null() { String::new() } else { v.to_string() };
+    let mut cu = String::from("id;name;group;color;parent;alive;population;provinces;founded_year;ended_year;fate;fate_other\n");
+    for c in arr("cultures") {
+        cu += &format!(
+            "{};{};{};{};{};{};{};{};{};{};{};{}\n",
+            c["id"], csv_text(&c["name"]), c["group"], hexc(&c["color"]), c["parent"], c["alive"], c["population"], c["provinces"],
+            c["founded_year"], opt(&c["ended_year"]), csv_text(&c["fate"]), c["fate_other"],
+        );
+    }
+    write("cultures.csv", cu)?;
+    let mut gr = String::from("id;name;color;population;cultures\n");
+    for g in arr("groups") {
+        gr += &format!("{};{};{};{};{}\n", g["id"], csv_text(&g["name"]), hexc(&g["color"]), g["population"], csv_text(&g["cultures"]));
+    }
+    write("culture_groups.csv", gr)?;
+    let mut ev = String::from("year;event;culture;other\n");
+    for e in arr("events") {
+        ev += &format!("{};{};{};{}\n", e["year"], csv_text(&e["kind"]), e["culture"], e["other"]);
+    }
+    write("culture_events.csv", ev)?;
+    let mut pc = String::from("province;population;culture;shares\n");
+    for p in arr("provinces") {
+        let shares: Vec<String> = p["shares"].as_array().into_iter().flatten().map(|s| format!("{}:{}", s[0], s[1])).collect();
+        pc += &format!("{};{};{};{}\n", p["id"], p["population"], p["culture"], shares.join(" "));
+    }
+    write("province_cultures.csv", pc)?;
+    Ok(["cultures.csv", "culture_groups.csv", "culture_events.csv", "province_cultures.csv"].map(String::from).to_vec())
 }
 
 /// River chains, biggest first: each runs from a source down its main stem to

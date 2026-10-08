@@ -78,6 +78,7 @@ export const RAMPS: Record<string, Stop[]> = {
   precip: [[0, [150, 90, 40]], [250, [220, 190, 110]], [500, [230, 230, 160]], [1000, [130, 200, 120]], [2000, [40, 140, 160]], [3000, [30, 70, 170]], [4500, [60, 20, 120]]],
   land: [[0, [86, 140, 82]], [300, [128, 168, 96]], [800, [196, 196, 128]], [1600, [190, 150, 100]], [2800, [150, 110, 90]], [4200, [200, 190, 185]], [6000, [250, 250, 252]]],
   sea: [[-8000, [8, 20, 60]], [-5000, [20, 45, 100]], [-3000, [30, 70, 135]], [-1000, [50, 105, 170]], [-150, [90, 155, 205]], [0, [130, 190, 225]]],
+  density: [[0, [235, 228, 205]], [1, [220, 200, 120]], [5, [215, 150, 60]], [15, [190, 80, 40]], [40, [120, 20, 40]], [100, [50, 0, 40]]],
   unit: [[0, [20, 30, 60]], [0.25, [40, 90, 160]], [0.5, [80, 170, 170]], [0.75, [210, 200, 90]], [1, [250, 240, 200]]],
   diverging: [[-1, [40, 80, 200]], [0, [240, 240, 240]], [1, [200, 50, 40]]],
   wind: [[0, [30, 40, 90]], [3, [50, 110, 170]], [6, [90, 180, 160]], [9, [220, 220, 110]], [13, [240, 140, 60]], [18, [200, 50, 60]]],
@@ -146,7 +147,7 @@ export type Legend = { title: string; items?: LegendItem[]; gradient?: { stops: 
 export type LayerId =
   | 'sketch' | 'plates' | 'crust' | 'boundaries' | 'elevation' | 'temperature' | 'precipitation'
   | 'continentality' | 'currents' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress'
-  | 'habitability' | 'barrier' | 'states' | 'regions' | 'provinces';
+  | 'habitability' | 'barrier' | 'states' | 'regions' | 'provinces' | 'cultures' | 'culture_groups' | 'population';
 
 export type LayerDef = {
   id: LayerId;
@@ -179,6 +180,9 @@ export const LAYERS: LayerDef[] = [
   { id: 'states', label: 'States', fields: ['state', 'province', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'regions', label: 'Regions & continents', fields: ['region', 'state', 'continent', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'provinces', label: 'Provinces', fields: ['province', 'province_kind', 'state', 'water', 'elevation'], smooth: false, group: 'Political' },
+  { id: 'cultures', label: 'Cultures', fields: ['culture', 'culture_group', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
+  { id: 'culture_groups', label: 'Culture groups', fields: ['culture_group', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
+  { id: 'population', label: 'Population density', fields: ['population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
 ];
 
 /** Same colours as states.png (core/src/export.rs state_color). */
@@ -186,6 +190,16 @@ export function stateColor(id: number): RGB {
   const h = (id * 137.508) % 360;
   const l = id % 3 === 0 ? 0.48 : id % 3 === 1 ? 0.6 : 0.7;
   return hsl(h, 0.5, l).map((v) => Math.floor(v)) as RGB;
+}
+
+/** Culture colour: its group's hue, shifted a little per culture (same as culture_color in core/src/stages/cultures.rs). */
+export function cultureColor(id: number, group: number): RGB {
+  const h = ((((group * 137.508) % 360) + ((id * 67) % 40) - 20) % 360 + 360) % 360;
+  return hsl(h, 0.42 + 0.12 * (id % 3), 0.42 + 0.07 * (id % 4)).map((v) => Math.floor(v)) as RGB;
+}
+
+export function groupColor(group: number): RGB {
+  return hsl((group * 137.508) % 360, 0.55, 0.5).map((v) => Math.floor(v)) as RGB;
 }
 
 /** Stable pseudo-random colour for a province id (the UI's view; provinces.png uses the table colours). */
@@ -412,6 +426,34 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
         put(i, stateColor(r * 7 + 3), 0.92 + tint);
       }
       legend = { title: 'Regions', items: [{ color: [20, 20, 20], label: 'Region border' }, { color: [120, 120, 120], label: 'Thin line: state border' }] };
+      break;
+    }
+    case 'cultures':
+    case 'culture_groups': {
+      const cu = f['culture'], gr = f['culture_group'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const g = gr ? gr[i] : 0;
+        const c = id === 'cultures' ? (cu ? cu[i] : 0) : g;
+        if (!c) { put(i, [150, 146, 138], 0.85 + 0.15 * sh(i)); continue; }
+        put(i, id === 'cultures' ? cultureColor(c, g) : groupColor(g), 0.9 + 0.1 * sh(i));
+      }
+      legend = { title: id === 'cultures' ? 'Cultures (hue = group)' : 'Culture groups', items: [
+        { color: [20, 20, 20], label: 'Group border' },
+        ...(id === 'cultures' ? [{ color: [90, 90, 90] as RGB, label: 'Thin line: culture border' }] : []),
+        { color: [150, 146, 138], label: 'Unsettled land' },
+      ] };
+      break;
+    }
+    case 'population': {
+      const pd = f['population'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        put(i, ramp(RAMPS.density, pd ? pd[i] : 0), 0.85 + 0.15 * sh(i));
+      }
+      legend = { title: 'Population density (people per km²)', gradient: { stops: RAMPS.density, unit: '/km²' } };
       break;
     }
     case 'provinces': {

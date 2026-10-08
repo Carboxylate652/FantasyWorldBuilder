@@ -195,6 +195,8 @@ The simulation uses 500–5,000 **bands**. A band is an abstract group of people
 - Each split and merge is logged, which builds a **family tree** of cultures with dates.
 - A province's culture is the majority by population. Minority shares are kept too, which helps with Victoria-style pops.
 
+**As built (M4).** Two additions turned out to be needed for clear cultures. *Homophily*: a contact succeeds with probability similarity³, not similarity, so unlike bands avoid each other. *Conformity*: a band may take the value most of its successful contacts share. Without them, each trait spreads on its own and neighbours agree on only about half their traits. Contact falls off over a fixed distance (200 km); the era's travel range only caps it. A new band always settles an unsettled province, so there is about one band per province. Community detection uses Louvain rather than Leiden; the persistence rule handles flicker.
+
 ### Names
 
 Each culture's phonology drifts along with its traits, and a daughter culture starts from a changed copy of its parent's. Names for cultures, provinces and states are generated from these phonologies, so related cultures have related-sounding names.

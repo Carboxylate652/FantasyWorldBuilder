@@ -1,4 +1,5 @@
-// UI description of the pipeline steps (seven for Stage 1, three for Stage 2):
+// UI description of the pipeline steps (seven for Stage 1, three for Stage 2,
+// one for Stage 3):
 // parameters, default layer and tools.
 
 import type { LayerId } from './layers';
@@ -57,6 +58,8 @@ export const TOOLS: ToolDef[] = [
 
 /** Index of the first Stage 2 step. */
 export const STAGE2_START = 7;
+/** Index of the first Stage 3 step. */
+export const STAGE3_START = 10;
 
 export type StepUI = {
   key: string;
@@ -218,6 +221,26 @@ export const STEPS: StepUI[] = [
       p('provinces', 'open_sea_km2', 'Open ocean zone (km²)', 20000, 10000000, 10000),
       p('provinces', 'lake_province_km2', 'Lake province from (km²)', 100, 500000, 100),
       p('provinces', 'max_strait_km', 'Longest strait crossing (km)', 0, 1000, 5),
+    ],
+  },
+  {
+    key: 'cultures', title: 'Cultures', layer: 'cultures', tools: [],
+    blurb: 'Bands of people spread over the provinces, grow, split and meet. Contact makes them alike, isolation and drift make them differ; where contact stays rare, cultures split. Groups are cultures that stay in touch.',
+    params: [
+      p('cultures', 'ticks', 'Generations', 20, 2000, 10, 'One generation is a tick of the simulation.'),
+      p('cultures', 'years_per_tick', 'Years per generation', 10, 50, 1),
+      p('cultures', 'initial_bands', 'Founding bands', 1, 1000, 1, 'Bands placed at the start. Few founders give a family tree of splits; many give unrelated cultures that merge.'),
+      p('cultures', 'max_bands', 'Band limit', 100, 20000, 100, 'Never below the number of habitable provinces (about one band each); more bands are slower.'),
+      p('cultures', 'density_per_km2', 'People per km² (fertile land)', 0.1, 100, 0.1),
+      p('cultures', 'contact_scale_km', 'Contact distance (km)', 20, 2000, 10, 'Most contact is within about this distance.'),
+      p('cultures', 'homophily', 'Like seeks like', 0, 10, 0.1, 'Higher values make unlike bands avoid each other, so cultures form sharper borders.'),
+      p('cultures', 'conformity', 'Conformity', 0, 1, 0.05, 'Chance per generation that a band takes the trait most of its contacts share.'),
+      p('cultures', 'drift', 'Drift per trait', 0, 0.02, 0.0001, 'Chance per trait and generation of a random change.'),
+      p('cultures', 'barrier_weight', 'Barrier weight', 0, 5, 0.05),
+      p('cultures', 'sea_cost', 'Sea travel cost', 0.1, 5, 0.05, 'Cost per km at sea once sailing is possible (era 3 coastal, era 4 open sea).'),
+      p('cultures', 'culture_resolution', 'Culture detail', 0.5, 20, 0.5, 'Higher values find more, smaller cultures.'),
+      p('cultures', 'group_resolution', 'Group detail', 0.005, 2, 0.005, 'Lower values make fewer, larger culture groups.'),
+      p('cultures', 'persistence', 'Checks before a change counts', 1, 10, 1, 'A split, merge or change of culture must hold this many checks in a row.'),
     ],
   },
 ];

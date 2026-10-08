@@ -1,17 +1,20 @@
 import './style.css';
 import * as api from './api';
 import { Grid, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
-import { BOUNDARY, KOPPEN, LAYERS, MONTHS, TERRAIN, colorize, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
+import { BOUNDARY, KOPPEN, LAYERS, MONTHS, TERRAIN, colorize, cultureColor, groupColor, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
-import { STAGE2_START, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
+import { STAGE2_START, STAGE3_START, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
 
 // ------------------------------------------------------------------ state
 
-/** States, regions, continents, provinces and straits of the latest run, indexed by id. */
+/** States, regions, continents, provinces and straits of the latest run, plus
+ *  cultures when they are up to date, indexed by id. */
 type Political = {
   states: any[]; regions: any[]; continents: any[]; provinces: any[]; adjacencies: any[];
+  cultures: any[]; groups: any[]; events: any[];
   byState: Map<number, any>; byRegion: Map<number, any>; byProv: Map<number, any>; byCont: Map<number, any>;
+  byCulture: Map<number, any>; byGroup: Map<number, any>;
 };
 
 type StepStatus = { key: string; title: string; state: 'done' | 'stale' | 'empty'; millis: number; meta: any };
@@ -136,7 +139,9 @@ async function political(): Promise<Political | null> {
     const idx = (a: any[] | undefined) => new Map<number, any>((a ?? []).map((x) => [x.id, x]));
     S.political = {
       states: t.states ?? [], regions: t.regions ?? [], continents: t.continents ?? [], provinces: t.provinces ?? [], adjacencies: t.adjacencies ?? [],
+      cultures: t.cultures ?? [], groups: t.culture_groups ?? [], events: t.culture_events ?? [],
       byState: idx(t.states), byRegion: idx(t.regions), byProv: idx(t.provinces), byCont: idx(t.continents),
+      byCulture: idx(t.cultures), byGroup: idx(t.culture_groups),
     };
   } catch {
     return null;
@@ -193,6 +198,7 @@ function stepOfLayer(id: LayerId): string {
     stress: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', continentality: 'Climate',
     currents: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
     habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
+    cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures',
   };
   return m[id];
 }
@@ -305,9 +311,15 @@ async function refreshOverlays() {
   // state borders over any other layer with the Borders overlay.
   const lay = S.layer;
   const political = lay === 'states' || lay === 'provinces' || lay === 'regions';
-  const stf = political || S.overlays.borders ? await getField('state') : null;
+  const cultural = lay === 'cultures' || lay === 'culture_groups';
+  const stf = cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
   if (stf && !stf.stale) {
     const L = new Lines();
+    // Culture layers: culture borders as hairlines, group borders as ribbons.
+    if (lay === 'cultures') {
+      const cu = await getField('culture');
+      if (cu) for (const [a, b] of cellEdges(g, cu.values, (x, y) => x > 0 && y > 0)) L.seg(a, b, [0.05, 0.05, 0.05, 0.45], 0.0024);
+    }
     if (lay === 'states' || lay === 'provinces') {
       const pv = await getField('province'), pk = await getField('province_kind');
       if (pv && pk) {
@@ -660,6 +672,7 @@ function renderSteps() {
       h('input', { type: 'checkbox', checked: S.autoRun, onchange: (e: Event) => (S.autoRun = (e.target as HTMLInputElement).checked) }), 'Auto-update')));
   STEPS.forEach((ui, idx) => {
     if (idx === STAGE2_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 2 · States and provinces')));
+    if (idx === STAGE3_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 3 · Cultures')));
     box.append(stepCard(ui, idx, st.steps[idx]));
   });
   box.scrollTop = scroll;
@@ -906,6 +919,38 @@ function summary(key: string, m: any): HTMLElement {
           list.append(h('div', { class: 'item link', onclick: () => R.lookAt(fromLatLon((s.capital[0] * Math.PI) / 180, (s.capital[1] * Math.PI) / 180)) },
             h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${c.join(',')})` }), `${s.name}`),
             h('span', { class: 'muted' }, `${r ? r.name + ' · ' : ''}${fmt(s.area_km2 / 1000)}k km² · habitability ${fmt(s.habitability, 2)}`)));
+        }
+      });
+      break;
+    }
+    case 'cultures': {
+      box.append(stat('Cultures', `${fmt(m.cultures)} in ${fmt(m.groups)} groups`), stat('Population', `${fmt(m.population / 1e6, 1)} M of ${fmt(m.capacity / 1e6, 1)} M possible`),
+        stat('History', `${fmt(m.years)} years: ${fmt(m.splits)} splits, ${fmt(m.merged)} merges, ${fmt(m.extinct)} died out`), stat('Bands', fmt(m.bands)));
+      const list = h('div', { class: 'list' });
+      box.append(list);
+      political().then((P) => {
+        if (!P || !P.cultures.length) return;
+        const yr = (y: number) => `year ${fmt(y)}`;
+        for (const g of P.groups.slice(0, 12)) {
+          const gc = groupColor(g.id).map(Math.round);
+          list.append(h('div', { class: 'item' }, h('b', {}, h('i', { class: 'swatch', style: `background: rgb(${gc.join(',')})` }), g.name),
+            h('span', { class: 'muted' }, `${fmt(g.population / 1e6, 1)} M people`)));
+          const members = (g.cultures as number[]).map((c) => P.byCulture.get(c)).filter(Boolean).sort((a, b) => b.population - a.population);
+          for (const c of members) {
+            const cc = cultureColor(c.id, c.group).map(Math.round);
+            const parent = c.parent ? P.byCulture.get(c.parent) : null;
+            const origin = parent ? `Split from ${parent.name} in ${yr(c.founded_year)}` : `Emerged in ${yr(c.founded_year)}`;
+            list.append(h('div', { class: 'item', title: origin },
+              h('span', {}, '\u00a0\u00a0', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name),
+              h('span', { class: 'muted' }, `${fmt(c.population / 1e6, 2)} M · ${c.provinces} prov.${parent ? ' · from ' + parent.name : ''}`)));
+          }
+        }
+        const recent = P.events.filter((e) => e.kind !== 'emerged').slice(-8).reverse();
+        if (recent.length) list.append(h('div', { class: 'item' }, h('b', {}, 'Latest events')));
+        for (const e of recent) {
+          const a = P.byCulture.get(e.culture)?.name ?? `#${e.culture}`, b = P.byCulture.get(e.other)?.name ?? '';
+          const text = e.kind === 'split' ? `${a} split from ${b}` : e.kind === 'merged' ? `${a} merged into ${b}` : `${a} died out`;
+          list.append(h('div', { class: 'item' }, h('span', {}, text), h('span', { class: 'muted' }, yr(e.year))));
         }
       });
       break;
@@ -1278,6 +1323,11 @@ function describe(d: any): string {
     const ct = s ? P.byCont.get(s.continent) : null;
     if (s) parts.push(`state ${s.name}${r ? ', ' + r.name : ''}${ct ? ', ' + ct.name : ''}`);
   }
+  if (P && d.culture) {
+    const c = P.byCulture.get(d.culture), g = c ? P.byGroup.get(c.group) : null;
+    if (c) parts.push(`${c.name} culture${g ? ' (' + g.name + ')' : ''}`);
+  }
+  if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
   return parts.join('  ·  ');
 }
 

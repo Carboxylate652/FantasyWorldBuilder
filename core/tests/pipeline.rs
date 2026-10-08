@@ -157,6 +157,65 @@ fn scatter_noise_reference_values() {
     assert!(got.iter().all(|v| v.abs() <= 1.2));
 }
 
+/// Stage 3: cultures emerge and settle the land, the family tree is consistent
+/// (parents existed before their daughters, ended cultures have a fate),
+/// provinces carry cultures and populations, and the export writes the tables.
+#[test]
+fn cultures_emerge_and_are_consistent() {
+    use worldcore::fields::Field;
+    let mut p = WorldParams::default();
+    p.planet.seed = 4;
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 200;
+    p.cultures.max_bands = 600;
+    let mut w = World::new(p);
+    w.run_to(LAST, &|_, _, _| {});
+    let m = w.meta(Step::Cultures).unwrap();
+    let t = &m["table"];
+    let cultures = t["cultures"].as_array().unwrap();
+    let alive: Vec<&serde_json::Value> = cultures.iter().filter(|c| c["alive"] == true).collect();
+    assert!(alive.len() >= 3, "only {} cultures", alive.len());
+    assert!(m["population"].as_f64().unwrap() > 0.5 * m["capacity"].as_f64().unwrap(), "land barely settled: {m}");
+    let by_id: std::collections::HashMap<u64, &serde_json::Value> = cultures.iter().map(|c| (c["id"].as_u64().unwrap(), c)).collect();
+    let groups = t["groups"].as_array().unwrap().len() as u64;
+    for c in cultures {
+        let parent = c["parent"].as_u64().unwrap();
+        if parent > 0 {
+            assert!(by_id[&parent]["founded_year"].as_f64().unwrap() < c["founded_year"].as_f64().unwrap(), "culture {} older than its parent", c["id"]);
+        }
+        if c["alive"] == true {
+            assert!(c["population"].as_f64().unwrap() > 0.0);
+            assert!((1..=groups).contains(&c["group"].as_u64().unwrap()));
+        } else {
+            assert!(c["fate"] == "merged" || c["fate"] == "extinct");
+            assert!(c["ended_year"].as_f64().unwrap() >= c["founded_year"].as_f64().unwrap());
+        }
+    }
+    for e in t["events"].as_array().unwrap() {
+        assert!(by_id.contains_key(&e["culture"].as_u64().unwrap()));
+    }
+    // Province cultures agree with the cell field and are living cultures.
+    let cult = match w.field("culture") { Some((Field::U16(v), _, _)) => v.clone(), _ => panic!("culture field") };
+    let prov = match w.field("province") { Some((Field::U32(v), _, _)) => v.clone(), _ => panic!("province field") };
+    let pc: std::collections::HashMap<u64, u64> = t["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["culture"].as_u64().unwrap())).collect();
+    for i in 0..cult.len() {
+        if let Some(&c) = pc.get(&(prov[i] as u64)) {
+            assert_eq!(cult[i] as u64, c);
+            if c > 0 {
+                assert_eq!(by_id[&c]["alive"], true);
+            }
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("fwm-cult-{}", std::process::id()));
+    let opts = ExportOptions { width: 1024, height: 512, ..Default::default() };
+    let r = export(&mut w, &dir, &opts, &|_, _| {}).unwrap();
+    for f in ["cultures.png", "cultures.csv", "culture_groups.csv", "culture_events.csv", "province_cultures.csv"] {
+        assert!(r.files.iter().any(|x| x == f), "{f} not exported");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Stage 2: every land cell is in a state and a province, ids and colours are
 /// unique, state tables agree with the cells, and an exported provinces.png
 /// imports back to (almost) the same cells.

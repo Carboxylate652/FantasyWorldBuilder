@@ -1,9 +1,11 @@
-//! The pipeline: seven Stage 1 steps (make the planet) and three Stage 2 steps
-//! (states and provinces). Each step reads plain fields from earlier steps and
-//! writes its own `Fields` plus a JSON `meta` summary.
+//! The pipeline: seven Stage 1 steps (make the planet), three Stage 2 steps
+//! (states and provinces) and the Stage 3 step (cultures). Each step reads
+//! plain fields from earlier steps and writes its own `Fields` plus a JSON
+//! `meta` summary.
 
 pub mod biomes;
 pub mod climate;
+pub mod cultures;
 pub mod habitability;
 pub mod hydrology;
 pub mod partition;
@@ -33,9 +35,10 @@ pub enum Step {
     Habitability,
     States,
     Provinces,
+    Cultures,
 }
 
-pub const N_STEPS: usize = 10;
+pub const N_STEPS: usize = 11;
 pub const STEPS: [Step; N_STEPS] = [
     Step::Planet,
     Step::Sketch,
@@ -47,9 +50,10 @@ pub const STEPS: [Step; N_STEPS] = [
     Step::Habitability,
     Step::States,
     Step::Provinces,
+    Step::Cultures,
 ];
 /// The last step (`run` without a target goes this far).
-pub const LAST: Step = Step::Provinces;
+pub const LAST: Step = Step::Cultures;
 
 impl Step {
     pub fn index(self) -> usize {
@@ -67,6 +71,7 @@ impl Step {
             Step::Habitability => "habitability",
             Step::States => "states",
             Step::Provinces => "provinces",
+            Step::Cultures => "cultures",
         }
     }
     pub fn title(self) -> &'static str {
@@ -81,6 +86,7 @@ impl Step {
             Step::Habitability => "Habitability & barriers",
             Step::States => "States",
             Step::Provinces => "Provinces",
+            Step::Cultures => "Cultures",
         }
     }
     pub fn from_key(k: &str) -> Option<Step> {
@@ -132,6 +138,12 @@ impl<'a> Upstream<'a> {
         match self.field(name) {
             Field::U16(v) => v,
             _ => panic!("field {name} is not u16"),
+        }
+    }
+    pub fn u32(&self, name: &str) -> &'a [u32] {
+        match self.field(name) {
+            Field::U32(v) => v,
+            _ => panic!("field {name} is not u32"),
         }
     }
     pub fn i32(&self, name: &str) -> &'a [i32] {
@@ -190,12 +202,13 @@ pub fn run_step(step: Step, ctx: &Ctx) -> StepOutput {
         Step::Habitability => habitability::run(ctx),
         Step::States => states::run(ctx),
         Step::Provinces => provinces::run(ctx),
+        Step::Cultures => cultures::run(ctx),
     }
 }
 
 /// Algorithm version of each step. Bump a step's number whenever its model
 /// changes, so results cached by an older build are recomputed, not reused.
-pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 2, 2, 4, 6, 2, 1, 1, 1];
+pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 2, 2, 4, 6, 2, 1, 1, 2, 1];
 
 /// Cache keys: each step hashes only the inputs it actually reads, chained to
 /// the previous step's key, so a change only invalidates what depends on it.
@@ -218,7 +231,8 @@ pub fn input_hashes(p: &WorldParams, e: &Edits) -> [u64; N_STEPS] {
     let h7 = hash::combine(h6, hash::json(&("habitability", &p.habitability, &e.overrides.barriers)));
     let h8 = hash::combine(h7, hash::json(&("states", &p.states, &e.overrides.states)));
     let h9 = hash::combine(h8, hash::json(&("provinces", &p.provinces, &e.overrides.provinces, &e.imports.provinces)));
-    let h = [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9];
+    let h10 = hash::combine(h9, hash::json(&("cultures", &p.cultures)));
+    let h = [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10];
     // Fold in the model versions, preserving the chain (a version bump in one
     // step invalidates every later step too).
     let mut out = [0u64; N_STEPS];
