@@ -21,7 +21,7 @@ The proposal: build a desktop world generator that goes from planet to provinces
 - Fine local geography such as coastline detail below about 10 km. The data model leaves room for it later.
 - Full general circulation or ocean-current physics.
 - A playable grand-strategy game. Stage 4 produces a starting map and a history log, not a running game with diplomacy or battles.
-- Modern economics. Industry, gambling or tourism are not simulated; cities that owe their existence to them are placed by hand (see *Settlement sites*).
+- Anything after the start date. History ends at a start date between 1910 and 1920, so later causes of growth (big dams of the 1930s, legal gambling, tourism, oil wealth) are not simulated; cities that owe their size to them are placed by hand (see *Settlement sites*).
 
 **Principles**
 
@@ -118,8 +118,9 @@ Habitability from climate alone puts nobody in a desert unless a river runs thro
 | Springs and groundwater | Las Vegas (named for its spring-fed meadows), Siwa, oases of the Sahara | New `groundwater` field in hydrology: recharge from rain on nearby uplands, flowing downhill under the surface and surfacing at basin floors and mountain feet | Stage 2, static |
 | Route waypoints | Palmyra, Timbuktu, Silk Road oases | Crossing value: how many shortest paths between fertile regions pass through a cell, times the cost of the desert around it | Stage 3, emerges from band travel |
 | Mineral wealth | Kalgoorlie, Chuquicamata | Resource deposits (see *Suggested additions*) | Stage 3, after the era that unlocks mining |
-| Large-scale water works | Phoenix (canals), Las Vegas after the Hoover Dam | Era-gated: a river within reach of a dry basin can irrigate it | Stage 3, later eras |
-| Things no model explains | Las Vegas as a gambling city, Dubai | A **site pin** placed by hand: a point with a target population | Override layer |
+| Large-scale water works | Phoenix (canals, Roosevelt Dam 1911) | Era-gated: a river within reach of a dry basin can irrigate it | Stage 3, later eras |
+| Railway stops | Las Vegas (founded 1905 as a railway town at its springs) | Industrial era: route waypoints with water get a bonus once railways exist | Stage 4, industrial era |
+| Things no model explains, or that come after the start date | Las Vegas as a gambling city, Dubai | A **site pin** placed by hand: a point with a target population | Override layer |
 
 The static part adds a site value that is large in a few cells and zero elsewhere, so a spring in the desert gets a small, dense cluster of provinces, not a wide fertile region. The dynamic parts raise the carrying capacity of those cells during the culture simulation, so a desert city can appear, grow and fade with the eras.
 
@@ -205,6 +206,8 @@ Export adds `cultures.csv` (ID, name, group, colour, parent) and per-province cu
 Nations come after cultures, and read them as input. The finished culture map is the ground they grow on, so a nation forms inside a culture group first and spreads outward, and its borders tend to follow the cultural and natural ones already in the map.
 
 - **Polity formation:** from a set era, dense and well-connected clusters of bands found polities. The polity slot on each band is filled, and a capital province is picked by population and site value.
+- **Timeline:** Stage 4 runs on its own clock in years, not generations, from polity formation up to a **start date** chosen between 1910 and 1920 (default 1914). Eras unlock tools along the way: gunpowder states, ocean shipping, then railways and industrial mining in the last century before the start date.
+- **Ownership is per province:** a nation's border can cut through a Stage 2 state, so one state can be split between several nations, like Victoria 3's split states. States stay as geographic units and are never redrawn by Stage 4.
 - **Expansion and collapse:** polities grow over the province graph at a cost that rises with barriers, distance from the capital and cultural distance. Large, culturally mixed polities have a chance to break apart along culture lines.
 - **Feedback on culture:** while Stage 4 runs, contact inside one polity counts for more, so cultures slowly converge within borders. This is the only way Stage 4 changes culture, and locked cultures are exempt.
 - **Output:** owner per province at a chosen start date, a capital per nation, `nations.csv` (ID, name, primary culture, colour, capital) and a dated event log of foundings, conquests and splits for lore writing.
@@ -267,5 +270,5 @@ There are seven milestones, each ending in something you can use and a pass/fail
 - Is the recommended stack (Rust + Tauri + TypeScript) OK, or do you prefer one engine such as Godot? Resolved: Rust + Tauri + TypeScript, as built in M0–M3.
 - Flat export projection: equirectangular, or something like Miller that is kinder at high latitudes? Resolved: equirectangular with an optional latitude crop, as built.
 - Will nations or history come after cultures? Resolved: yes, as Stage 4. Bands carry an empty polity slot from M4 so the same simulation can continue into nations.
-- Open: should a Stage 4 polity be allowed to override a Stage 2 state border, or must nations be built from whole states, as in Victoria 3?
-- Open: how far should history run, and in what eras (for example ancient to early modern), given that modern desert cities are placed by hand?
+- Can a nation's border cut through a Stage 2 state? Resolved: yes. Ownership is stored per province, and a state can be split between nations.
+- How far should history run? Resolved: up to a start date between 1910 and 1920 (default 1914), so the exported map is an early-20th-century start in the spirit of Victoria 3's late game or HOI4's opening.
