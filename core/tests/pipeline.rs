@@ -216,6 +216,52 @@ fn cultures_emerge_and_are_consistent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Settlement sites and resources: springs only appear in dry land, land
+/// provinces get trade goods and some deposits, and a site pin in a desert
+/// grows a town of about the population it asks for.
+#[test]
+fn springs_resources_and_site_pins() {
+    use worldcore::edits::{Stroke, Tool};
+    use worldcore::fields::Field;
+    let mut p = WorldParams::default();
+    p.planet.seed = 4;
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 200;
+    let mut w = World::new(p.clone());
+    w.run_to(LAST, &|_, _, _| {});
+    let f32f = |w: &World, n: &str| match w.field(n) { Some((Field::F32(v), _, _)) => v.clone(), _ => panic!("{n}") };
+    let site = f32f(&w, "site");
+    let rain = f32f(&w, "p_ann");
+    for i in 0..site.len() {
+        if site[i] > 0.0 {
+            assert!(rain[i] < p.habitability.spring_max_precip_mm as f32, "spring in wet land at cell {i}");
+        }
+    }
+    let provs = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().clone();
+    let land: Vec<&serde_json::Value> = provs.iter().filter(|p| p["kind"] == "land").collect();
+    assert!(land.iter().all(|p| p["trade_good"].is_string()));
+    let with_deposits = land.iter().filter(|p| !p["resources"].as_array().unwrap().is_empty()).count();
+    assert!(with_deposits > 0 && with_deposits < land.len(), "{with_deposits} of {} land provinces have deposits", land.len());
+    assert!(w.meta(Step::Cultures).unwrap()["desert_towns"].is_u64());
+
+    // Pin a town in the driest land province that has people around.
+    let dry = land.iter().filter(|p| !p["river"].as_bool().unwrap()).min_by(|a, b| a["rain_mm"].as_f64().partial_cmp(&b["rain_mm"].as_f64()).unwrap()).unwrap();
+    let (lat, lon) = (dry["center"][0].as_f64().unwrap(), dry["center"][1].as_f64().unwrap());
+    let pid = dry["id"].as_u64().unwrap();
+    w.edits.add_stroke(Stroke { tool: Tool::SitePin, value: 40_000.0, points: vec![[lat, lon]], ..Default::default() });
+    assert!(!w.is_fresh(Step::Habitability));
+    w.run_to(LAST, &|_, _, _| {});
+    let prov_field = match w.field("province") { Some((Field::U32(v), _, _)) => v.clone(), _ => panic!() };
+    // Provinces are regenerated around the pin: find the one holding it now.
+    let g = w.grid();
+    let cell = g.nearest(worldcore::vec3::Vec3::from_lat_lon_deg(lat, lon), None);
+    let now = prov_field[cell] as u64;
+    let c = &w.meta(Step::Cultures).unwrap()["table"]["provinces"];
+    let pop = c.as_array().unwrap().iter().find(|p| p["id"].as_u64() == Some(now)).map(|p| p["population"].as_f64().unwrap()).unwrap();
+    assert!(pop >= 0.8 * 40_000.0, "pinned town in province {now} (was {pid}) holds only {pop}");
+}
+
 /// Stage 2: every land cell is in a state and a province, ids and colours are
 /// unique, state tables agree with the cells, and an exported provinces.png
 /// imports back to (almost) the same cells.

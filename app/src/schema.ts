@@ -18,7 +18,7 @@ export type Param = {
 export type ToolId =
   | 'navigate' | 'land' | 'sea' | 'mountain' | 'erase_hint' | 'scatter_land' | 'scatter_sea' | 'scatter_mountain' | 'pin' | 'arrow' | 'plate_paint'
   | 'raise' | 'lower' | 'smooth' | 'flatten' | 'biome_paint' | 'biome_erase'
-  | 'barrier_paint' | 'barrier_erase' | 'state_paint' | 'province_paint';
+  | 'barrier_paint' | 'barrier_erase' | 'site_pin' | 'state_paint' | 'province_paint';
 
 export type ToolDef = {
   id: ToolId;
@@ -27,7 +27,7 @@ export type ToolDef = {
   step: string; // step the edit belongs to (auto-run target)
   rust?: string; // core Tool name when it differs from the id
   scatter?: boolean; // noisy natural edge (scatter brush)
-  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier';
+  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people';
   defaultValue?: number;
   hint: string;
 };
@@ -52,6 +52,7 @@ export const TOOLS: ToolDef[] = [
   { id: 'biome_erase', label: 'Biome erase', step: 'biomes', hint: 'Remove biome paint.' },
   { id: 'barrier_paint', label: 'Add barrier', key: 'k', step: 'habitability', value: 'barrier', defaultValue: 6, hint: 'Make land costly to cross, so state and province borders follow your stroke.' },
   { id: 'barrier_erase', label: 'Remove barrier', step: 'habitability', hint: 'Remove barriers under the brush, including border rivers.' },
+  { id: 'site_pin', label: 'Site pin', key: 't', step: 'habitability', value: 'people', defaultValue: 50000, hint: 'Click to place a town no model explains (a gambling city, an oil port). It becomes habitable land and, in the last culture era, holds this many people.' },
   { id: 'state_paint', label: 'Grow state', key: 'e', step: 'states', hint: 'Start the stroke inside a state, then paint: every land cell you cover joins that state.' },
   { id: 'province_paint', label: 'Grow province', key: 'o', step: 'provinces', hint: 'Start inside a province, then paint over its neighbours in the same state.' },
 ];
@@ -171,8 +172,8 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'habitability', title: 'Habitability & barriers', layer: 'habitability', tools: ['barrier_paint', 'barrier_erase'],
-    blurb: 'How well each cell supports people (growing season, water, slope, terrain, rivers, coast), and how costly it is to cross: ridges, border rivers, desert, ice and marsh.',
+    key: 'habitability', title: 'Habitability & barriers', layer: 'habitability', tools: ['barrier_paint', 'barrier_erase', 'site_pin'],
+    blurb: 'How well each cell supports people (growing season, water, slope, terrain, rivers, coast), and how costly it is to cross: ridges, border rivers, desert, ice and marsh. Groundwater from the uplands surfaces as springs at mountain feet and basin floors: oases in dry land. Site pins place towns no model explains.',
     params: [
       p('habitability', 'river_reach_km', 'River reach (km)', 5, 300, 5, 'Distance over which a river still waters the land and gives transport.'),
       p('habitability', 'coast_reach_km', 'Coast reach (km)', 5, 500, 5),
@@ -185,6 +186,11 @@ export const STEPS: StepUI[] = [
       p('habitability', 'river_border_width_m', 'Border river width (m)', 20, 3000, 10, 'Rivers at least this wide can be borders.'),
       p('habitability', 'river_border_habitability', 'Border river habitability', 0, 1, 0.01, 'A wide river divides land at least this habitable (Rhine).'),
       p('habitability', 'backbone_max_precip_mm', 'Backbone river rainfall (mm/yr)', 0, 1500, 10, 'A river through land drier than this holds its valley together instead (Nile): states grow along it.'),
+      p('habitability', 'groundwater_recharge', 'Groundwater recharge', 0, 1, 0.01, 'Share of rain above 150 mm/yr that soaks in.'),
+      p('habitability', 'groundwater_reach_km', 'Groundwater reach (km)', 20, 3000, 10, 'How far groundwater flows underground before most of it is lost.'),
+      p('habitability', 'spring_flux_m3s', 'Spring flow for a full oasis (m³/s)', 0.05, 50, 0.05),
+      p('habitability', 'spring_max_precip_mm', 'Springs matter below (mm/yr)', 0, 1500, 10, 'Only land drier than this gets oases.'),
+      p('habitability', 'spring_habitability', 'Oasis habitability', 0, 1, 0.01),
     ],
   },
   {
@@ -241,6 +247,9 @@ export const STEPS: StepUI[] = [
       p('cultures', 'culture_resolution', 'Culture detail', 0.5, 20, 0.5, 'Higher values find more, smaller cultures.'),
       p('cultures', 'group_resolution', 'Group detail', 0.005, 2, 0.005, 'Lower values make fewer, larger culture groups.'),
       p('cultures', 'persistence', 'Checks before a change counts', 1, 10, 1, 'A split, merge or change of culture must hold this many checks in a row.'),
+      p('cultures', 'caravan_people', 'Caravan stop size (people)', 0, 500000, 1000, 'From era 2: people a watered stop on the busiest route across dry land can hold.'),
+      p('cultures', 'mining_people', 'Mining town size (people)', 0, 200000, 500, 'From era 3: people each metal deposit draws.'),
+      p('cultures', 'irrigation_share', 'Irrigated share of dry river land', 0, 1, 0.05, 'From era 4: share of a dry province with a river that becomes farmland.'),
     ],
   },
 ];

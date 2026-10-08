@@ -24,6 +24,7 @@ type Status = {
   edits: {
     elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_strokes: number; pins: any[]; arrows: any[];
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
+    site_pins: number; sites: { lat: number; lon: number; population: number }[];
   };
   grid: { level: number; cells: number; spacing_km: number };
   path: string | null;
@@ -197,7 +198,8 @@ function stepOfLayer(id: LayerId): string {
     sketch: 'Continent sketch', plates: 'Plates', crust: 'Plates', boundaries: 'Tectonic relief', elevation: 'Tectonic relief',
     stress: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', continentality: 'Climate',
     currents: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
-    habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
+    habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
+    resources: 'Provinces',
     cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures',
   };
   return m[id];
@@ -400,6 +402,14 @@ function drawEditMarkers() {
     }
     L.seg(offset(p, e, n, -r * 0.5, 0), offset(p, e, n, r * 0.5, 0), col, 0.004);
     L.seg(offset(p, e, n, 0, -r * 0.5), offset(p, e, n, 0, r * 0.5), col, 0.004);
+  }
+  for (const s of st.edits.sites ?? []) {
+    const p = fromLatLon((s.lat * Math.PI) / 180, (s.lon * Math.PI) / 180);
+    const [e, n] = eastNorth(p);
+    const r = 0.018;
+    const col: [number, number, number, number] = [1, 0.25, 0.8, 1];
+    const pts = [[0, r], [r, 0], [0, -r], [-r, 0], [0, r]];
+    for (let k = 0; k < 4; k++) L.seg(offset(p, e, n, pts[k][0], pts[k][1]), offset(p, e, n, pts[k + 1][0], pts[k + 1][1]), col, 0.004);
   }
   for (const a of st.edits.arrows) {
     const p = fromLatLon((a.lat * Math.PI) / 180, (a.lon * Math.PI) / 180);
@@ -739,6 +749,8 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
   if (ui.key === 'habitability') {
     body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.barrier_strokes} barrier strokes`),
       h('button', { class: 'small', disabled: !e.barrier_strokes, onclick: () => mutate('clear_layer', { layer: 'barriers' }) }, 'Clear barriers')));
+    body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.site_pins} site pins`),
+      h('button', { class: 'small', disabled: !e.site_pins, onclick: () => mutate('clear_layer', { layer: 'sites' }) }, 'Clear pins')));
   }
   if (ui.key === 'states') {
     body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.state_strokes} state paint strokes`),
@@ -901,6 +913,7 @@ function summary(key: string, m: any): HTMLElement {
     case 'habitability':
       box.append(stat('Mean habitability', fmt(m.mean_habitability, 2)), stat('Habitable land (≥ 0.4)', `${fmt(m.habitable_share * 100)} %`),
         stat('Border rivers', `${fmt(m.border_river_km)} km`), stat('Backbone rivers', `${fmt(m.backbone_river_km)} km`));
+      if (m.springs !== undefined) box.append(stat('Springs in dry land', fmt(m.springs)));
       if (m.painted_cells) box.append(stat('Painted cells', fmt(m.painted_cells)));
       break;
     case 'states': {
@@ -926,6 +939,10 @@ function summary(key: string, m: any): HTMLElement {
     case 'cultures': {
       box.append(stat('Cultures', `${fmt(m.cultures)} in ${fmt(m.groups)} groups`), stat('Population', `${fmt(m.population / 1e6, 1)} M of ${fmt(m.capacity / 1e6, 1)} M possible`),
         stat('History', `${fmt(m.years)} years: ${fmt(m.splits)} splits, ${fmt(m.merged)} merges, ${fmt(m.extinct)} died out`), stat('Bands', fmt(m.bands)));
+      if (m.desert_towns !== undefined) {
+        const by = Object.entries(m.desert_towns_by_cause ?? {}).map(([k, v]) => `${v} ${k}`).join(', ');
+        box.append(stat('Desert towns (dry, no river, ≥ 10,000 people)', `${fmt(m.desert_towns)}${by ? ' — ' + by : ''}`));
+      }
       const list = h('div', { class: 'list' });
       box.append(list);
       political().then((P) => {
@@ -1032,6 +1049,7 @@ function renderToolbar() {
   const val = S.toolValue[t.id] ?? t.defaultValue ?? 0;
   const setVal = (v: number) => (S.toolValue[t.id] = v);
   if (t.value === 'metres') bb.append(h('label', {}, h('span', {}, S.tool === 'flatten' ? 'Target (m)' : 'Amount (m)'), h('input', { type: 'number', step: 50, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
+  if (t.value === 'people') bb.append(h('label', {}, h('span', {}, 'Population'), h('input', { type: 'number', step: 1000, min: 0, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'barrier') bb.append(h('label', {}, h('span', {}, 'Barrier strength'), h('input', { type: 'number', step: 1, min: 0, max: 50, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'speed') bb.append(h('label', {}, h('span', {}, 'Speed (mm/yr)'), h('input', { type: 'number', step: 5, min: 1, max: 300, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'plate') {
@@ -1315,7 +1333,11 @@ function describe(d: any): string {
   const P = S.political;
   if (P && d.province) {
     const p = P.byProv.get(d.province);
-    if (p) parts.push(`${p.name} (province ${p.id}, ${p.kind}${p.band ? ' ' + p.band : ''}, ${Math.round(p.area_km2 / 1000)}k km²)`);
+    if (p) {
+      parts.push(`${p.name} (province ${p.id}, ${p.kind}${p.band ? ' ' + p.band : ''}, ${Math.round(p.area_km2 / 1000)}k km²)`);
+      const goods = [p.trade_good && p.trade_good !== 'none' ? p.trade_good : null, ...(p.resources ?? [])].filter(Boolean);
+      if (goods.length) parts.push(goods.join(', '));
+    }
   }
   if (P && d.state) {
     const s = P.byState.get(d.state);
@@ -1328,6 +1350,7 @@ function describe(d: any): string {
     if (c) parts.push(`${c.name} culture${g ? ' (' + g.name + ')' : ''}`);
   }
   if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
+  if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
   return parts.join('  ·  ');
 }
 

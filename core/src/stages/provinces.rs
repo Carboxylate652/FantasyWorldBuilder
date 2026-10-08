@@ -4,6 +4,8 @@
 //!   Poisson-disc sampling whose radius follows habitability (small provinces
 //!   on fertile land, large ones in the steppe), grown with the barrier-aware
 //!   Dijkstra search at a lower barrier weight, and relaxed by Lloyd passes.
+//! - A strong spring in dry land gets a province seed of its own with a
+//!   fertile-land target area, so an oasis becomes a small, dense province.
 //! - Peaks, ice caps and deep desert (in large patches) become impassable
 //!   wasteland provinces, still inside their state.
 //! - Sea is split by depth band (coastal, shelf, open ocean) into sea zones of
@@ -141,8 +143,10 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         }
         ctx.progress(0.1, "Seeding provinces");
         let a_land = |h: f64| pp.sparse_province_area_km2 * (pp.province_area_km2 / pp.sparse_province_area_km2.max(1.0)).powf(h.clamp(0.0, 1.0));
+        let spring_cell = ctx.input.f32("site");
         let target = |i: usize| -> f64 {
             let a = match group_kind(group[i]) {
+                kind::LAND if spring_cell[i] > 0.3 => a_land(hab[i] as f64).min(1.5 * pp.province_area_km2),
                 kind::LAND => a_land(hab[i] as f64),
                 kind::WASTELAND => pp.wasteland_area_km2,
                 kind::LAKE => pp.coastal_sea_km2,
@@ -151,7 +155,12 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             a.max(500.0)
         };
         let weight = |i: usize| 1.0 / target(i);
-        let order = partition::race_order((0..n).filter(|&i| group[i] != NONE), weight, seed, stream::PROVINCES);
+        let mut order = partition::race_order((0..n).filter(|&i| group[i] != NONE), weight, seed, stream::PROVINCES);
+        // Strong springs (the best cell of each) are seeded first.
+        let is_spring = |i: usize| {
+            group_kind(group[i]) == kind::LAND && spring_cell[i] > 0.5 && g.neighbors(i).iter().all(|&j| spring_cell[j as usize] <= spring_cell[i])
+        };
+        order.sort_by_key(|&c| !is_spring(c as usize));
         let mut seeds = partition::poisson(g, &order, &group, |i| (target(i) / 1.2).sqrt() / r_km);
         partition::seed_every_component(g, &group, &order, &mut seeds);
         let bw = pp.barrier_weight.max(0.0);
@@ -252,6 +261,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     struct Agg {
         area: f64,
         hab: f64,
+        hab15: f64,
         pos: Vec3,
         kinds: [f64; 4],
         bands: [f64; 3],
@@ -265,6 +275,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         Agg {
             area: 0.0,
             hab: 0.0,
+            hab15: 0.0,
             pos: Vec3::new(0.0, 0.0, 0.0),
             kinds: [0.0; 4],
             bands: [0.0; 3],
@@ -285,6 +296,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         let ar = area[i];
         a.area += ar;
         a.hab += ar * hab[i] as f64;
+        a.hab15 += ar * (hab[i].max(0.0) as f64).powf(1.5);
         a.pos += g.pos[i] * ar;
         let k = cell_kind(i);
         a.kinds[k as usize] += ar;
@@ -328,6 +340,51 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             }
         })
         .collect();
+
+    // Resource signals, rainfall, rivers and springs per province.
+    let stress = ctx.input.f32("stress");
+    let crust = ctx.input.u8("crust");
+    let p_ann = ctx.input.f32("p_ann");
+    let lake_cls = ctx.input.u8("lake");
+    let recv = ctx.input.i32("receiver");
+    let rwidth = ctx.input.f32("river_width");
+    let site = ctx.input.f32("site");
+    let site_kind = ctx.input.u8("site_kind");
+    let mut sig = vec![super::resources::Signals::default(); count];
+    let mut river = vec![false; count];
+    let mut pinned = vec![false; count];
+    for i in 0..n {
+        let l = label[i];
+        if l == NONE {
+            continue;
+        }
+        let (s, a) = (&mut sig[l as usize], area[i] / agg[l as usize].area.max(1e-9));
+        s.abs_lat += a * g.lat[i].to_degrees().abs();
+        if !land(i) {
+            continue;
+        }
+        let e = elev[i] as f64;
+        s.rain_mm += a * p_ann[i] as f64;
+        s.orogen += a * (stress[i] as f64 * 2.0).min(1.0);
+        if crust[i] == 1 && stress[i] <= 0.0 {
+            s.shield += a * (1.0 - ((e - 600.0) / 1400.0).clamp(0.0, 1.0));
+        }
+        if crust[i] == 1 && stress[i] < 0.1 && e < 600.0 && p_ann[i] > 700.0 {
+            s.coal += a;
+        }
+        let dry_basin = lake_cls[i] == super::hydrology::lake::DRY
+            || g.neighbors(i).iter().any(|&j| lake_cls[j as usize] == super::hydrology::lake::SALT)
+            || (recv[i] < 0 && p_ann[i] < 400.0);
+        if dry_basin {
+            s.salt += a * 4.0;
+        }
+        s.site = s.site.max(site[i] as f64);
+        river[l as usize] |= rwidth[i] > 0.0;
+        pinned[l as usize] |= site_kind[i] == 3;
+    }
+    for s in sig.iter_mut() {
+        s.salt = s.salt.min(1.0);
+    }
 
     // ------------------------------------------------------------ ids, colours, names
     let mut ids = vec![0u32; count];
@@ -607,6 +664,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let mut provinces_json = Vec::with_capacity(count);
     let mut by_kind = [0usize; 4];
     let mut land_area = Vec::new();
+    let mut good = vec![0u8; count];
     for &p in &order {
         let (a, pr) = (&agg[p], &provs[p]);
         by_kind[pr.kind as usize] += 1;
@@ -623,13 +681,28 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "continent": if pr.kind == kind::LAND || pr.kind == kind::WASTELAND { pr.cont + 1 } else { 0 },
             "area_km2": a.area.round(),
             "habitability": (a.hab / a.area.max(1.0) * 1000.0).round() / 1000.0,
+            "capacity_factor": (a.hab15 / a.area.max(1.0) * 10000.0).round() / 10000.0,
             "terrain": TERRAIN[pr.terrain as usize].0,
             "coastal": a.coastal,
             "center": deg(pr.center),
             "neighbors": neighbors[p],
         });
+        let s = &sig[p];
+        good[p] = 0;
         if pr.kind == kind::SEA {
             j["band"] = serde_json::json!(BAND_NAMES[pr.band as usize]);
+            let fish = super::resources::sea_fish(seed, ids[p], pr.band, s.abs_lat);
+            j["resources"] = serde_json::json!(if fish { vec!["fish"] } else { vec![] });
+        } else if pr.kind == kind::LAND || pr.kind == kind::WASTELAND {
+            let dep = super::resources::deposits(seed, ids[p], s);
+            let tg = if pr.kind == kind::LAND { super::resources::trade_good(pr.terrain, s, &dep) } else { "none" };
+            good[p] = super::resources::good_index(tg);
+            j["trade_good"] = serde_json::json!(tg);
+            j["resources"] = serde_json::json!(dep);
+            j["rain_mm"] = serde_json::json!(s.rain_mm.round());
+            j["river"] = serde_json::json!(river[p]);
+            j["site"] = serde_json::json!((s.site * 100.0).round() / 100.0);
+            j["site_pin"] = serde_json::json!(pinned[p]);
         }
         provinces_json.push(j);
     }
@@ -654,6 +727,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let mut f = Fields::default();
     f.put("province", Field::U32(f_prov));
     f.put("province_kind", Field::U8(f_kind));
+    f.put("trade_good", Field::U8((0..n).map(|i| if label[i] == NONE { 0 } else { good[label[i] as usize] }).collect()));
     f.put("state", Field::U16(f_state));
     StepOutput {
         fields: f,

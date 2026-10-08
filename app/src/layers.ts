@@ -147,7 +147,7 @@ export type Legend = { title: string; items?: LegendItem[]; gradient?: { stops: 
 export type LayerId =
   | 'sketch' | 'plates' | 'crust' | 'boundaries' | 'elevation' | 'temperature' | 'precipitation'
   | 'continentality' | 'currents' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress'
-  | 'habitability' | 'barrier' | 'states' | 'regions' | 'provinces' | 'cultures' | 'culture_groups' | 'population';
+  | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population';
 
 export type LayerDef = {
   id: LayerId;
@@ -176,10 +176,12 @@ export const LAYERS: LayerDef[] = [
   { id: 'koppen', label: 'Köppen climate', fields: ['koppen', 'elevation'], smooth: false, group: 'Biomes' },
   { id: 'terrain', label: 'Game terrain', fields: ['terrain', 'elevation'], smooth: false, group: 'Biomes' },
   { id: 'habitability', label: 'Habitability', fields: ['habitability', 'water', 'elevation'], smooth: true, group: 'Political' },
+  { id: 'springs', label: 'Groundwater & springs', fields: ['groundwater', 'site', 'site_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'barrier', label: 'Barriers', fields: ['barrier', 'river_role', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'states', label: 'States', fields: ['state', 'province', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'regions', label: 'Regions & continents', fields: ['region', 'state', 'continent', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'provinces', label: 'Provinces', fields: ['province', 'province_kind', 'state', 'water', 'elevation'], smooth: false, group: 'Political' },
+  { id: 'resources', label: 'Trade goods', fields: ['trade_good', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'cultures', label: 'Cultures', fields: ['culture', 'culture_group', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'culture_groups', label: 'Culture groups', fields: ['culture_group', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'population', label: 'Population density', fields: ['population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
@@ -191,6 +193,13 @@ export function stateColor(id: number): RGB {
   const l = id % 3 === 0 ? 0.48 : id % 3 === 1 ? 0.6 : 0.7;
   return hsl(h, 0.5, l).map((v) => Math.floor(v)) as RGB;
 }
+
+/** Trade goods in the order of the trade_good field (value = index + 1), as in core/src/stages/resources.rs. */
+export const TRADE_GOODS: [string, RGB][] = [
+  ['grain', [226, 196, 86]], ['wine', [140, 40, 90]], ['horses', [170, 120, 70]], ['wool', [220, 220, 205]], ['cattle', [190, 150, 110]],
+  ['wood', [50, 120, 50]], ['furs', [110, 80, 60]], ['spices', [220, 90, 40]], ['fish', [70, 150, 200]], ['stone', [140, 140, 140]],
+  ['metals', [90, 90, 120]], ['dates', [210, 140, 40]], ['salt', [245, 245, 250]], ['camels', [200, 170, 120]],
+];
 
 /** Culture colour: its group's hue, shifted a little per culture (same as culture_color in core/src/stages/cultures.rs). */
 export function cultureColor(id: number, group: number): RGB {
@@ -426,6 +435,32 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
         put(i, stateColor(r * 7 + 3), 0.92 + tint);
       }
       legend = { title: 'Regions', items: [{ color: [20, 20, 20], label: 'Region border' }, { color: [120, 120, 120], label: 'Thin line: state border' }] };
+      break;
+    }
+    case 'springs': {
+      const gw = f['groundwater'], st = f['site'], sk = f['site_kind'];
+      for (let i = 0; i < n; i++) {
+        if (isSea(i) || (wm && wm[i] === 2)) { put(i, relief(i), 0.6); continue; }
+        if (sk && sk[i] === 3) { put(i, [255, 60, 200]); continue; }
+        if (st && st[i] > 0) { put(i, mix([120, 230, 120], [20, 140, 40], Math.min(1, st[i])) as RGB); continue; }
+        const v = gw ? Math.log10(1 + gw[i]) / 2.5 : 0;
+        put(i, mix([225, 210, 170], [60, 110, 200], Math.min(1, v)) as RGB, 0.85 + 0.15 * sh(i));
+      }
+      legend = { title: 'Groundwater flow and springs', items: [
+        { color: [225, 210, 170], label: 'Little groundwater' }, { color: [60, 110, 200], label: 'Much groundwater (flows downhill underground)' },
+        { color: [40, 170, 60], label: 'Spring in dry land (oasis)' }, { color: [255, 60, 200], label: 'Site pin' },
+      ] };
+      break;
+    }
+    case 'resources': {
+      const tg = f['trade_good'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const g = tg ? tg[i] : 0;
+        put(i, g > 0 && g <= TRADE_GOODS.length ? TRADE_GOODS[g - 1][1] : [120, 120, 120], 0.85 + 0.15 * sh(i));
+      }
+      legend = { title: 'Trade goods (hover a province for its deposits)', items: TRADE_GOODS.map(([label, color]) => ({ color, label })) };
       break;
     }
     case 'cultures':

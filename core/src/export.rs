@@ -460,7 +460,7 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         "provinces": {
             "provinces.png": "one unique RGB colour per province, nearest-cell sampling (no anti-aliasing); borders are noise-warped by up to a third of a grid cell; islets and ponds made only by detail noise are removed, stray pieces merged and X-crossings broken up (see province_cleanup)",
             "definition.csv": "id;r;g;b;name;x; (CK3 / Victoria 3), first row 0;0;0;0;x;x;",
-            "provinces.csv": "id;name;kind (land, wasteland, lake, sea);band (sea: coastal, shelf, open);state;region;continent;terrain;area_km2;habitability;coastal;lat;lon;neighbors",
+            "provinces.csv": "id;name;kind (land, wasteland, lake, sea);band (sea: coastal, shelf, open);state;region;continent;terrain;area_km2;habitability;coastal;lat;lon;neighbors;trade_good;resources (copper, gold, silver, iron, coal, salt; fish for sea zones);rain_mm;river;spring (0–1 strength of its best spring or site pin)",
             "states.csv": "id;key;name;region;continent;capital_province;area_km2;habitability;provinces;province_colors (Victoria 3 style xRRGGBB)",
             "regions.csv": "id;key;name;continent;states",
             "continents.csv": "id;name;area_km2;states;regions",
@@ -732,16 +732,18 @@ fn write_tables(dir: &Path, t: &serde_json::Value, wpx: usize, hpx: usize, o: &E
     let mut colors = std::collections::HashMap::new();
 
     let mut def = String::from("0;0;0;0;x;x;\n");
-    let mut prov = String::from("id;name;kind;band;state;region;continent;terrain;area_km2;habitability;coastal;lat;lon;neighbors\n");
+    let mut prov = String::from("id;name;kind;band;state;region;continent;terrain;area_km2;habitability;coastal;lat;lon;neighbors;trade_good;resources;rain_mm;river;spring\n");
     for p in arr("provinces") {
         let c = &p["color"];
         let rgb = [c[0].as_u64().unwrap_or(0), c[1].as_u64().unwrap_or(0), c[2].as_u64().unwrap_or(0)];
         colors.insert(p["id"].as_u64().unwrap_or(0), format!("x{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
         def += &format!("{};{};{};{};{};x;\n", p["id"], rgb[0], rgb[1], rgb[2], csv_text(&p["name"]));
+        let opt = |v: &serde_json::Value| if v.is_null() { String::new() } else { csv_text(v) };
         prov += &format!(
-            "{};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
+            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
             p["id"], csv_text(&p["name"]), csv_text(&p["kind"]), csv_text(&p["band"]), p["state"], p["region"], p["continent"],
             csv_text(&p["terrain"]), p["area_km2"], p["habitability"], p["coastal"], p["center"][0], p["center"][1], csv_text(&p["neighbors"]),
+            opt(&p["trade_good"]), opt(&p["resources"]), opt(&p["rain_mm"]), opt(&p["river"]), opt(&p["site"]),
         );
     }
     write("definition.csv", def)?;

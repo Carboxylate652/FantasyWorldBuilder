@@ -131,7 +131,7 @@ fn route(g: &Grid, h: &[f64], ocean: &[bool]) -> Flow {
 }
 
 /// Donors-before-receivers order for an arbitrary receiver forest (Kahn).
-fn upstream_first(receiver: &[i32]) -> Vec<u32> {
+pub(crate) fn upstream_first(receiver: &[i32]) -> Vec<u32> {
     let n = receiver.len();
     let mut indeg = vec![0u32; n];
     for &r in receiver {

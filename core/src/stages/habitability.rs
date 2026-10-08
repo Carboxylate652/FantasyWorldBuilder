@@ -4,6 +4,13 @@
 //! heat, slope, altitude, terrain and nearness to the coast. It sets how many
 //! provinces a state gets and, later, where people live.
 //!
+//! Springs: rain that soaks in becomes groundwater, which flows downhill
+//! underground (losing water with distance) and surfaces at the foot of
+//! mountains and on basin floors. In dry land away from rivers such a spring
+//! is an oasis (Las Vegas was named for its spring-fed meadows): its site
+//! value raises habitability in a few cells, so Stage 2 cuts a small, dense
+//! province around it. Site pins place towns no model explains.
+//!
 //! The barrier field is the extra cost of crossing a cell when states and
 //! provinces grow: ridge crests, high ground, border rivers, deep desert, ice and
 //! marsh. Rivers play one of two roles: a wide river through fertile land is a
@@ -112,6 +119,85 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         .collect();
     let mut hab: Vec<f32> = scores.iter().map(|s| s.0).collect();
     let dry: Vec<f32> = scores.iter().map(|s| s.1).collect();
+
+    // ---- groundwater and springs
+    ctx.progress(0.45, "Tracing groundwater to springs");
+    let recv = ctx.input.i32("receiver");
+    let lake = ctx.input.u8("lake");
+    let order = super::hydrology::upstream_first(recv);
+    let r2 = r_km * r_km;
+    let mut gw = vec![0.0f64; n];
+    for &c in &order {
+        let c = c as usize;
+        if !land(c) {
+            continue;
+        }
+        let area_m2 = g.area[c] * r2 * 1e6;
+        gw[c] += hp.groundwater_recharge * (p_ann[c] as f64 - 150.0).max(0.0) / 1000.0 * area_m2 / 3.156e7;
+        let r = recv[c];
+        if r >= 0 && land(r as usize) {
+            let km = g.pos[c].angle_to(g.pos[r as usize]) * r_km;
+            gw[r as usize] += gw[c] * (-km / hp.groundwater_reach_km.max(1.0)).exp();
+        }
+    }
+    let mut site = vec![0.0f32; n];
+    let mut kind_of = vec![0u8; n]; // 1 mountain foot, 2 basin floor
+    for i in 0..n {
+        if !land(i) {
+            continue;
+        }
+        // Where groundwater surfaces: below a steep rise, or at a closed basin's floor.
+        let rise = g.neighbors(i).iter().map(|&j| elev[j as usize] - elev[i]).fold(0.0f32, f32::max) as f64;
+        let foot = ((rise - 150.0) / 450.0).clamp(0.0, 1.0);
+        let basin = if recv[i] < 0 || lake[i] == super::hydrology::lake::DRY || g.neighbors(i).iter().any(|&j| lake[j as usize] == super::hydrology::lake::SALT) { 1.0 } else { 0.0 };
+        let surfacing = foot.max(basin);
+        let dryness = ((hp.spring_max_precip_mm - p_ann[i] as f64) / hp.spring_max_precip_mm.max(1.0)).clamp(0.0, 1.0);
+        let no_river = if d_river[i].is_finite() { 1.0 - (-d_river[i] / hp.river_reach_km.max(1.0)).exp() } else { 1.0 };
+        let s = (1.0 - (-gw[i] * surfacing / hp.spring_flux_m3s.max(1e-6)).exp()) * dryness.sqrt() * no_river;
+        if s > 0.3 {
+            site[i] = s as f32;
+            kind_of[i] = if basin >= foot { 2 } else { 1 };
+        }
+    }
+    // Site pins: a town that reaches the stroke's value in people.
+    let mut pins = Vec::new();
+    for s in &ctx.edits.overrides.sites {
+        if s.tool != Tool::SitePin || s.points.is_empty() {
+            continue;
+        }
+        let c = g.nearest(crate::vec3::Vec3::from_lat_lon_deg(s.points[0][0], s.points[0][1]), None);
+        if !land(c) {
+            continue;
+        }
+        for k in std::iter::once(c).chain(g.neighbors(c).iter().map(|&j| j as usize)) {
+            if land(k) {
+                site[k] = 1.0;
+                kind_of[k] = 3;
+            }
+        }
+        pins.push(serde_json::json!({ "lat": s.points[0][0], "lon": s.points[0][1], "cell": c, "population": s.value.max(0.0) }));
+    }
+    let mut springs = Vec::new();
+    for i in 0..n {
+        if site[i] <= 0.0 {
+            continue;
+        }
+        // An oasis: habitable whatever the rain, as long as crops can grow at all.
+        let t_mean = (0..12).map(|m| (temp[m * n + i] + adj[i]) as f64).sum::<f64>() / 12.0;
+        let warmth = smooth01((t_mean + 5.0) / 10.0);
+        let h = (hp.spring_habitability * site[i] as f64 * warmth).max(if kind_of[i] == 3 { 0.9 } else { 0.0 });
+        hab[i] = hab[i].max(h as f32);
+        // List each spring warm enough to farm once: the strongest cell among its neighbours.
+        if kind_of[i] < 3 && warmth > 0.3 && g.neighbors(i).iter().all(|&j| site[j as usize] < site[i] || (site[j as usize] == site[i] && (j as usize) > i)) {
+            let (la, lo) = g.pos[i].lat_lon();
+            springs.push(serde_json::json!({
+                "lat": (la.to_degrees() * 100.0).round() / 100.0, "lon": (lo.to_degrees() * 100.0).round() / 100.0,
+                "kind": if kind_of[i] == 2 { "basin" } else { "mountain foot" },
+                "flow_m3s": (gw[i] * 100.0).round() / 100.0, "site": (site[i] * 100.0).round() / 100.0, "cell": i,
+            }));
+        }
+    }
+    springs.sort_by(|a, b| b["site"].as_f64().partial_cmp(&a["site"].as_f64()).unwrap());
 
     // Regional dry habitability and rainfall (a few rings), used to decide each river's role.
     let mut regional = dry.clone();
@@ -229,7 +315,6 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     }
 
     // Summary.
-    let r2 = r_km * r_km;
     let (mut land_a, mut hab_a, mut cap, mut good) = (0.0, 0.0, 0.0, 0.0);
     let (mut border_km, mut backbone_km) = (0.0, 0.0);
     let spacing_km = g.spacing * r_km;
@@ -256,6 +341,9 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     f.put("habitability", Field::F32(hab));
     f.put("barrier", Field::F32(barrier));
     f.put("river_role", Field::U8(river_role));
+    f.put("groundwater", Field::F32(gw.iter().map(|&x| x as f32).collect()));
+    f.put("site", Field::F32(site));
+    f.put("site_kind", Field::U8(kind_of));
     StepOutput {
         fields: f,
         meta: serde_json::json!({
@@ -265,6 +353,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "border_river_km": border_km,
             "backbone_river_km": backbone_km,
             "painted_cells": painted,
+            "springs": springs.len(),
+            "sites": { "springs": springs, "pins": pins },
         }),
     }
 }

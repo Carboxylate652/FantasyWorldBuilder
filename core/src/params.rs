@@ -253,6 +253,16 @@ pub struct HabitabilityParams {
     /// Rivers through land drier than this (mm/yr, regional) hold their valley
     /// together instead (Nile).
     pub backbone_max_precip_mm: f64,
+    /// Share of rain above 150 mm/yr that soaks in and becomes groundwater.
+    pub groundwater_recharge: f64,
+    /// Groundwater flows downhill underground; this far (km) it keeps 1/e of its water.
+    pub groundwater_reach_km: f64,
+    /// Spring flow (m³/s) that makes a full oasis.
+    pub spring_flux_m3s: f64,
+    /// Springs only matter in land drier than this (mm/yr).
+    pub spring_max_precip_mm: f64,
+    /// Habitability of a full oasis.
+    pub spring_habitability: f64,
 }
 
 impl Default for HabitabilityParams {
@@ -269,6 +279,11 @@ impl Default for HabitabilityParams {
             river_border_width_m: 300.0,
             river_border_habitability: 0.3,
             backbone_max_precip_mm: 350.0,
+            groundwater_recharge: 0.15,
+            groundwater_reach_km: 400.0,
+            spring_flux_m3s: 1.0,
+            spring_max_precip_mm: 350.0,
+            spring_habitability: 0.7,
         }
     }
 }
@@ -415,6 +430,14 @@ pub struct CultureParams {
     pub group_resolution: f64,
     /// Smallest share of world population a new culture can start with.
     pub min_culture_share: f64,
+    /// From the second era: people a watered stop on the busiest caravan route
+    /// across dry land can hold (less on quieter routes).
+    pub caravan_people: f64,
+    /// From the third era: people each metal deposit draws to a mining town.
+    pub mining_people: f64,
+    /// From the fourth era: share of a dry province's land that irrigation
+    /// from its river turns into farmland.
+    pub irrigation_share: f64,
 }
 
 impl Default for CultureParams {
@@ -444,6 +467,9 @@ impl Default for CultureParams {
             culture_resolution: 4.0,
             group_resolution: 0.05,
             min_culture_share: 0.002,
+            caravan_people: 25_000.0,
+            mining_people: 4_000.0,
+            irrigation_share: 0.3,
         }
     }
 }

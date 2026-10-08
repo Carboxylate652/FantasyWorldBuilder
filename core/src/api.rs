@@ -70,6 +70,8 @@ impl Session {
                 "barrier_strokes": e.overrides.barriers.len(),
                 "state_strokes": e.overrides.states.len(),
                 "province_strokes": e.overrides.provinces.len(),
+                "site_pins": e.overrides.sites.len(),
+                "sites": e.overrides.sites.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "population": s.value }))).collect::<Vec<_>>(),
                 "elevation_import": e.imports.elevation,
                 "province_import": e.imports.provinces,
             },

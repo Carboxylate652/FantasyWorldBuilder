@@ -27,6 +27,13 @@
 //!   dialect of their home region's language; a daughter culture starts from a
 //!   changed copy of its parent's. Provinces are renamed in the language of
 //!   their majority culture, and a state takes its capital's name.
+//! - **Settlements beyond the climate:** a province holds people in proportion
+//!   to area × habitability^1.5 (springs already raise habitability). Later
+//!   eras add room: from the second, watered stops on caravan routes across
+//!   dry land (routes run between the most populous provinces, and dry land
+//!   without water is costly to cross); from the third, mining towns at metal
+//!   deposits; from the fourth, irrigation along rivers in dry land. Site
+//!   pins reach their population in the last era.
 
 use super::{Ctx, StepOutput};
 use crate::community;
@@ -62,12 +69,17 @@ struct Prov {
     /// Sea band: 0 coastal, 1 shelf, 2 open.
     band: u8,
     area: f64,
-    hab: f64,
     center: Vec3,
     state: u16,
     region: u16,
     continent: u32,
     name: String,
+    /// Mean of habitability^1.5 over the province's cells.
+    cap_factor: f64,
+    rain: f64,
+    river: bool,
+    site: f64,
+    metals: u32,
 }
 
 struct Border {
@@ -213,12 +225,16 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                     _ => 0,
                 },
                 area: p["area_km2"].as_f64().unwrap_or(0.0),
-                hab: p["habitability"].as_f64().unwrap_or(0.0),
                 center: Vec3::from_lat_lon_deg(ll[0].as_f64().unwrap_or(0.0), ll[1].as_f64().unwrap_or(0.0)),
                 state: p["state"].as_u64().unwrap_or(0) as u16,
                 region: p["region"].as_u64().unwrap_or(0) as u16,
                 continent: (p["continent"].as_u64().unwrap_or(1) as u32).saturating_sub(1),
                 name: p["name"].as_str().unwrap_or("").to_string(),
+                cap_factor: p["capacity_factor"].as_f64().unwrap_or_else(|| p["habitability"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0).powf(1.5)),
+                rain: p["rain_mm"].as_f64().unwrap_or(1000.0),
+                river: p["river"].as_bool().unwrap_or(false),
+                site: p["site"].as_f64().unwrap_or(0.0),
+                metals: p["resources"].as_array().map_or(0, |r| r.iter().filter(|x| x.as_str().is_some_and(|m| super::resources::METALS.contains(&m))).count() as u32),
             }
         })
         .collect();
@@ -240,8 +256,22 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         adj[x].push(Border { to: y as u32, ty, km, barrier });
         adj[y].push(Border { to: x as u32, ty, km, barrier });
     }
-    let capacity: Vec<f64> = provs.iter().map(|p| if p.kind <= kind::WASTELAND { cp.density_per_km2 * p.area * p.hab.clamp(0.0, 1.0).powf(1.5) } else { 0.0 }).collect();
-    let k_total: f64 = capacity.iter().sum();
+    let base_capacity: Vec<f64> = provs.iter().map(|p| if p.kind <= kind::WASTELAND { cp.density_per_km2 * p.area * p.cap_factor } else { 0.0 }).collect();
+    let mut capacity = base_capacity.clone();
+    // Site pins: the province holding each pin and the population it should reach.
+    let prov_field = ctx.input.u32("province");
+    let mut pin_pop = vec![0.0f64; np];
+    for pin in ctx.input.meta("sites")["pins"].as_array().unwrap_or(&empty) {
+        let cell = pin["cell"].as_u64().unwrap_or(0) as usize;
+        if let Some(&p) = prov_field.get(cell).and_then(|id| index.get(id)) {
+            pin_pop[p] = pin_pop[p].max(pin["population"].as_f64().unwrap_or(0.0));
+        }
+    }
+    let arid = |p: &Prov| ((400.0 - p.rain) / 400.0).clamp(0.0, 1.0);
+    let watered = |p: &Prov| p.site > 0.3 || p.river;
+    let mut traffic = vec![0.0f64; np];
+    let mut why = vec![0u8; np]; // bit 1 caravan, 2 mining, 4 irrigation, 8 pin
+    let k_total: f64 = base_capacity.iter().sum();
     if np == 0 || k_total <= 0.0 {
         return empty_output(ctx.grid.len());
     }
@@ -312,6 +342,45 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             era = e;
             ctx.progress(0.02 + 0.9 * frac as f32, &format!("Era {}: mapping travel routes", era + 1));
             hood = neighbourhoods(era);
+            // Room beyond the climate, by era.
+            if era >= 1 {
+                ctx.progress(0.02 + 0.9 * frac as f32, &format!("Era {}: tracing caravan routes", era + 1));
+                traffic = caravan_traffic(&provs, &adj, &bands, &edge_cost(era), &arid, &watered);
+            }
+            // Traffic relative to the busiest watered stop in dry land.
+            let tmax = (0..np).filter(|&p| arid(&provs[p]) > 0.0 && watered(&provs[p])).map(|p| traffic[p]).fold(0.0, f64::max).max(1e-9);
+            for p in 0..np {
+                let pr = &provs[p];
+                let mut k = base_capacity[p];
+                if pr.kind > kind::WASTELAND {
+                    capacity[p] = 0.0;
+                    continue;
+                }
+                let dry = arid(pr);
+                if era >= 1 && dry > 0.0 && watered(pr) && traffic[p] > 0.0 {
+                    let add = cp.caravan_people * dry * (traffic[p] / tmax).sqrt();
+                    if add > 0.1 * cp.caravan_people {
+                        why[p] |= 1;
+                    }
+                    k += add;
+                }
+                if era >= 2 && pr.metals > 0 {
+                    k += cp.mining_people * pr.metals as f64;
+                    why[p] |= 2;
+                }
+                if era >= 3 && pr.river && dry > 0.0 {
+                    let irr = cp.density_per_km2 * pr.area * cp.irrigation_share * dry * 0.35;
+                    if irr > k {
+                        why[p] |= 4;
+                    }
+                    k = k.max(irr);
+                }
+                if era >= 3 && pin_pop[p] > 0.0 {
+                    k = k.max(pin_pop[p]);
+                    why[p] |= 8;
+                }
+                capacity[p] = k;
+            }
         } else if t % 20 == 0 {
             ctx.progress(0.02 + 0.9 * frac as f32, &format!("Generation {t} of {ticks}: {} bands, {} cultures", bands.alive.iter().filter(|&&a| a).count(), cultures.iter().filter(|c| c.ended.is_none()).count()));
         }
@@ -670,6 +739,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             serde_json::json!({ "id": g1, "name": group_name(&cult_names[lead - 1]), "color": group_color(g1), "cultures": members, "population": pop.round() })
         })
         .collect();
+    let cp_spring_rain = ctx.params.habitability.spring_max_precip_mm;
     let provinces_json: Vec<serde_json::Value> = (0..np)
         .filter(|&p| provs[p].kind <= kind::WASTELAND)
         .map(|p| {
@@ -677,10 +747,20 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             let mut shares: Vec<(u32, f64)> = prov_cult[p].iter().map(|(&c, &v)| (c, v / total.max(1e-9))).collect();
             shares.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
             let shares: Vec<serde_json::Value> = shares.iter().filter(|s| s.1 >= 0.05).take(4).map(|s| serde_json::json!([s.0, (s.1 * 1000.0).round() / 1000.0])).collect();
+            // Why the province holds more people than its climate alone allows.
+            let mut growth: Vec<&str> = Vec::new();
+            if provs[p].site > 0.3 && provs[p].rain < cp_spring_rain {
+                growth.push("spring");
+            }
+            for (bit, what) in [(1, "caravan"), (2, "mining"), (4, "irrigation"), (8, "pin")] {
+                if why[p] & bit != 0 {
+                    growth.push(what);
+                }
+            }
             serde_json::json!({
                 "id": provs[p].id, "name": prov_names[p], "population": total.round(),
                 "density_km2": (total / provs[p].area.max(1.0) * 100.0).round() / 100.0,
-                "culture": prov_major[p], "shares": shares,
+                "culture": prov_major[p], "shares": shares, "growth": growth,
             })
         })
         .collect();
@@ -701,6 +781,31 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         }
     }
     let alive_cultures = cultures.iter().filter(|c| c.ended.is_none()).count();
+    // Desert towns: dry provinces (under 250 mm of rain) with no river that
+    // still hold at least 10,000 people and 0.5 people per km² (about half the
+    // world median; open desert holds about a tenth of that), by what made
+    // room for them.
+    let mut desert_towns: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut n_desert_towns = 0;
+    for p in 0..np {
+        let total: f64 = prov_cult[p].values().sum();
+        if provs[p].kind > kind::WASTELAND || provs[p].rain >= 250.0 || provs[p].river || total < 10_000.0 || total < 0.5 * provs[p].area {
+            continue;
+        }
+        n_desert_towns += 1;
+        let cause = if why[p] & 8 != 0 {
+            "pin"
+        } else if why[p] & 2 != 0 {
+            "mining"
+        } else if why[p] & 1 != 0 {
+            "caravan"
+        } else if provs[p].site > 0.3 {
+            "spring"
+        } else {
+            "other"
+        };
+        *desert_towns.entry(cause).or_insert(0) += 1;
+    }
     let count_fate = |f: &str| cultures.iter().filter(|c| c.fate == f).count();
     let mut f = Fields::default();
     f.put("culture", Field::U16(f_cult));
@@ -721,6 +826,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "band_split_pop": split_pop.round(),
             "years": year(ticks),
             "checks": checks,
+            "desert_towns": n_desert_towns,
+            "desert_towns_by_cause": desert_towns,
             "table": {
                 "cultures": cultures_json,
                 "groups": groups_json,
@@ -1030,6 +1137,69 @@ fn update_cultures(
             }
         }
     }
+}
+
+/// Caravan traffic per province: routes between the 60 most populous
+/// provinces over the era's travel graph, each weighted by the geometric mean
+/// of the two populations. Dry land is costly to cross unless it has water
+/// (a spring or a river), so routes run from oasis to oasis.
+fn caravan_traffic(
+    provs: &[Prov],
+    adj: &[Vec<Border>],
+    bands: &Bands,
+    cost: &dyn Fn(usize, &Border) -> Option<f64>,
+    arid: &dyn Fn(&Prov) -> f64,
+    watered: &dyn Fn(&Prov) -> bool,
+) -> Vec<f64> {
+    let np = provs.len();
+    let mut pop = vec![0.0f64; np];
+    for b in 0..bands.len() {
+        if bands.alive[b] {
+            pop[bands.prov[b] as usize] += bands.pop[b];
+        }
+    }
+    let mut hubs: Vec<usize> = (0..np).filter(|&p| pop[p] > 0.0).collect();
+    hubs.sort_by(|&a, &b| pop[b].partial_cmp(&pop[a]).unwrap().then(a.cmp(&b)));
+    hubs.truncate(60);
+    let mut traffic = vec![0.0f64; np];
+    let mut dist = vec![f64::INFINITY; np];
+    let mut pred = vec![NONE; np];
+    for (k, &src) in hubs.iter().enumerate() {
+        dist.iter_mut().for_each(|d| *d = f64::INFINITY);
+        pred.iter_mut().for_each(|p| *p = NONE);
+        dist[src] = 0.0;
+        let mut heap = BinaryHeap::new();
+        heap.push(Reverse((0u64, src as u32)));
+        while let Some(Reverse((bits, p))) = heap.pop() {
+            let (d, pu) = (f64::from_bits(bits), p as usize);
+            if d > dist[pu] {
+                continue;
+            }
+            for e in &adj[pu] {
+                let Some(c) = cost(pu, e) else { continue };
+                let to = &provs[e.to as usize];
+                let c = c * (1.0 + 3.0 * arid(to) * if watered(to) { 0.2 } else { 1.0 });
+                let nd = d + c;
+                if nd < dist[e.to as usize] {
+                    dist[e.to as usize] = nd;
+                    pred[e.to as usize] = p;
+                    heap.push(Reverse((nd.to_bits(), e.to)));
+                }
+            }
+        }
+        for &dst in &hubs[k + 1..] {
+            if !dist[dst].is_finite() {
+                continue;
+            }
+            let w = (pop[src] * pop[dst]).sqrt();
+            let mut c = pred[dst];
+            while c != NONE && c as usize != src {
+                traffic[c as usize] += w;
+                c = pred[c as usize];
+            }
+        }
+    }
+    traffic
 }
 
 fn intersect(a: &[u32], b: &[u32]) -> usize {
