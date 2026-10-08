@@ -4,7 +4,7 @@ import { Grid, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
 import { BOUNDARY, KOPPEN, LAYERS, MONTHS, TERRAIN, colorize, cultureColor, groupColor, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
-import { STAGE2_START, STAGE3_START, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
+import { EDITOR_TOOLS, STAGE2_START, STAGE3_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
 
 // ------------------------------------------------------------------ state
 
@@ -25,6 +25,7 @@ type Status = {
     elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_strokes: number; pins: any[]; arrows: any[];
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
     site_pins: number; sites: { lat: number; lon: number; population: number }[];
+    fertility_strokes: number; band_pins: { lat: number; lon: number; bands: number }[];
   };
   grid: { level: number; cells: number; spacing_km: number };
   path: string | null;
@@ -43,6 +44,8 @@ const S = {
   toolValue: {} as Record<string, number>,
   pinKind: 'auto',
   openStep: 'sketch',
+  /** Map editor toolbar shown (province, state and goods tools). */
+  editor: false,
   overlays: { rivers: true, wind: false, motion: false, edits: true, borders: false },
   political: null as Political | null,
   exag: 0,
@@ -411,6 +414,21 @@ function drawEditMarkers() {
     const pts = [[0, r], [r, 0], [0, -r], [-r, 0], [0, r]];
     for (let k = 0; k < 4; k++) L.seg(offset(p, e, n, pts[k][0], pts[k][1]), offset(p, e, n, pts[k + 1][0], pts[k + 1][1]), col, 0.004);
   }
+  // Founding-band pins (filled, size by bands) and, without pins, where the
+  // random founders started (hollow).
+  const ring = (p: Vec3, r: number, col: [number, number, number, number], fill: boolean) => {
+    const [e, n] = eastNorth(p);
+    for (let k = 0; k < 16; k++) {
+      const a1 = (k / 16) * 2 * Math.PI, a2 = ((k + 1) / 16) * 2 * Math.PI;
+      L.seg(offset(p, e, n, Math.cos(a1) * r, Math.sin(a1) * r), offset(p, e, n, Math.cos(a2) * r, Math.sin(a2) * r), col, 0.004);
+      if (fill) L.seg(p, offset(p, e, n, Math.cos(a1) * r, Math.sin(a1) * r), col, 0.004);
+    }
+  };
+  for (const b of st.edits.band_pins ?? []) ring(fromLatLon((b.lat * Math.PI) / 180, (b.lon * Math.PI) / 180), 0.01 + 0.004 * Math.sqrt(b.bands), [1, 0.85, 0.2, 1], true);
+  if (!(st.edits.band_pins ?? []).length) {
+    const founders = st.steps.find((s) => s.key === 'cultures')?.meta?.founders ?? [];
+    for (const f of founders) ring(fromLatLon((f.lat * Math.PI) / 180, (f.lon * Math.PI) / 180), 0.012, [1, 0.85, 0.2, 0.7], false);
+  }
   for (const a of st.edits.arrows) {
     const p = fromLatLon((a.lat * Math.PI) / 180, (a.lon * Math.PI) / 180);
     const b = (a.bearing_deg * Math.PI) / 180;
@@ -565,8 +583,24 @@ function renderTopbar() {
       h('label', { class: 'check', title: 'Relief exaggeration on the globe' }, 'Relief',
         h('input', { type: 'range', min: 0, max: 40, step: 1, value: S.exag, oninput: (e: Event) => { S.exag = Number((e.target as HTMLInputElement).value); refreshLayer(); } }))),
     h('div', { class: 'spacer' }),
-    h('button', { class: 'primary', disabled: S.busy, onclick: () => run('provinces') }, 'Generate all'),
+    btn('Edit map', () => {
+      S.editor = !S.editor;
+      if (!S.editor && EDITOR_TOOLS.includes(S.tool)) S.tool = 'navigate';
+      renderTopbar();
+      renderToolbar();
+    }, { class: S.editor ? 'on' : '', title: 'Map editor: merge, move and rename provinces and states, paint trade goods' }),
+    stageButtons(st),
   );
+}
+
+/** "Next stage" (the first stage not fully generated), one button per stage, and "Generate all". */
+function stageButtons(st: Status): HTMLElement {
+  const done = (step: string) => st.steps.find((s) => s.key === step)?.state === 'done';
+  const next = STAGE_ENDS.find((s) => !done(s.step));
+  return h('div', { class: 'group' },
+    next ? h('button', { class: 'primary', disabled: S.busy, title: `Generate everything up to the end of Stage ${next.stage}`, onclick: () => run(next.step) }, `Next: Stage ${next.stage}`) : null,
+    ...STAGE_ENDS.map((s) => h('button', { disabled: S.busy, class: done(s.step) ? 'done' : '', title: `Generate up to the end of Stage ${s.stage}`, onclick: () => run(s.step) }, done(s.step) ? `Stage ${s.stage} ✓` : `Stage ${s.stage}`)),
+    h('button', { class: next ? '' : 'primary', disabled: S.busy, onclick: () => run(STAGE_ENDS[STAGE_ENDS.length - 1].step) }, 'Generate all'));
 }
 
 function undoTarget(): string | undefined {
@@ -755,6 +789,18 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
   if (ui.key === 'states') {
     body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.state_strokes} state paint strokes`),
       h('button', { class: 'small', disabled: !e.state_strokes, onclick: () => mutate('clear_layer', { layer: 'states' }) }, 'Clear paint')));
+    body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.fertility_strokes} fertility strokes`),
+      h('button', { class: 'small', disabled: !e.fertility_strokes, onclick: () => mutate('clear_layer', { layer: 'fertility' }, 'habitability') }, 'Clear fertility')));
+  }
+  if (ui.key === 'cultures') {
+    const pins = e.band_pins ?? [];
+    const founders = S.status!.steps.find((x) => x.key === 'cultures')?.meta?.founders ?? [];
+    body.append(h('h4', {}, 'Founding peoples'),
+      h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, pins.length
+        ? `${pins.length} founding-band pins (${pins.reduce((a, b) => a + b.bands, 0)} bands) replace the random founders.`
+        : `Random founders (hollow circles on the map). Pin them to move or resize them.`),
+        !pins.length && founders.length ? h('button', { class: 'small', onclick: () => pinFounders(founders) }, 'Pin these') : null,
+        h('button', { class: 'small', disabled: !pins.length, onclick: () => mutate('clear_layer', { layer: 'bands' }, 'cultures') }, 'Clear pins')));
   }
   if (ui.key === 'provinces') {
     const imp = e.province_import;
@@ -838,6 +884,22 @@ function paramInput(p: Param): HTMLElement {
     setParam('planet', 'seed', s);
   } }, 'Dice') : null;
   return h('label', { class: slider ? 'has-range' : '' }, label, h('div', { class: 'row' }, slider, num, extra));
+}
+
+/** Turn the random founders of the last run into pins (one band each), so they can be moved, resized or removed. */
+async function pinFounders(founders: { lat: number; lon: number; bands: number }[]) {
+  try {
+    for (const f of founders) {
+      await api.json('add_stroke', { stroke: { tool: 'band_pin', value: f.bands, radius_km: 100, points: [[f.lat, f.lon]] } });
+    }
+    const st = await api.json<Status>('status', {});
+    S.status = st;
+    invalidate();
+    await refreshStatus(st);
+    toast(`Pinned ${founders.length} founders`);
+  } catch (err) {
+    toast(String(err), true);
+  }
 }
 
 function stat(k: string, v: string) {
@@ -1020,7 +1082,8 @@ function renderToolbar() {
   const tb = $('#toolbar');
   tb.innerHTML = '';
   const open = STEPS.find((s) => s.key === S.openStep);
-  const ids: ToolId[] = ['navigate', ...(open?.tools ?? [])];
+  const ids: ToolId[] = ['navigate', ...(S.editor ? EDITOR_TOOLS : open?.tools ?? [])];
+  if (S.editor) tb.append(h('div', { class: 'tb-hint' }, 'Map editor'));
   for (const id of ids) {
     const t = TOOLS.find((x) => x.id === id)!;
     tb.append(h('button', { class: S.tool === id ? 'on' : '', title: `${t.hint}${t.key ? ` (${t.key.toUpperCase()})` : ''}`, onclick: () => { S.tool = id; renderToolbar(); } }, t.label));
@@ -1042,13 +1105,30 @@ function renderToolbar() {
       out.textContent = fmt(S.brush[key]);
     } }), out);
   };
-  if (t.value !== 'pin' && S.tool !== 'arrow') {
+  if (t.value !== 'pin' && S.tool !== 'arrow' && !t.gesture) {
     bb.append(slider('Radius', 'radius_km', 30, 3000, 10, (v) => `${v} km`), slider('Strength', 'strength', 0.05, 1, 0.05, (v) => v.toFixed(2)), slider('Hardness', 'hardness', 0, 0.95, 0.05, (v) => v.toFixed(2)));
     if (t.scatter) bb.append(slider('Scatter', 'scatter', 0.05, 1, 0.05, (v) => v.toFixed(2)), slider('Grain', 'grain_km', 40, 1500, 10, (v) => `${v} km`));
   }
   const val = S.toolValue[t.id] ?? t.defaultValue ?? 0;
   const setVal = (v: number) => (S.toolValue[t.id] = v);
   if (t.value === 'metres') bb.append(h('label', {}, h('span', {}, S.tool === 'flatten' ? 'Target (m)' : 'Amount (m)'), h('input', { type: 'number', step: 50, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
+  if (t.value === 'fertility') {
+    const out = h('b', {}, (val > 0 ? '+' : '') + val.toFixed(2));
+    bb.append(h('label', {}, h('span', {}, 'Fertility (− barren, + fertile)'), h('input', { type: 'range', min: -1, max: 1, step: 0.05, value: val, oninput: (e: Event) => {
+      const v = Number((e.target as HTMLInputElement).value);
+      setVal(v);
+      out.textContent = (v > 0 ? '+' : '') + v.toFixed(2);
+    } }), out));
+  }
+  if (t.value === 'bands') bb.append(h('label', {}, h('span', {}, 'Bands'), h('input', { type: 'number', step: 1, min: 1, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
+  if (t.value === 'goods') {
+    const goods = ['grain', 'wine', 'horses', 'wool', 'cattle', 'wood', 'furs', 'spices', 'fish', 'stone', 'metals', 'dates', 'salt', 'camels'];
+    const deps = ['copper', 'gold', 'silver', 'iron', 'coal', 'salt'];
+    bb.append(h('label', {}, h('span', {}, 'Paint'), h('select', { onchange: (e: Event) => setVal(Number((e.target as HTMLSelectElement).value)) },
+      h('optgroup', { label: 'Trade good' }, ...goods.map((g, i) => h('option', { value: i + 1, selected: val === i + 1 }, g))),
+      h('optgroup', { label: 'Add deposit' }, ...deps.map((d, i) => h('option', { value: 101 + i, selected: val === 101 + i }, `+ ${d}`))),
+      h('optgroup', { label: 'Remove deposit' }, ...deps.map((d, i) => h('option', { value: 201 + i, selected: val === 201 + i }, `− ${d}`))))));
+  }
   if (t.value === 'people') bb.append(h('label', {}, h('span', {}, 'Population'), h('input', { type: 'number', step: 1000, min: 0, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'barrier') bb.append(h('label', {}, h('span', {}, 'Barrier strength'), h('input', { type: 'number', step: 1, min: 0, max: 50, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'speed') bb.append(h('label', {}, h('span', {}, 'Speed (mm/yr)'), h('input', { type: 'number', step: 5, min: 1, max: 300, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
@@ -1102,6 +1182,7 @@ function toast(msg: string, err = false) {
 
 type Drag =
   | { kind: 'nav'; x: number; y: number }
+  | { kind: 'link'; start: Vec3; end: Vec3 }
   | { kind: 'stroke'; points: Vec3[]; base: Map<number, number>; dmin: Map<number, number>; noise: Map<number, number>; seed: number; gen: Noise | null }
   | { kind: 'arrow'; start: Vec3 };
 
@@ -1138,6 +1219,10 @@ function bindCanvas() {
       return;
     }
     const tdef = TOOLS.find((x) => x.id === S.tool)!;
+    if (tdef.gesture) {
+      drag = { kind: 'link', start: p, end: p };
+      return;
+    }
     const seed = Math.floor(Math.random() * 2 ** 32);
     drag = { kind: 'stroke', points: [p], base: new Map(), dmin: new Map(), noise: new Map(), seed, gen: tdef.scatter ? new Noise(seed, SCATTER_STREAM) : null };
     paintPreview(drag, p);
@@ -1175,6 +1260,14 @@ function bindCanvas() {
       drawBrush(p, drag.points);
       return;
     }
+    if (drag?.kind === 'link' && p) {
+      drag.end = p;
+      const L = new Lines();
+      L.seg(drag.start, p, [1, 0.85, 0.2, 1], 0.006);
+      const [a, b] = L.sets();
+      R.setOverlay('brush', a, b);
+      return;
+    }
     if (drag?.kind === 'arrow' && p) {
       const L = new Lines();
       L.seg(drag.start, p, [1, 0.35, 0.3, 1], 0.006);
@@ -1205,6 +1298,28 @@ function bindCanvas() {
         points: d.points.map((p) => toLatLon(p).map((v) => +((v * 180) / Math.PI).toFixed(4))),
       };
       drawBrush(null);
+      await mutate('add_stroke', { stroke }, t.step);
+    } else if (d.kind === 'link') {
+      R.setOverlay('brush', null, null);
+      const t = TOOLS.find((x) => x.id === S.tool)!;
+      const deg = (p: Vec3) => toLatLon(p).map((v) => +((v * 180) / Math.PI).toFixed(4));
+      const moved = Math.acos(Math.max(-1, Math.min(1, d.start[0] * d.end[0] + d.start[1] * d.end[1] + d.start[2] * d.end[2]))) > 0.004;
+      if (t.gesture === 'link' && !moved && t.id !== 'band_pin') {
+        toast('Drag from the first place to the second.');
+        return;
+      }
+      let name = '';
+      if (t.rename) {
+        name = window.prompt(t.id === 'rename_state' ? 'New state name' : 'New province name')?.trim() ?? '';
+        if (!name) return;
+      }
+      const stroke = {
+        tool: t.rust ?? S.tool,
+        radius_km: S.brush.radius_km,
+        value: S.toolValue[t.id] ?? t.defaultValue ?? 0,
+        points: (moved && t.gesture === 'link' ? [d.start, d.end] : [d.start]).map(deg),
+        name,
+      };
       await mutate('add_stroke', { stroke }, t.step);
     } else if (d.kind === 'arrow') {
       const [x, y] = pos(e);
@@ -1369,7 +1484,7 @@ function bindKeys() {
     if (e.key === 'g') setView(0);
     if (e.key === 'f') setView(1);
     const open = STEPS.find((s) => s.key === S.openStep);
-    const t = TOOLS.find((x) => x.key === e.key && (x.id === 'navigate' || open?.tools.includes(x.id)));
+    const t = TOOLS.find((x) => x.key === e.key && (x.id === 'navigate' || (S.editor ? EDITOR_TOOLS : open?.tools ?? []).includes(x.id)));
     if (t) { S.tool = t.id; renderToolbar(); }
   });
 }

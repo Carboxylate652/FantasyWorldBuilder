@@ -31,6 +31,27 @@ pub enum Tool {
     // state or province that grows over the painted cells.
     StatePaint,
     ProvincePaint,
+    // Fertility (applied with habitability, used from state making on): paint
+    // fertile (value > 0) or barren (value < 0) land, or erase the paint.
+    FertilityPaint,
+    FertilityErase,
+    // Map editor (drag from the first point to the last): merge the province
+    // or state under the first point into the one under the last; move the
+    // province under the first point into the state under the last.
+    ProvinceMerge,
+    StateMerge,
+    ProvinceToState,
+    // Rename the province or state under the first point to `name`.
+    RenameProvince,
+    RenameState,
+    // Goods editor: the provinces under the brush get a trade good (value
+    // 1–14, as in resources::TRADE_GOODS), gain a deposit (101–106) or lose
+    // one (201–206, as in resources::DEPOSITS).
+    GoodsPaint,
+    // Founding-band pins for the culture simulation: value = bands. A drag
+    // that starts on a pin moves it; erase removes the nearest pin.
+    BandPin,
+    BandErase,
     // Settlement site pin (step 8): a town no model explains (a gambling city,
     // an oil port). The stroke's first point places it; `value` is the
     // population it should reach.
@@ -45,9 +66,11 @@ impl Tool {
             Tool::Raise | Tool::Lower | Tool::Smooth | Tool::Flatten => EditLayer::Elevation,
             Tool::BiomePaint | Tool::BiomeErase => EditLayer::Biomes,
             Tool::BarrierPaint | Tool::BarrierErase => EditLayer::Barriers,
-            Tool::StatePaint => EditLayer::States,
-            Tool::ProvincePaint => EditLayer::Provinces,
+            Tool::StatePaint | Tool::StateMerge | Tool::RenameState => EditLayer::States,
+            Tool::ProvincePaint | Tool::ProvinceMerge | Tool::ProvinceToState | Tool::RenameProvince | Tool::GoodsPaint => EditLayer::Provinces,
             Tool::SitePin => EditLayer::Sites,
+            Tool::FertilityPaint | Tool::FertilityErase => EditLayer::Fertility,
+            Tool::BandPin | Tool::BandErase => EditLayer::Bands,
         }
     }
 }
@@ -63,6 +86,8 @@ pub enum EditLayer {
     States,
     Provinces,
     Sites,
+    Fertility,
+    Bands,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -85,11 +110,14 @@ pub struct Stroke {
     pub scatter_scale_km: f64,
     /// Per-stroke noise seed, so every scatter stroke looks different but replays identically.
     pub seed: u64,
+    /// New name (rename tools).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 impl Default for Stroke {
     fn default() -> Self {
-        Stroke { tool: Tool::Land, radius_km: 400.0, strength: 1.0, hardness: 0.5, value: 0.0, points: vec![], scatter: 0.0, scatter_scale_km: 250.0, seed: 0 }
+        Stroke { tool: Tool::Land, radius_km: 400.0, strength: 1.0, hardness: 0.5, value: 0.0, points: vec![], scatter: 0.0, scatter_scale_km: 250.0, seed: 0, name: String::new() }
     }
 }
 
@@ -145,6 +173,8 @@ pub struct Overrides {
     pub states: Vec<Stroke>,
     pub provinces: Vec<Stroke>,
     pub sites: Vec<Stroke>,
+    pub fertility: Vec<Stroke>,
+    pub bands: Vec<Stroke>,
 }
 
 /// How heightmap pixel values map to metres.
@@ -210,6 +240,31 @@ impl Edits {
             EditLayer::States => self.overrides.states.push(s),
             EditLayer::Provinces => self.overrides.provinces.push(s),
             EditLayer::Sites => self.overrides.sites.push(s),
+            EditLayer::Fertility => self.overrides.fertility.push(s),
+            EditLayer::Bands => self.add_band_pin(s),
+        }
+    }
+
+    /// Founding-band pins: a drag that starts within 400 km of a pin moves
+    /// it; otherwise the pin goes where the stroke ends. Erase removes the
+    /// nearest pin within 600 km.
+    fn add_band_pin(&mut self, s: Stroke) {
+        let (Some(first), Some(last)) = (s.points.first().copied(), s.points.last().copied()) else { return };
+        let km = |a: [f64; 2], b: [f64; 2]| Vec3::from_lat_lon_deg(a[0], a[1]).angle_to(Vec3::from_lat_lon_deg(b[0], b[1])) * 6371.0;
+        let pins = &mut self.overrides.bands;
+        let nearest = |pins: &Vec<Stroke>, max: f64| {
+            pins.iter().enumerate().filter_map(|(k, p)| p.points.first().map(|q| (k, km(*q, first)))).filter(|x| x.1 <= max).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| x.0)
+        };
+        match s.tool {
+            Tool::BandErase => {
+                if let Some(k) = nearest(pins, 600.0) {
+                    pins.remove(k);
+                }
+            }
+            _ => match nearest(pins, 400.0).filter(|_| s.points.len() >= 2 && km(first, last) > 50.0) {
+                Some(k) => pins[k].points = vec![last],
+                None => pins.push(Stroke { points: vec![last], ..s }),
+            },
         }
     }
     pub fn clear_layer(&mut self, layer: EditLayer) {
@@ -226,6 +281,8 @@ impl Edits {
             EditLayer::States => self.overrides.states.clear(),
             EditLayer::Provinces => self.overrides.provinces.clear(),
             EditLayer::Sites => self.overrides.sites.clear(),
+            EditLayer::Fertility => self.overrides.fertility.clear(),
+            EditLayer::Bands => self.overrides.bands.clear(),
         }
     }
 }

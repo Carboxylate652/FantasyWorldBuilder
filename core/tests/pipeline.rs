@@ -366,3 +366,78 @@ fn states_and_provinces_round_trip() {
     assert!(same > 0.98, "only {:.1}% of cells kept their province", same * 100.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Map editor and pre-culture edits: fertility paint, province and state
+/// merges, moving a province to another state, renames, the goods editor and
+/// founding-band pins (add, move, erase).
+#[test]
+fn map_editor_and_founders() {
+    use worldcore::edits::{Stroke, Tool};
+    use worldcore::fields::Field;
+    let mut p = WorldParams::default();
+    p.planet.seed = 4;
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 60;
+    let mut w = World::new(p);
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let table = w.meta(Step::Provinces).unwrap()["table"].clone();
+    let land: Vec<serde_json::Value> = table["provinces"].as_array().unwrap().iter().filter(|p| p["kind"] == "land").cloned().collect();
+    let ll = |p: &serde_json::Value| [p["center"][0].as_f64().unwrap(), p["center"][1].as_f64().unwrap()];
+    let n_prov = table["provinces"].as_array().unwrap().len();
+    let n_states = table["states"].as_array().unwrap().len();
+    // Two land provinces of different states, and a third in yet another state.
+    let a = &land[0];
+    let b = land.iter().find(|p| p["state"] != a["state"]).unwrap();
+    let c = land.iter().find(|p| p["state"] != a["state"] && p["state"] != b["state"]).unwrap();
+    let pt = |q: &serde_json::Value| ll(q);
+    let stroke = |tool: Tool, points: Vec<[f64; 2]>, value: f64, name: &str| Stroke { tool, points, value, radius_km: 300.0, name: name.into(), ..Default::default() };
+    w.edits.add_stroke(stroke(Tool::FertilityPaint, vec![pt(c)], 1.0, ""));
+    w.edits.add_stroke(stroke(Tool::StateMerge, vec![pt(b), pt(c)], 0.0, ""));
+    w.edits.add_stroke(stroke(Tool::ProvinceMerge, vec![pt(a), pt(b)], 0.0, ""));
+    w.edits.add_stroke(stroke(Tool::RenameProvince, vec![pt(b)], 0.0, "Testburg"));
+    w.edits.add_stroke(stroke(Tool::RenameState, vec![pt(b)], 0.0, "Testland"));
+    w.edits.add_stroke(stroke(Tool::GoodsPaint, vec![pt(b)], 2.0, ""));
+    w.edits.add_stroke(stroke(Tool::GoodsPaint, vec![pt(b)], 101.0, ""));
+    // Founders: two pins, then move the first and erase the second.
+    let far = land.iter().max_by(|x, y| {
+        let d = |q: &serde_json::Value| (q["center"][0].as_f64().unwrap() - a["center"][0].as_f64().unwrap()).abs();
+        d(x).partial_cmp(&d(y)).unwrap()
+    }).unwrap();
+    w.edits.add_stroke(stroke(Tool::BandPin, vec![pt(a)], 5.0, ""));
+    w.edits.add_stroke(stroke(Tool::BandPin, vec![pt(far)], 1.0, ""));
+    w.edits.add_stroke(stroke(Tool::BandPin, vec![pt(a), pt(c)], 5.0, ""));
+    assert_eq!(w.edits.overrides.bands.len(), 2, "dragging a pin moves it");
+    assert_eq!(w.edits.overrides.bands[0].points[0], pt(c));
+    w.run_to(LAST, &|_, _, _| {});
+
+    let hab = match w.field("habitability") { Some((Field::F32(v), _, _)) => v.clone(), _ => panic!() };
+    let g = w.grid();
+    let cell = |q: [f64; 2]| g.nearest(worldcore::vec3::Vec3::from_lat_lon_deg(q[0], q[1]), None);
+    assert!(hab[cell(pt(c))] > 0.99, "fertility paint raises habitability");
+    let prov = match w.field("province") { Some((Field::U32(v), _, _)) => v.clone(), _ => panic!() };
+    let state = match w.field("state") { Some((Field::U16(v), Step::Provinces, _)) => v.clone(), _ => panic!() };
+    assert_eq!(prov[cell(pt(a))], prov[cell(pt(b))], "province merge");
+    assert_eq!(state[cell(pt(b))], state[cell(pt(c))], "state merge");
+    let t = &w.meta(Step::Provinces).unwrap()["table"];
+    // (Counts are not compared: fertility paint reshapes provinces and states.)
+    let _ = (n_prov, n_states);
+    let merged = t["provinces"].as_array().unwrap().iter().find(|q| q["id"].as_u64() == Some(prov[cell(pt(b))] as u64)).unwrap();
+    assert_eq!(merged["name"], "Testburg");
+    assert_eq!(merged["trade_good"], "wine");
+    assert!(merged["resources"].as_array().unwrap().iter().any(|r| r == "copper"));
+    let st = t["states"].as_array().unwrap().iter().find(|s| s["id"].as_u64() == Some(state[cell(pt(b))] as u64)).unwrap();
+    assert_eq!(st["name"], "Testland");
+    // Culture names keep the editor's names.
+    let mut named = t.clone();
+    worldcore::stages::cultures::apply_names(&mut named, &w.meta(Step::Cultures).unwrap()["table"]);
+    assert!(named["provinces"].as_array().unwrap().iter().any(|q| q["name"] == "Testburg"));
+    assert!(named["states"].as_array().unwrap().iter().any(|s| s["name"] == "Testland"));
+    let founders = w.meta(Step::Cultures).unwrap()["founders"].as_array().unwrap().clone();
+    assert_eq!(founders.len(), 2);
+    assert!(founders.iter().all(|f| f["pinned"] == true));
+    assert_eq!(founders[0]["bands"], 5);
+    // Erase the second pin: one founding people left.
+    w.edits.add_stroke(stroke(Tool::BandErase, vec![pt(far)], 0.0, ""));
+    assert_eq!(w.edits.overrides.bands.len(), 1);
+}

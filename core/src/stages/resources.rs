@@ -18,6 +18,9 @@ use crate::rng::hash_unit;
 
 pub const METALS: [&str; 4] = ["copper", "gold", "silver", "iron"];
 
+/// Deposits, in the order the goods editor numbers them (101–106 add, 201–206 remove).
+pub const DEPOSITS: [&str; 6] = ["copper", "gold", "silver", "iron", "coal", "salt"];
+
 /// Trade goods, in the order of the `trade_good` field (value = index + 1;
 /// 0 = none). Keep in sync with TRADE_GOODS in app/src/layers.ts.
 pub const TRADE_GOODS: [&str; 16] = [

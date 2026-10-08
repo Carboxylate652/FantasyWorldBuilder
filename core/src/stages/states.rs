@@ -12,6 +12,9 @@
 //! 3. State paint strokes move cells to the state under the stroke's start.
 //! 4. Clean-up: disconnected fragments join the neighbour they touch most, and
 //!    states below the minimum size merge into their longest-border neighbour.
+//!    Map editor merges then join the state under each drag's start to the
+//!    one under its end (any distance apart, e.g. an island and the mainland),
+//!    and renames replace generated names.
 //! 5. States are grouped into regions (a few neighbouring states each, by
 //!    farthest-point seeding and growth over the state graph) and regions into
 //!    continents (from landmasses).
@@ -123,7 +126,33 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let mut st: Vec<u32> = (0..n).map(|i| if land(i) { label[i] } else { NONE }).collect();
     let moved = partition::absorb_fragments(g, &mut st, &area, |a, b| land(a) && land(b));
     let before = seeds.len();
-    let count = partition::merge_small(g, &mut st, seeds.len(), &area, &vec![sp.min_state_area_km2; seeds.len()], |_, _| true);
+    let mut count = partition::merge_small(g, &mut st, seeds.len(), &area, &vec![sp.min_state_area_km2; seeds.len()], |_, _| true);
+    // Map editor: merge the state under each drag's start into the one under its end.
+    let mut merged = 0usize;
+    for s in &ctx.edits.overrides.states {
+        if s.tool != Tool::StateMerge || s.points.len() < 2 {
+            continue;
+        }
+        let at = |p: [f64; 2]| st[g.nearest(Vec3::from_lat_lon_deg(p[0], p[1]), None)];
+        let (a, b) = (at(s.points[0]), at(*s.points.last().unwrap()));
+        if a != NONE && b != NONE && a != b {
+            st.iter_mut().filter(|x| **x == a).for_each(|x| *x = b);
+            merged += 1;
+        }
+    }
+    if merged > 0 {
+        let mut map = vec![NONE; count];
+        let mut next = 0u32;
+        for x in st.iter_mut().filter(|x| **x != NONE) {
+            let m = &mut map[*x as usize];
+            if *m == NONE {
+                *m = next;
+                next += 1;
+            }
+            *x = *m;
+        }
+        count = next as usize;
+    }
     // Seed index -> merged state (via the seed cell), for the water labels.
     let old_to_new: Vec<u32> = seeds.iter().map(|&c| st[c as usize]).collect();
     let water_label: Vec<u32> = (0..n)
@@ -296,6 +325,18 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         let lang = if r == NONE { &langs[s_cont[s as usize] as usize] } else { &dialects[r as usize] };
         state_names[s as usize] = lang.unique(&mut rng, &mut used);
     }
+    // Map editor renames.
+    let mut renamed = vec![false; count];
+    for s in &ctx.edits.overrides.states {
+        if s.tool != Tool::RenameState || s.points.is_empty() || s.name.trim().is_empty() {
+            continue;
+        }
+        let k = st[g.nearest(Vec3::from_lat_lon_deg(s.points[0][0], s.points[0][1]), None)];
+        if k != NONE {
+            state_names[k as usize] = s.name.trim().to_string();
+            renamed[k as usize] = true;
+        }
+    }
 
     let mut f_state = vec![0u16; n];
     let mut f_region = vec![0u16; n];
@@ -334,6 +375,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "center": deg(s_centroid[su]),
             "capital": if s_capital[su].1 != NONE { deg(g.pos[s_capital[su].1 as usize]) } else { deg(s_centroid[su]) },
             "capital_cell": s_capital[su].1,
+            "renamed": renamed[su],
         }));
     }
     let mut regions_json = Vec::new();
@@ -390,6 +432,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "attached_islands": attached,
             "fragments_moved": moved,
             "painted_cells": painted,
+            "merged_by_editor": merged,
             "table": { "states": states_json, "regions": regions_json, "continents": conts_json },
         }),
     }
