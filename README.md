@@ -22,7 +22,7 @@ Stack, as the proposal recommends: a **Rust simulation core** (`core/`), a **Tau
 
 Windows builds are on the [Releases page](https://github.com/Carboxylate652/FantasyWorldBuilder/releases): an installer (`…_x64-setup.exe`) and a portable zip with the app and the `worldgen` CLI. They need 64-bit Windows 10 or 11 with Microsoft Edge WebView2 (the installer fetches it if it is missing). The builds are not code-signed, so SmartScreen may warn on first launch (*More info → Run anyway*).
 
-Releases are built by `.github/workflows/release-windows.yml` on a Windows runner whenever a `v*` tag is pushed; tags with a hyphen (`v0.1.0-beta.1`) become pre-releases.
+Releases are built by `.github/workflows/release-windows.yml` on a Windows runner when a `v*` tag is pushed, or a commit whose message contains `[release v0.1.0-beta.1]` (the workflow then creates the tag on that commit). Tags with a hyphen (`v0.1.0-beta.1`) become pre-releases.
 
 ## Run it
 
