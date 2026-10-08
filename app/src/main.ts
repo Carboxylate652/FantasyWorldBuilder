@@ -913,6 +913,11 @@ function summary(key: string, m: any): HTMLElement {
     case 'provinces': {
       box.append(stat('Provinces', fmt(m.provinces)), stat('Land', fmt(m.land)), stat('Wasteland', fmt(m.wasteland)), stat('Lakes', fmt(m.lakes)),
         stat('Sea zones', fmt(m.sea)), stat('Median land province', `${fmt(m.median_land_km2 / 1000, 1)}k km²`), stat('Strait crossings', fmt(m.straits)));
+      if (m.borders) {
+        const b = m.borders;
+        box.append(stat('Land borders', `${fmt(b.land ?? 0)} open · ${fmt(b.river ?? 0)} river · ${fmt(b.impassable ?? 0)} impassable`),
+          stat('Coast and sea borders', `${fmt(b.coast ?? 0)} coast · ${fmt(b.sea ?? 0)} sea · ${fmt(b.lake ?? 0)} lake`));
+      }
       if (m.import?.error) box.append(h('div', { class: 'error' }, `Import failed, generated provinces shown: ${m.import.error}`));
       else if (m.import) {
         box.append(stat('Imported from', String(m.import.png).split(/[\\/]/).pop() ?? ''));

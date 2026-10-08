@@ -191,12 +191,52 @@ fn states_and_provinces_round_trip() {
         assert!(ids.insert(p["id"].as_u64().unwrap()));
         assert!(colors.insert(p["color"].to_string()), "duplicate colour {}", p["color"]);
     }
+    let by_id: std::collections::HashMap<u64, &serde_json::Value> = provs.iter().map(|p| (p["id"].as_u64().unwrap(), p)).collect();
     for s in t["states"].as_array().unwrap() {
         for pid in s["provinces"].as_array().unwrap() {
             let p = provs.iter().find(|p| &p["id"] == pid).unwrap();
             assert_eq!(p["state"], s["id"]);
         }
+        // Every state has a capital in it; a land capital carries the state's name.
+        let cap = by_id[&s["capital_province"].as_u64().unwrap()];
+        assert_eq!(cap["state"], s["id"], "capital of state {} is outside it", s["id"]);
+        if cap["kind"] == "land" {
+            assert_eq!(cap["name"], s["name"]);
+        }
     }
+    let mut names = std::collections::HashSet::new();
+    for p in provs {
+        assert!(names.insert(p["name"].as_str().unwrap()), "province name {} used twice", p["name"]);
+    }
+
+    // Every pair of neighbouring provinces has one typed border, and the type fits the kinds.
+    let adj = t["adjacency"].as_array().unwrap();
+    let mut borders = std::collections::HashMap::new();
+    for a in adj {
+        let (f, to, ty) = (a["from"].as_u64().unwrap(), a["to"].as_u64().unwrap(), a["type"].as_str().unwrap());
+        assert!(f < to);
+        assert!(borders.insert((f, to, ty == "strait"), ty).is_none(), "border {f}-{to} listed twice");
+        let kinds = [by_id[&f]["kind"].as_str().unwrap(), by_id[&to]["kind"].as_str().unwrap()];
+        let land = |k: &str| k == "land" || k == "wasteland";
+        let ok = match ty {
+            "land" | "river" => kinds == ["land", "land"],
+            "impassable" => land(kinds[0]) && land(kinds[1]) && kinds.contains(&"wasteland"),
+            "coast" => kinds.contains(&"sea") && kinds.iter().any(|k| land(k)),
+            "lake" => kinds.contains(&"lake"),
+            "sea" => kinds == ["sea", "sea"],
+            "strait" => true,
+            _ => false,
+        };
+        assert!(ok, "border {f}-{to} of type {ty} between {kinds:?}");
+    }
+    for p in provs {
+        let a = p["id"].as_u64().unwrap();
+        for b in p["neighbors"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()) {
+            assert!(borders.contains_key(&(a.min(b), a.max(b), false)), "neighbours {a} and {b} have no border");
+        }
+    }
+
+    let n_provs = provs.len();
 
     let dir = std::env::temp_dir().join(format!("fwm-prov-{}", std::process::id()));
     let opts = ExportOptions { width: 2048, height: 1024, ..Default::default() };
@@ -205,6 +245,14 @@ fn states_and_provinces_round_trip() {
     let csv = dir.join("definition.csv").display().to_string();
     let (imp, rep) = worldcore::province_import::describe(&png, Some(&csv), None, None).unwrap();
     assert!(rep.ok, "{:?}", rep.errors);
+    // The export clean-up leaves every province some pixels, no X-crossings and
+    // (almost) no provinces in pieces.
+    for warning in &rep.warnings {
+        assert!(!warning.contains("no pixels") && !warning.contains("X-crossings"), "{warning}");
+    }
+    let pkg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap()).unwrap();
+    let split = pkg["province_cleanup"]["split_provinces"].as_u64().unwrap() as usize;
+    assert!(split * 100 <= n_provs, "{split} of {n_provs} provinces are in pieces");
     w.edits.imports.provinces = Some(imp);
     assert!(!w.is_fresh(Step::Provinces) && w.is_fresh(Step::States));
     w.run_to(LAST, &|_, _, _| {});

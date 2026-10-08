@@ -111,25 +111,34 @@ Each step is cached under a hash of exactly the inputs it reads, plus a per-step
 | `rivers.geojson` | One LineString per river (source to confluence or mouth) with `width_m` and `discharge_m3s` per vertex, for spline-based renderers (Vic3 style) and GIS tools |
 | `biomes.png` | Köppen–Geiger colours |
 | `climate.png`, `precipitation.png` | Reference layers for modders |
-| `provinces.png` | One unique 24-bit RGB colour per province, no anti-aliasing. Borders are warped by noise (up to a third of a cell) so they don't follow the hexagonal cells; the coastline matches the heightmap pixel for pixel |
+| `provinces.png` | One unique 24-bit RGB colour per province, no anti-aliasing. Borders are warped by noise (up to a third of a cell) so they don't follow the hexagonal cells; the coastline matches the heightmap pixel for pixel. A clean-up pass keeps provinces in one piece (see below) |
 | `definition.csv` | `id;r;g;b;name;x;` with a `0;0;0;0;x;x;` first row (CK3 / Victoria 3) |
 | `provinces.csv` | Extra columns per province: kind (land, wasteland, lake, sea), sea band (coastal, shelf, open), state, region, continent, terrain, area, habitability, coastal, centre, neighbours |
 | `states.csv` | State key (`STATE_…`), name, region, continent, capital province, area, habitability, province ids and Victoria 3 style `xRRGGBB` colours |
 | `regions.csv`, `continents.csv` | The hierarchy above states |
 | `adjacencies.csv` | CK3 layout (`From;To;Type;Through;start_x;start_y;stop_x;stop_y;Comment`): sea crossings between provinces on different landmasses, up to *Longest strait crossing* |
+| `province_adjacency.csv` | Every border between two provinces: `from;to;type;border_km;barrier;crossing_km`. Types: `land`, `river` (the border runs along a border river), `impassable` (wasteland), `coast` (land–sea), `lake`, `sea`, `strait` (with its crossing width). `barrier` is the mean crossing cost along the border (0 = open) |
 | `states.png` | Reference map: states coloured, province borders thin, state borders black |
 | `package.json` | Palettes, encodings, file formats, parameters |
 
-Detail noise is added only at export time, which makes coastlines sharper than the grid.
+Detail noise is added only at export time, which makes coastlines sharper than the grid. It also makes islets and ponds the grid doesn't have, and the noise-warped borders cut a few pixels off their province. Before `provinces.png` is written, a clean-up pass (`core/src/export_clean.rs`):
+
+- turns islets and ponds that hold no grid cell's centre into the surface around them (the heightmap follows), keeping real islands;
+- makes every land pixel belong to a land or wasteland province and every sea pixel to a sea zone;
+- gives each stray piece of a province to the neighbouring province it touches most;
+- gives a province that the noise left under 8 pixels (a one-cell island) a disc of about half a cell;
+- breaks up X-crossings where four provinces meet at a pixel corner.
+
+`package.json` reports what it changed under `province_cleanup`. On the default world (seed 1, level 8, 8192 px) this takes provinces in several pieces from 464 to 18, X-crossings from 310 to 0, and provinces with no pixels from 4 to 0. The 18 left are islands of at least a cell, cut off from the rest of their province by a channel in the heightmap; they are kept rather than deleted.
 
 ### Re-importing edited provinces
 
 Edit `provinces.png` (and `definition.csv`) with a hard-edged pencil, then use *Import…* in the Provinces card or `worldgen import-provinces`. The files are checked first:
 
 - **Errors (the import is refused):** duplicate colours or ids in the CSV, colours in the image with no CSV row, and anti-aliased edge pixels (a colour that is a blend of two neighbouring provinces).
-- **Warnings:** CSV rows with no pixels, provinces in several pieces, provinces under 8 pixels, and X-crossings where four provinces meet at a pixel corner.
+- **Warnings:** CSV rows with no pixels, provinces in several pieces, provinces under 8 pixels, and X-crossings where four provinces meet at a pixel corner. A fresh export gives none of these except a handful of island provinces in several pieces.
 
-Each cell then takes its province by majority pixel vote. A province joins the state it overlaps most, so existing provinces keep their state. Ids, colours and names come from the CSV; without a CSV, colours are numbered automatically. The latitude band is read from `package.json` next to the image. Exporting and re-importing a package leaves 99.6% of cells in the same province at 2048 px, and the losses are islands too small to get a pixel.
+Each cell then takes its province by majority pixel vote. A province joins the state it overlaps most, so existing provinces keep their state. Ids, colours and names come from the CSV; without a CSV, colours are numbered automatically. The latitude band is read from `package.json` next to the image. Exporting and re-importing a package leaves 99.8% of cells in the same province (seed 1, level 8, 8192 px).
 
 ## How each step works (short version)
 
@@ -177,12 +186,13 @@ Each cell then takes its province by majority pixel vote. A province joins the s
   - All seeds grow together (multi-source Dijkstra, step cost = length × (1 + barrier)), so neighbours meet on ridges, border rivers and deserts. Water can be crossed at *Sea crossing cost*, so islands without their own seed join the state across the shortest strait. Landmasses over *Own state from island size* get their own.
   - Clean-up: disconnected fragments join the neighbour they touch most, and states under the minimum merge into their longest-border neighbour.
   - Regions are a few neighbouring states, by farthest-point seeding and growth over the state graph (land borders and sea links), relaxed four times. Continents come from landmasses over *Continent size*; smaller islands join the nearest.
-  - Names are placeholders from a small random "language" per continent, so names on one continent sound alike. Stage 3 will replace them.
+  - Names are placeholders from a small random "language" per continent; each region speaks a dialect of it (a few sounds and endings swapped), so neighbouring regions sound related but distinct. Stage 3 will replace them.
 - **Provinces:**
   - Inside each state, seeds are spaced so that province area runs from *Province area, fertile* to *Province area, barren* with habitability. Growth uses the same barrier-aware search at a lower weight, followed by Lloyd relaxation passes.
   - Ice, mountains above *Wasteland above* and land below *Wasteland below habitability* become wasteland provinces when the patch is large enough. They stay inside their state.
   - The sea is split into coastal (within *Coastal sea band* of land), shelf (shallower than *Shelf depth*) and open-ocean zones of band-specific size. Lakes over *Lake province from* become lake provinces; smaller lakes join the land province around them.
-  - The step also builds the province adjacency graph and finds strait crossings.
+  - Each state's capital province (the land province with the state's capital cell) takes the state's name; other land provinces are named in their region's dialect, seas and lakes in the nearest continent's language. No name is used twice.
+  - The step also finds strait crossings and types every border between two provinces (land, river, impassable, coast, lake, sea, strait) with its length and crossing cost.
 
 ## Tests
 
@@ -190,7 +200,7 @@ Each cell then takes its province by majority pixel vote. A province joins the s
 cargo test --release -p worldcore
 ```
 
-This covers grid topology, barycentric location, Köppen against real stations (London, Cairo, Singapore, Moscow, Athens), Earth insolation, determinism and the save/load round trip (through Stage 2), stale-step invalidation, plausible climate, the heightmap export/import round trip, and Stage 2 completeness: every land cell in a state and a province, unique ids and colours, state tables consistent with the cells, and the provinces.png export/import round trip.
+This covers grid topology, barycentric location, Köppen against real stations (London, Cairo, Singapore, Moscow, Athens), Earth insolation, determinism and the save/load round trip (through Stage 2), stale-step invalidation, plausible climate, the heightmap export/import round trip, and Stage 2 completeness: every land cell in a state and a province, unique ids and colours, state tables consistent with the cells, a capital inside every state, unique province names, a typed border for every pair of neighbours, the provinces.png export/import round trip, and the export clean-up (no provinces without pixels, no X-crossings, under 1% of provinces in pieces; unit tests on small rasters in `export_clean.rs`).
 
 ## Status against the roadmap
 
@@ -203,9 +213,10 @@ This covers grid topology, barycentric location, Köppen against real stations (
 
 - The climate is tuned to be plausible rather than exact. Large continental interiors come out dry, and the cold-desert share is higher than Earth's. Parameters in the Climate card adjust this.
 - Plate motion is random unless pinned with arrows, so some seeds produce few collision ranges. Use mountain hints or arrows.
-- The flat export is equirectangular only; a Miller option is still an open question.
+- The flat export is equirectangular, with an optional latitude crop (settled in the proposal).
 - Stage 2 names are placeholders until Stage 3 (cultures) generates names from cultural phonologies. Stage 3 isn't started.
 - Export uses the neutral profile only; game-specific writers (CK3 `default.map`, Vic3 `state_regions` script files) are not written yet.
-- `adjacencies.csv` lists sea crossings only. Land-to-land "impassable" adjacencies aren't generated.
+- `adjacencies.csv` (CK3 layout) lists sea crossings only; every other border, including impassable ones, is in `province_adjacency.csv`.
 - At grid level 7 a fertile province is only a few cells; use level 8 (default) or 9 for province maps.
-- Validating an export reports harmless warnings: islands and sea zones in several pieces, and a few X-crossings from the coastline detail noise.
+- Validating an export can still report a handful of provinces in several pieces: islands that a channel in the heightmap separates from the rest of their province.
+- The province clean-up makes `worldgen export` slower and larger: on the default world at 8192 × 4096 it takes about 28 s instead of 16 s, with a peak of about 800 MB instead of 590 MB.
