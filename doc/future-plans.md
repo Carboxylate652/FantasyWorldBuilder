@@ -4,7 +4,7 @@ Suggestions, in rough order of value for effort. Each says why and where it woul
 
 ## 1. Housekeeping (short)
 
-- **Merge the Stage 4 work** (`master-3sczxa`) into the main line and release **0.2.0-beta.1** (the changelog section is ready). PR #5 does not contain it (see [status.md](status.md#repository-note)).
+- **Bring `master` up to date with `main`:** PR #5 merged `main` into `master` only up to 0.1.0-beta.3; the Stage 4 work and 0.2.0-beta.1 are on `main`.
 - **CI:** add `cargo clippy` (warnings allowed at first), `npx tsc --noEmit`, and a short Playwright run of the UI (open, generate a small world, step Stage 4, switch layers) using the pre-installed Chromium.
 - **Statistical regression tests** for Stage 4 on two or three seeds: ranges for nations, ruled share, population, era spread, first-industry year, transport totals — so tuning changes are caught.
 
