@@ -217,6 +217,15 @@ Nations come after cultures, and read them as input. The finished culture map is
 
 Keeping this order makes each stage simple to re-run: changing a nation never re-runs cultures, and changing cultures marks Stage 4 as stale like any other stage.
 
+### Two ways to run Stages 3 and 4
+
+1. **The simulation alone** (as above): the stage runs from start to end with its parameters.
+2. **Guided:** the stage runs step by step, and its course is steered toward a history the user describes, by hand or by an LLM through an API (the Claude API, an OpenAI-compatible endpoint, or a gateway such as the Vercel AI Gateway). Each turn, the simulation advances a stretch of time; the guide reads a summary of the world and the user's goal and answers with **directives**, the same actions the user can issue by hand (a plague, a schism, isolation, a migration wave; aggression, war, peace, stability, a breakup, a founding, a union, a treaty, a railway), and a line for the chronicle. The simulation, not the model, decides what follows, so the result stays consistent with the map.
+
+Directives are stored like any other override layer, each with the generation or year it was issued, so re-running a stage replays the steered history exactly, without the model. The step-by-step run and the full run use the same code, which makes this exact: a kept live run equals a fresh run with the same directives.
+
+**As built (M5).** Stage 4 works on the province graph with province populations and culture shares from Stage 3, rather than continuing the Stage 3 bands: the rules above need only those. Polities form where a province reaches a population threshold; expansion is an attempt per nation and step (scaled by an aggression drawn at founding) at the best frontier target by value over cost, with cost growing across barriers, with distance from the capital and with cultural distance (half within the culture group); conquests are resolved by the two nations' strength near the target. Ocean shipping allows colonies, including weakly held land of much weaker nations. Breakups secede the largest foreign culture, or else the outlying part. Assimilation moves each ruled province's culture shares toward its ruler's. Railways link each nation's largest cities over its own land, with stations at the ends, every five provinces and in dry land. The event log records foundings, independences, captured capitals, war summaries per half century, colonies, unions, renames and railways. Default run (seed 3, level 6): about 0.3 s, ending in 1914 with about 175 nations.
+
 ## World editor
 
 All hand editing comes together in one editor at the end, in the style of the in-game map editors of Paradox games. It works on any layer, reads the current map and writes only to the override layer, so re-running a stage keeps every edit. The Stage 2 brushes (barrier, grow state, grow province) stay where they are as quick tools and move into the editor as well.

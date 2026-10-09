@@ -1,5 +1,5 @@
 // UI description of the pipeline steps (seven for Stage 1, three for Stage 2,
-// one for Stage 3):
+// one each for Stages 3 and 4):
 // parameters, default layer and tools.
 
 import type { LayerId } from './layers';
@@ -80,12 +80,16 @@ export const TOOLS: ToolDef[] = [
 export const EDITOR_TOOLS: ToolId[] = ['province_merge', 'state_merge', 'province_to_state', 'province_paint', 'state_paint', 'rename_province', 'rename_state', 'goods_paint'];
 
 /** Last step of each stage (the stage buttons run up to it). */
-export const STAGE_ENDS = [{ stage: 1, step: 'biomes' }, { stage: 2, step: 'provinces' }, { stage: 3, step: 'cultures' }];
+export const STAGE_ENDS = [{ stage: 1, step: 'biomes' }, { stage: 2, step: 'provinces' }, { stage: 3, step: 'cultures' }, { stage: 4, step: 'nations' }];
 
 /** Index of the first Stage 2 step. */
 export const STAGE2_START = 7;
 /** Index of the first Stage 3 step. */
 export const STAGE3_START = 10;
+/** Index of the first Stage 4 step. */
+export const STAGE4_START = 11;
+/** Steps that can run step by step (live simulation, directives, AI guide). */
+export const LIVE_STEPS = ['cultures', 'nations'];
 
 export type StepUI = {
   key: string;
@@ -275,6 +279,29 @@ export const STEPS: StepUI[] = [
       p('cultures', 'caravan_people', 'Caravan stop size (people)', 0, 500000, 1000, 'From era 2: people a watered stop on the busiest route across dry land can hold.'),
       p('cultures', 'mining_people', 'Mining town size (people)', 0, 200000, 500, 'From era 3: people each metal deposit draws.'),
       p('cultures', 'irrigation_share', 'Irrigated share of dry river land', 0, 1, 0.05, 'From era 4: share of a dry province with a river that becomes farmland.'),
+    ],
+  },
+  {
+    key: 'nations', title: 'Nations & history', layer: 'nations', tools: [],
+    blurb: 'Polities form where people are many, then grow over the culture map: they settle empty land, fight over borders, colonise overseas and break apart along culture lines. Borders can cut through states, and colonies and exclaves are allowed. Railways link the largest cities in the industrial era. Run it in one go, step by step with your own directives, or let an AI guide steer it toward the history you describe.',
+    params: [
+      p('nations', 'start_year', 'First polities (year)', -5000, 1800, 10),
+      p('nations', 'start_date', 'Start date (year)', 1800, 2000, 1, 'The year the map shows: 1910–1920 for an early-20th-century start.'),
+      p('nations', 'years_per_step', 'Years per step', 1, 25, 1),
+      p('nations', 'found_population', 'People to found a polity', 1000, 1000000, 1000),
+      p('nations', 'found_rate', 'Founding chance per step', 0, 0.05, 0.0005),
+      p('nations', 'expansion_rate', 'Expansion', 0, 5, 0.05, 'Expansion attempts per nation and step.'),
+      p('nations', 'culture_weight', 'Culture border weight', 0, 10, 0.1, 'Extra cost of taking land of another culture (half within the culture group): higher values make borders follow cultures.'),
+      p('nations', 'barrier_weight', 'Barrier weight', 0, 5, 0.05),
+      p('nations', 'reach_km', 'Reach from the capital (km)', 100, 5000, 50, 'Expansion costs twice as much this far from the capital.'),
+      p('nations', 'collapse_rate', 'Breakups', 0, 0.2, 0.002, 'Chance of a breakup at instability 1 (mixed cultures, size, spread).'),
+      p('nations', 'assimilation', 'Assimilation per year', 0, 0.02, 0.0005, 'Share of a province\'s other cultures that takes its ruler\'s culture each year.'),
+      p('nations', 'gunpowder_year', 'Gunpowder era (year)', 0, 2000, 10),
+      p('nations', 'shipping_year', 'Ocean shipping era (year)', 0, 2000, 10, 'Colonies across the sea from this year.'),
+      p('nations', 'industrial_year', 'Industrial era (year)', 0, 2000, 10, 'Railways and faster growth from this year.'),
+      p('nations', 'overseas_km', 'Colony range (km)', 500, 20000, 100),
+      p('nations', 'railway_cities', 'Cities linked by rail per nation', 2, 40, 1),
+      p('nations', 'station_people', 'People per railway station', 0, 200000, 1000, 'Railway towns, also in the desert.'),
     ],
   },
 ];

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0-beta.1 (unreleased)
+
+Stage 4: nations and history, and history you can steer.
+
+- **Nations and history** (Stage 4): polities form where people are many and grow over the culture map up to a start date (1914 by default): they settle empty land, fight over borders, colonise overseas, break apart along culture lines and assimilate their provinces. Borders can cut through states; colonies and exclaves are allowed. Railways link the largest cities in the industrial era, with stations that grow railway towns. New *Nations* and *Railways* layers, a Nations card, and `nations.png`, `railways.png`, `nations.csv`, `nation_events.csv`, `railways.csv` and `province_nations.csv` in the export.
+- **Step by step** (Stages 3 and 4): a panel on the map runs the simulation a generation or a few years at a time, to the next era or to the end, or plays it while the map updates. *Finish and keep* keeps the history.
+- **Directives:** steer a live run (a fertile age, isolation, a schism, a plague, a migration wave; aggression, war, peace, stability, a split, a founding, a union, a treaty, a rename, a railway). They are saved with the world and replay exactly.
+- **AI guide:** describe the history you want; an LLM steers the live run turn by turn with the same directives and writes a chronicle. Works with the Claude API, the Vercel AI Gateway, OpenAI, OpenRouter, local servers and other OpenAI- or Anthropic-compatible gateways. Keys stay on your computer, never in a world.
+- **CLI:** `worldgen guide` (a guided history without the app), `worldgen guide-setup`, `worldgen directive`; `worldgen validate` checks Stage 4 too.
+
 ## 0.1.0-beta.3
 
 Groundwork before Stage 4.

@@ -36,6 +36,8 @@ pub mod stream {
     pub const BORDER_NOISE: u64 = 15;
     pub const CULTURES: u64 = 16;
     pub const COMMUNITIES: u64 = 17;
+    // 18: resources (stages/resources.rs)
+    pub const NATIONS: u64 = 19;
 }
 
 #[derive(Clone, Debug)]

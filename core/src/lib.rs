@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod community;
+pub mod directives;
 pub mod edits;
 pub mod export;
 pub mod export_clean;

@@ -474,6 +474,78 @@ impl Default for CultureParams {
     }
 }
 
+/// Stage 4: nations and history, from polity formation to the start date.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NationParams {
+    /// Year the first polities can form.
+    pub start_year: i32,
+    /// Year history stops: the map's start date (1910–1920 recommended).
+    pub start_date: i32,
+    /// Years per simulation step.
+    pub years_per_step: u32,
+    /// People a province needs before a polity can form there.
+    pub found_population: f64,
+    /// Chance per step that a province with that many people and no ruler
+    /// founds a polity (more people, likelier).
+    pub found_rate: f64,
+    /// Expansion attempts per nation and step at aggression 1.
+    pub expansion_rate: f64,
+    /// Cost multiplier for barriers along a border (ridges, rivers, desert).
+    pub barrier_weight: f64,
+    /// Extra cost of taking land of another culture (half for the same group).
+    pub culture_weight: f64,
+    /// Distance from the capital (km) at which expansion costs twice as much.
+    pub reach_km: f64,
+    /// Chance per step of a breakup at instability 1 (mixed cultures, size, spread).
+    pub collapse_rate: f64,
+    /// Share of a province's other cultures that takes its ruler's culture per year.
+    pub assimilation: f64,
+    /// Population growth per year before and during the industrial era.
+    pub growth: f64,
+    pub industrial_growth: f64,
+    /// Era start years: gunpowder states, ocean shipping (overseas colonies),
+    /// industry (railways, mining).
+    pub gunpowder_year: i32,
+    pub shipping_year: i32,
+    pub industrial_year: i32,
+    /// Farthest a colony can lie from its nation's coast (km), with ocean shipping.
+    pub overseas_km: f64,
+    /// Largest cities each nation links by rail.
+    pub railway_cities: u32,
+    /// Years between a nation's railway projects.
+    pub railway_every_years: u32,
+    /// People a railway station draws (railway towns, also in the desert).
+    pub station_people: f64,
+}
+
+impl Default for NationParams {
+    fn default() -> Self {
+        NationParams {
+            start_year: 800,
+            start_date: 1914,
+            years_per_step: 2,
+            found_population: 60_000.0,
+            found_rate: 0.0015,
+            expansion_rate: 0.8,
+            barrier_weight: 1.0,
+            culture_weight: 1.5,
+            reach_km: 700.0,
+            collapse_rate: 0.01,
+            assimilation: 0.0015,
+            growth: 0.0018,
+            industrial_growth: 0.009,
+            gunpowder_year: 1450,
+            shipping_year: 1500,
+            industrial_year: 1830,
+            overseas_km: 9000.0,
+            railway_cities: 8,
+            railway_every_years: 8,
+            station_people: 15_000.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct WorldParams {
@@ -488,6 +560,7 @@ pub struct WorldParams {
     pub states: StateParams,
     pub provinces: ProvinceParams,
     pub cultures: CultureParams,
+    pub nations: NationParams,
 }
 
 impl WorldParams {

@@ -1,10 +1,10 @@
 import './style.css';
 import * as api from './api';
 import { Grid, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
-import { BOUNDARY, DEPOSITS, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
+import { BOUNDARY, DEPOSITS, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
-import { EDITOR_TOOLS, STAGE2_START, STAGE3_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
+import { EDITOR_TOOLS, LIVE_STEPS, STAGE2_START, STAGE3_START, STAGE4_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
 
 // ------------------------------------------------------------------ state
 
@@ -13,8 +13,9 @@ import { EDITOR_TOOLS, STAGE2_START, STAGE3_START, STAGE_ENDS, STEPS, TOOLS, typ
 type Political = {
   states: any[]; regions: any[]; continents: any[]; provinces: any[]; adjacencies: any[];
   cultures: any[]; groups: any[]; events: any[];
+  nations: any[]; nationEvents: any[]; railways: any[];
   byState: Map<number, any>; byRegion: Map<number, any>; byProv: Map<number, any>; byCont: Map<number, any>;
-  byCulture: Map<number, any>; byGroup: Map<number, any>;
+  byCulture: Map<number, any>; byGroup: Map<number, any>; byNation: Map<number, any>;
 };
 
 type StepStatus = { key: string; title: string; state: 'done' | 'stale' | 'empty'; millis: number; meta: any };
@@ -33,6 +34,8 @@ type Status = {
   can_redo: boolean;
   dirty: boolean;
   override_edits: number;
+  /** A Stage 3 or 4 simulation running step by step. */
+  live: { stage: string; position: number; end: number; unit: string; done: boolean } | null;
 };
 
 type Asset = { name: string; url: string; size: number; sha256: string | null };
@@ -93,6 +96,7 @@ async function boot() {
         h('div', { id: 'toolbar' }),
         h('div', { id: 'brushbar' }),
         h('div', { id: 'legend' }),
+        h('div', { id: 'simpanel' }),
         h('div', { id: 'toast' }),
       ),
     ),
@@ -116,6 +120,7 @@ async function boot() {
       api.isTauri ? String(e) : h('span', {}, 'Start it with ', h('code', {}, 'worldgen serve --static app/dist'), '.')));
     return;
   }
+  loadGuidePrefs();
   void startupUpdateCheck();
   // A fresh session: generate the sketch so there is something to look at.
   if (S.status!.steps[1].state === 'empty') await run('sketch');
@@ -133,6 +138,7 @@ async function refreshStatus(st?: Status) {
   renderTopbar();
   renderSteps();
   renderToolbar();
+  renderSim();
   await refreshLayer();
 }
 
@@ -153,8 +159,9 @@ async function political(): Promise<Political | null> {
     S.political = {
       states: t.states ?? [], regions: t.regions ?? [], continents: t.continents ?? [], provinces: t.provinces ?? [], adjacencies: t.adjacencies ?? [],
       cultures: t.cultures ?? [], groups: t.culture_groups ?? [], events: t.culture_events ?? [],
+      nations: t.nations ?? [], nationEvents: t.nation_events ?? [], railways: t.railways ?? [],
       byState: idx(t.states), byRegion: idx(t.regions), byProv: idx(t.provinces), byCont: idx(t.continents),
-      byCulture: idx(t.cultures), byGroup: idx(t.culture_groups),
+      byCulture: idx(t.cultures), byGroup: idx(t.culture_groups), byNation: idx(t.nations),
     };
   } catch {
     return null;
@@ -213,6 +220,7 @@ function stepOfLayer(id: LayerId): string {
     habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
     resources: 'Provinces',
     cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures', attraction: 'Cultures',
+    nations: 'Nations & history', railways: 'Nations & history',
   };
   return m[id];
 }
@@ -326,7 +334,8 @@ async function refreshOverlays() {
   const lay = S.layer;
   const political = lay === 'states' || lay === 'provinces' || lay === 'regions';
   const cultural = lay === 'cultures' || lay === 'culture_groups';
-  const stf = cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
+  const national = lay === 'nations' || lay === 'railways';
+  const stf = national ? await getField('owner') : cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
   if (stf && !stf.stale) {
     const L = new Lines();
     // Culture layers: culture borders as hairlines, group borders as ribbons.
@@ -942,6 +951,379 @@ function onAbout() {
   if (S.update) show(S.update);
 }
 
+// ------------------------------------------------------------------ live simulation (Stages 3 and 4)
+
+type GuideLog = { position: number; narration: string; actions: { action: string; args: any; ok: boolean; error?: string | null }[] };
+
+const SIM = {
+  /** Summary of the live run (sim_* replies). */
+  state: null as any | null,
+  tab: 'world' as 'world' | 'steer' | 'guide',
+  playing: false,
+  busy: false,
+  actions: new Map<string, any[]>(),
+  action: '',
+  form: {} as Record<string, string>,
+  note: '',
+  advance: { cultures: 250, nations: 25 } as Record<string, number>,
+  /** Names of living nations and cultures of the live run, for hover text. */
+  nations: new Map<number, any>(),
+  cultures: new Map<number, any>(),
+  guide: {
+    running: false, goal: '', years: { cultures: 500, nations: 50 } as Record<string, number>, maxActions: 4,
+    log: [] as GuideLog[], tokens: [0, 0], settings: null as any | null, presets: [] as any[], showSettings: false, keyDraft: '',
+  },
+};
+
+function loadGuidePrefs() {
+  try {
+    const g = JSON.parse(localStorage.getItem('fwm.guide') ?? '{}');
+    if (typeof g.goal === 'string') SIM.guide.goal = g.goal;
+    if (g.years) Object.assign(SIM.guide.years, g.years);
+    if (g.maxActions) SIM.guide.maxActions = g.maxActions;
+  } catch { /* ignore */ }
+}
+
+function saveGuidePrefs() {
+  try {
+    localStorage.setItem('fwm.guide', JSON.stringify({ goal: SIM.guide.goal, years: SIM.guide.years, maxActions: SIM.guide.maxActions }));
+  } catch { /* ignore */ }
+}
+
+/** Show progress messages while a long command runs. */
+function pollProgress(): () => void {
+  const prog = $('#progress');
+  const t = setInterval(async () => {
+    try {
+      const p = await api.json('progress');
+      if (p.running) {
+        prog.innerHTML = '';
+        prog.append(h('span', {}, p.msg || p.step || '…'), h('progress', { max: 1, value: p.frac || 0 }));
+      }
+    } catch { /* ignore */ }
+  }, 200);
+  return () => {
+    clearInterval(t);
+    prog.textContent = '';
+  };
+}
+
+/** Take a reply that carries the session status and the live summary. */
+async function applySim(r: any) {
+  const { sim, ...status } = r;
+  S.status = status as Status;
+  SIM.state = sim ?? null;
+  SIM.nations = new Map((sim?.nations ?? []).map((n: any) => [n.id, n]));
+  SIM.cultures = new Map((sim?.cultures ?? []).map((c: any) => [c.id, c]));
+  invalidate();
+  renderTopbar();
+  renderSim();
+  await refreshLayer();
+}
+
+async function simCall(cmd: string, args: any = {}): Promise<any | null> {
+  if (SIM.busy) return null;
+  SIM.busy = true;
+  renderSim();
+  const stop = pollProgress();
+  try {
+    const r = await api.json(cmd, args);
+    await applySim(r);
+    return r;
+  } catch (e) {
+    toast(String(e), true);
+    SIM.playing = false;
+    return null;
+  } finally {
+    stop();
+    SIM.busy = false;
+    renderSim();
+  }
+}
+
+async function simStart(stage: string) {
+  S.layer = stage === 'cultures' ? 'cultures' : 'nations';
+  SIM.guide.log = [];
+  SIM.guide.tokens = [0, 0];
+  await simCall('sim_start', { stage });
+  renderSteps();
+}
+
+async function simPlay() {
+  SIM.playing = !SIM.playing;
+  renderSim();
+  while (SIM.playing && S.status?.live && !S.status.live.done) {
+    const r = await simCall('sim_step', { steps: 1 });
+    if (!r) break;
+  }
+  SIM.playing = false;
+  renderSim();
+}
+
+async function simCommit() {
+  SIM.playing = false;
+  SIM.guide.running = false;
+  if (SIM.busy) return;
+  SIM.busy = true;
+  renderSim();
+  const stop = pollProgress();
+  try {
+    const st = await api.json<Status & { committed: string; replayed: boolean }>('sim_commit', {});
+    SIM.state = null;
+    SIM.nations.clear();
+    SIM.cultures.clear();
+    invalidate();
+    await refreshStatus(st);
+    toast(`Kept the ${st.committed === 'nations' ? 'Stage 4' : 'Stage 3'} run${st.replayed ? ' (re-run, since its inputs changed)' : ''}. Its directives are saved with the world.`);
+  } catch (e) {
+    toast(String(e), true);
+  } finally {
+    stop();
+    SIM.busy = false;
+    renderSim();
+  }
+}
+
+async function simCancel() {
+  if (!confirm('Stop the live run? Its directives stay in the world (Overrides panel); the step keeps its previous result.')) return;
+  SIM.playing = false;
+  SIM.guide.running = false;
+  SIM.state = null;
+  SIM.nations.clear();
+  SIM.cultures.clear();
+  const st = await api.json<Status>('sim_cancel', {});
+  invalidate();
+  await refreshStatus(st);
+}
+
+async function simActions(stage: string): Promise<any[]> {
+  if (!SIM.actions.has(stage)) SIM.actions.set(stage, await api.json('sim_actions', { stage }));
+  return SIM.actions.get(stage)!;
+}
+
+/** Arguments from the directive form, by the action's schema. */
+function formArgs(schema: any): any {
+  const out: any = {};
+  for (const [k, sp] of Object.entries<any>(schema.properties ?? {})) {
+    const raw = (SIM.form[k] ?? '').trim();
+    const types: string[] = Array.isArray(sp.type) ? sp.type : [sp.type];
+    if (!raw) { out[k] = types.includes('null') ? null : types.includes('array') ? [] : undefined; continue; }
+    if (types.includes('array')) out[k] = raw.split(/[\s,;]+/).filter(Boolean).map(Number);
+    else if (types.includes('integer')) out[k] = Math.round(Number(raw));
+    else if (types.includes('number')) out[k] = Number(raw);
+    else out[k] = raw;
+  }
+  return out;
+}
+
+async function guideSettingsLoad() {
+  try {
+    SIM.guide.settings = await api.json('guide_config_get', {});
+    if (!SIM.guide.presets.length) SIM.guide.presets = await api.json('guide_presets', {});
+  } catch (e) {
+    SIM.guide.settings = { error: String(e) };
+  }
+  renderSim();
+}
+
+async function guideRun() {
+  const g = SIM.guide;
+  const live = S.status?.live;
+  if (!live) return;
+  if (!g.goal.trim()) return toast('Describe the history you want to see first', true);
+  saveGuidePrefs();
+  g.running = true;
+  SIM.playing = false;
+  renderSim();
+  const atStart = SIM.state && (SIM.state.stage === 'cultures' ? SIM.state.tick === 0 : SIM.state.year === SIM.state.start_year);
+  let years = atStart && !g.log.length ? 0 : g.years[live.stage];
+  while (g.running) {
+    const stop = pollProgress();
+    let r: any;
+    try {
+      r = await api.json('guide_turn', { goal: g.goal, years, max_actions: g.maxActions });
+    } catch (e) {
+      toast(`Guide: ${e}`, true);
+      stop();
+      break;
+    }
+    stop();
+    g.tokens[0] += r.input_tokens ?? 0;
+    g.tokens[1] += r.output_tokens ?? 0;
+    if (r.status) await applySim(r.status);
+    if (r.done) break;
+    g.log.push({ position: r.position, narration: r.narration, actions: r.actions ?? [] });
+    years = r.next_years ?? g.years[live.stage];
+    renderSim();
+  }
+  g.running = false;
+  renderSim();
+}
+
+function renderSim() {
+  const box = document.querySelector('#simpanel') as HTMLElement | null;
+  if (!box || !S.status) return;
+  const live = S.status.live;
+  const stage = live?.stage ?? (LIVE_STEPS.includes(S.openStep) ? S.openStep : null);
+  box.innerHTML = '';
+  box.className = stage ? 'show' : '';
+  if (!stage) return;
+  const stageName = stage === 'cultures' ? 'Stage 3 · Cultures' : 'Stage 4 · Nations';
+  if (!live) {
+    box.append(h('div', { class: 'sim-head' }, h('b', {}, `Step by step · ${stageName}`)),
+      h('p', { class: 'muted' }, 'Run the simulation a step at a time, watch it on the map, steer it with directives, or let an AI guide steer it toward the history you describe. Directives are saved with the world, so re-running the stage replays the same history.'),
+      h('div', { class: 'row' }, h('button', { class: 'primary', disabled: SIM.busy || S.busy, onclick: () => simStart(stage) }, 'Start step by step')));
+    return;
+  }
+  const st = SIM.state;
+  const pos = live.unit === 'year'
+    ? `Year ${live.position} of ${st?.start_year ?? ''}–${live.end}${st?.era ? ' · ' + st.era + ' era' : ''}`
+    : `Generation ${live.position} of ${live.end}${st ? ' · year ' + Math.round(st.year).toLocaleString() + ' · era ' + st.era : ''}`;
+  const frac = live.unit === 'year' && st ? (live.position - st.start_year) / Math.max(1, live.end - st.start_year) : live.position / Math.max(1, live.end);
+  const busy = SIM.busy || SIM.guide.running;
+  const adv = SIM.advance[stage];
+  box.append(
+    h('div', { class: 'sim-head' }, h('b', {}, stageName), h('span', { class: 'muted' }, live.done ? 'finished' : 'live')),
+    h('div', {}, pos), h('progress', { class: 'sim-prog', max: 1, value: Math.min(1, Math.max(0, frac)) }),
+    h('div', { class: 'row wrap' },
+      h('button', { disabled: busy || live.done, title: live.unit === 'year' ? 'One step' : 'One generation', onclick: () => simCall('sim_step', { steps: 1 }) }, 'Step'),
+      h('input', { type: 'number', class: 'years', min: 1, step: 1, value: adv, title: 'Years to advance', onchange: (e: Event) => (SIM.advance[stage] = Math.max(1, Number((e.target as HTMLInputElement).value))) }),
+      h('button', { disabled: busy || live.done, onclick: () => simCall('sim_step', { years: SIM.advance[stage] }) }, `+${adv} years`),
+      h('button', { disabled: busy || live.done, onclick: () => simCall('sim_step', { to: 'era' }) }, 'Next era'),
+      h('button', { disabled: (SIM.busy && !SIM.playing) || SIM.guide.running || live.done, class: SIM.playing ? 'on' : '', onclick: simPlay }, SIM.playing ? 'Pause' : 'Play'),
+      h('button', { disabled: busy || live.done, onclick: () => simCall('sim_step', { to: 'end' }) }, 'To the end')),
+    h('div', { class: 'row wrap' },
+      h('button', { class: 'primary', disabled: busy, title: 'Run to the end and keep this history as the stage result', onclick: simCommit }, live.done ? 'Keep this history' : 'Finish and keep'),
+      h('button', { disabled: busy, title: 'Start again from the beginning (directives so far are replayed)', onclick: () => simStart(stage) }, 'Restart'),
+      h('button', { disabled: SIM.busy, onclick: simCancel }, 'Stop')),
+    h('div', { class: 'seg tabs' },
+      ...(['world', 'steer', 'guide'] as const).map((t) => h('button', { class: SIM.tab === t ? 'on' : '', onclick: () => { SIM.tab = t; if (t === 'guide' && !SIM.guide.settings) guideSettingsLoad(); renderSim(); } }, t === 'world' ? 'World' : t === 'steer' ? 'Steer' : 'AI guide'))),
+  );
+  const body = h('div', { class: 'sim-body' });
+  box.append(body);
+  if (!st) return;
+  const fmtM = (x: number) => (x >= 1e6 ? `${(x / 1e6).toFixed(1)} M` : `${Math.round(x / 1000)}k`);
+  if (SIM.tab === 'world') {
+    if (stage === 'cultures') {
+      body.append(h('div', { class: 'muted' }, `${st.cultures.length} cultures in ${st.groups} groups · ${fmtM(st.population)} people · ${st.settled_provinces} of ${st.land_provinces} provinces settled`));
+      for (const c of st.cultures.slice(0, 10)) {
+        const cc = cultureColor(c.id, c.group).map(Math.round);
+        body.append(h('div', { class: 'item' }, h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), `${c.name} `, h('span', { class: 'muted' }, `#${c.id}`)),
+          h('span', { class: 'muted' }, `${fmtM(c.population)} · ${c.provinces} prov.${c.regions?.[0]?.name ? ' · ' + c.regions[0].name : ''}`)));
+      }
+      const ev = (st.events ?? []).slice(-8).reverse();
+      if (ev.length) body.append(h('h4', {}, 'Recent events'), ...ev.map((e: any) => h('div', { class: 'muted small' }, `${Math.round(e.year)}: ${e.event} ${SIM.cultures.get(e.culture)?.name ?? '#' + e.culture}${e.other ? ' / ' + (SIM.cultures.get(e.other)?.name ?? '#' + e.other) : ''}`)));
+    } else {
+      body.append(h('div', { class: 'muted' }, `${st.nations.length} nations · ${st.ruled_provinces} of ${st.land_provinces} provinces ruled · ${fmtM(st.population)} people · ${st.railways} railways`));
+      for (const n of st.nations.slice(0, 12)) {
+        const nc = nationColor(n.id).map(Math.round);
+        body.append(h('div', { class: 'item link', onclick: () => {
+          const p = S.political?.byProv.get(n.capital);
+          if (p?.center) R.lookAt(fromLatLon((p.center[0] * Math.PI) / 180, (p.center[1] * Math.PI) / 180));
+        } }, h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${nc.join(',')})` }), `${n.name} `, h('span', { class: 'muted' }, `#${n.id}`)),
+          h('span', { class: 'muted' }, `${n.government} · ${n.provinces} prov. · ${fmtM(n.population)}${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
+      }
+      if (st.effects?.length) body.append(h('h4', {}, 'In effect'), ...st.effects.map((e: any) => h('div', { class: 'muted small' }, `${e.effect} · nation #${e.nation}${e.target ? ' → #' + e.target : ''}${e.factor !== undefined ? ' ×' + e.factor : ''} until ${e.until}`)));
+      const ev = (st.events ?? []).slice(-10).reverse();
+      if (ev.length) body.append(h('h4', {}, 'Recent events'), ...ev.map((e: any) => h('div', { class: 'muted small' }, `${e.year}: ${e.text}`)));
+    }
+  }
+  if (SIM.tab === 'steer') {
+    const sel = h('select', { onchange: (e: Event) => { SIM.action = (e.target as HTMLSelectElement).value; SIM.form = {}; renderSim(); } }) as HTMLSelectElement;
+    body.append(h('p', { class: 'muted small' }, 'A directive applies from the next step and is saved with the world. Ids are shown when you hover the map (province, state, region, culture, nation).'), sel);
+    simActions(stage).then((acts) => {
+      if (!SIM.action || !acts.some((a) => a.name === SIM.action)) SIM.action = acts[0]?.name ?? '';
+      sel.append(...acts.map((a) => h('option', { value: a.name, selected: a.name === SIM.action }, a.name.replace(/_/g, ' '))));
+      const a = acts.find((x) => x.name === SIM.action);
+      if (!a) return;
+      const form = h('div', { class: 'form sim-form' });
+      for (const [k, sp] of Object.entries<any>(a.schema.properties ?? {})) {
+        const types: string[] = Array.isArray(sp.type) ? sp.type : [sp.type];
+        const ph = types.includes('array') ? 'ids, e.g. 12, 40' : types.includes('null') ? 'optional' : sp.minimum !== undefined ? `${sp.minimum} to ${sp.maximum}` : '';
+        form.append(h('label', { title: sp.description ?? '' }, h('span', {}, k.replace(/_/g, ' ')),
+          h('input', { type: types.includes('number') || types.includes('integer') ? 'number' : 'text', placeholder: ph, value: SIM.form[k] ?? '', step: 'any', oninput: (e: Event) => (SIM.form[k] = (e.target as HTMLInputElement).value) })));
+      }
+      form.append(h('label', { class: 'wide' }, h('span', {}, 'note'), h('input', { type: 'text', placeholder: 'why (for the chronicle)', value: SIM.note, oninput: (e: Event) => (SIM.note = (e.target as HTMLInputElement).value) })));
+      sel.after(h('div', { class: 'muted small' }, a.description), form,
+        h('div', { class: 'row' }, h('button', { class: 'primary', disabled: busy || live.done, onclick: async () => {
+          const r = await simCall('sim_directive', { action: a.name, args: formArgs(a.schema), note: SIM.note });
+          if (r) { SIM.note = ''; toast(`${a.name.replace(/_/g, ' ')} applies from the next step`); }
+        } }, 'Apply')));
+    });
+    const applied = [...(st.queued ?? []).map((d: any) => ({ ...d, queued: true })), ...(st.directives ?? []).slice(-14).reverse()];
+    if (applied.length) {
+      body.append(h('h4', {}, 'Directives so far'), ...applied.map((d: any) => {
+        const when = d.year !== undefined ? Math.round(d.year) : d.tick;
+        const what = d.action === 'note' ? `“${d.args?.text ?? ''}”` : `${d.action.replace(/_/g, ' ')} ${JSON.stringify(Object.fromEntries(Object.entries(d.args ?? {}).filter(([, v]) => v !== null && !(Array.isArray(v) && !v.length))))}`;
+        return h('div', { class: 'muted small' }, `${when}: ${what}${d.note ? ' — ' + d.note : ''}${d.by === 'guide' ? ' (guide)' : ''}${d.queued ? ' (from the next step)' : d.applied === false ? ' (no effect)' : ''}`);
+      }));
+    }
+  }
+  if (SIM.tab === 'guide') {
+    const g = SIM.guide;
+    const cfg = g.settings;
+    const ready = cfg && !cfg.error && cfg.model && (cfg.has_key || (cfg.base_url ?? '').includes('localhost') || (cfg.base_url ?? '').includes('127.0.0.1'));
+    body.append(
+      h('div', { class: 'row' },
+        h('span', { class: 'muted small', style: 'flex:1' }, cfg?.error ? cfg.error : cfg ? `${cfg.provider === 'anthropic' ? 'Anthropic' : 'OpenAI-compatible'} · ${cfg.model || 'no model'} · ${cfg.has_key ? 'key ' + (cfg.key_source === 'settings' ? cfg.key_hint : 'from ' + cfg.key_source) : 'no key'}` : 'Loading settings…'),
+        h('button', { class: 'small', onclick: () => { g.showSettings = !g.showSettings; renderSim(); } }, g.showSettings ? 'Hide settings' : 'Settings')),
+    );
+    if (g.showSettings && cfg && !cfg.error) {
+      const f = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model, effort: cfg.effort };
+      const preset = h('select', { onchange: (e: Event) => {
+        const pr = g.presets.find((x) => x.id === (e.target as HTMLSelectElement).value);
+        if (pr) { Object.assign(cfg, { provider: pr.provider, base_url: pr.base_url, model: pr.model }); renderSim(); }
+      } }, h('option', { value: '' }, 'Choose a provider…'), ...g.presets.map((pr) => h('option', { value: pr.id, selected: !!pr.base_url && pr.base_url === cfg.base_url && pr.provider === cfg.provider }, pr.label)));
+      const hint = g.presets.find((pr) => pr.base_url && pr.base_url === cfg.base_url)?.hint ?? '';
+      const inp = (k: keyof typeof f, label: string, ph = '') => h('label', {}, h('span', {}, label), h('input', { type: 'text', value: (cfg as any)[k] ?? '', placeholder: ph, oninput: (e: Event) => ((cfg as any)[k] = (e.target as HTMLInputElement).value) }));
+      body.append(h('div', { class: 'form sim-form' },
+        h('label', { class: 'wide' }, h('span', {}, 'Preset'), preset),
+        h('label', {}, h('span', {}, 'Format'), h('select', { onchange: (e: Event) => { cfg.provider = (e.target as HTMLSelectElement).value; renderSim(); } },
+          h('option', { value: 'anthropic', selected: cfg.provider === 'anthropic' }, 'Anthropic Messages API'), h('option', { value: 'openai', selected: cfg.provider === 'openai' }, 'OpenAI-compatible'))),
+        cfg.provider === 'anthropic' ? h('label', {}, h('span', {}, 'Effort'), h('select', { onchange: (e: Event) => (cfg.effort = (e.target as HTMLSelectElement).value) },
+          ...['low', 'medium', 'high'].map((x) => h('option', { value: x, selected: cfg.effort === x }, x)))) : h('span', {}),
+        inp('base_url', 'Base URL', 'https://…'), inp('model', 'Model', 'model id'),
+        h('label', { class: 'wide' }, h('span', {}, 'API key'), h('input', { type: 'password', autocomplete: 'off', value: g.keyDraft, placeholder: cfg.has_key ? (cfg.key_source === 'settings' ? `saved (${cfg.key_hint}); type to replace` : `using ${cfg.key_source}`) : 'paste your key', oninput: (e: Event) => (g.keyDraft = (e.target as HTMLInputElement).value) })),
+      ), hint ? h('div', { class: 'muted small' }, hint) : '',
+      h('div', { class: 'muted small' }, `Saved on this computer only (${cfg.path}), never in a world.`),
+      h('div', { class: 'row' },
+        h('button', { onclick: async () => {
+          try {
+            const args: any = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model, effort: cfg.effort };
+            if (g.keyDraft) args.api_key = g.keyDraft;
+            g.settings = await api.json('guide_config_set', args);
+            g.keyDraft = '';
+            toast('Guide settings saved');
+          } catch (e) { toast(String(e), true); }
+          renderSim();
+        } }, 'Save'),
+        h('button', { onclick: async () => {
+          const stop = pollProgress();
+          try { const r = await api.json('guide_test', {}); toast(`${r.model}: ${r.text}`); } catch (e) { toast(String(e), true); }
+          stop();
+        } }, 'Test'),
+        cfg.key_source === 'settings' ? h('button', { onclick: async () => { g.settings = await api.json('guide_config_set', { api_key: '' }); renderSim(); } }, 'Forget key') : null));
+    }
+    body.append(
+      h('label', { class: 'sim-goal' }, h('span', { class: 'muted small' }, 'The history you want to see'),
+        h('textarea', { rows: 4, placeholder: stage === 'cultures' ? 'e.g. Two great peoples: one on the western continent, one spread over the islands; the steppe people should split into many tribes.' : 'e.g. A sea empire grows in the south and colonises the east; by 1800 it breaks into three kingdoms. The northern city-states stay independent.', oninput: (e: Event) => { g.goal = (e.target as HTMLTextAreaElement).value; } }, g.goal)),
+      h('div', { class: 'row wrap' },
+        h('label', { class: 'check' }, 'Years per turn ', h('input', { type: 'number', class: 'years', min: 5, value: g.years[stage], onchange: (e: Event) => (g.years[stage] = Math.max(5, Number((e.target as HTMLInputElement).value))) })),
+        h('label', { class: 'check' }, 'Max directives ', h('input', { type: 'number', class: 'years', min: 1, max: 12, value: g.maxActions, onchange: (e: Event) => (g.maxActions = Math.max(1, Number((e.target as HTMLInputElement).value))) }))),
+      h('div', { class: 'row' },
+        g.running
+          ? h('button', { class: 'on', onclick: () => { g.running = false; renderSim(); } }, 'Pause after this turn')
+          : h('button', { class: 'primary', disabled: SIM.busy || live.done || !ready, title: ready ? '' : 'Set up a provider, model and key first', onclick: guideRun }, g.log.length ? 'Continue guiding' : 'Start guiding'),
+        h('span', { class: 'muted small' }, g.tokens[0] ? `${g.tokens[0].toLocaleString()} tokens in · ${g.tokens[1].toLocaleString()} out` : '')),
+      h('p', { class: 'muted small' }, 'Each turn the simulation advances, the model reads a summary of the world and your goal, then issues directives and writes a line for the chronicle. It needs the model only while guiding: the directives are saved, so re-runs replay without it.'),
+    );
+    for (const t of [...g.log].reverse().slice(0, 30)) {
+      body.append(h('div', { class: 'guide-turn' }, h('b', {}, String(Math.round(t.position))), ' ', t.narration || h('span', { class: 'muted' }, '(no note)'),
+        ...t.actions.map((a) => h('div', { class: `small ${a.ok ? 'muted' : 'err'}` }, `${a.ok ? '✓' : '✗'} ${a.action.replace(/_/g, ' ')} ${a.ok ? JSON.stringify(Object.fromEntries(Object.entries(a.args ?? {}).filter(([, v]) => v !== null && !(Array.isArray(v) && !v.length)))) : a.error ?? ''}`))));
+    }
+  }
+}
+
 // ------------------------------------------------------------------ step cards
 
 function renderSteps() {
@@ -956,6 +1338,7 @@ function renderSteps() {
   STEPS.forEach((ui, idx) => {
     if (idx === STAGE2_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 2 · States and provinces')));
     if (idx === STAGE3_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 3 · Cultures')));
+    if (idx === STAGE4_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 4 · Nations and history')));
     box.append(stepCard(ui, idx, st.steps[idx]));
   });
   box.scrollTop = scroll;
@@ -975,6 +1358,7 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
     if (!open && ui.tools.length && !ui.tools.includes(S.tool)) S.tool = 'navigate';
     renderSteps();
     renderToolbar();
+    renderSim();
   } },
     h('span', { class: 'num' }, String(idx + 1)), h('span', { class: 'title' }, ui.title),
     ss.millis ? h('span', { class: 'ms' }, ss.millis < 1000 ? `${ss.millis} ms` : `${(ss.millis / 1000).toFixed(1)} s`) : null, pill);
@@ -1030,6 +1414,10 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
       h('button', { class: 'small', disabled: !e.state_strokes, onclick: () => mutate('clear_layer', { layer: 'states' }) }, 'Clear paint')));
     body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.fertility_strokes} fertility strokes`),
       h('button', { class: 'small', disabled: !e.fertility_strokes, onclick: () => mutate('clear_layer', { layer: 'fertility' }, 'habitability') }, 'Clear fertility')));
+  }
+  if (LIVE_STEPS.includes(ui.key)) {
+    body.append(h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, 'Step by step, directives and the AI guide: panel on the map.'),
+      h('button', { class: 'small', disabled: !!S.status!.live || S.busy, onclick: () => simStart(ui.key) }, 'Step by step')));
   }
   if (ui.key === 'cultures') {
     const pins = e.band_pins ?? [];
@@ -1236,6 +1624,29 @@ function summary(key: string, m: any): HTMLElement {
             h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${c.join(',')})` }), `${s.name}`),
             h('span', { class: 'muted' }, `${r ? r.name + ' · ' : ''}${fmt(s.area_km2 / 1000)}k km² · habitability ${fmt(s.habitability, 2)}`)));
         }
+      });
+      break;
+    }
+    case 'nations': {
+      box.append(stat('Nations', `${fmt(m.nations)} in ${m.start_date} (${fmt(m.nations_ever)} ever since ${m.start_year})`),
+        stat('Land ruled', `${fmt((m.ruled_share ?? 0) * 100)}%`), stat('Population', `${fmt((m.population ?? 0) / 1e6, 1)} M`),
+        stat('History', `${fmt(m.conquests)} capitals taken, ${fmt(m.independences)} independences, ${fmt(m.colonies)} colonies`),
+        stat('Railways', `${fmt(m.railways)} lines over ${fmt(m.railway_provinces)} provinces`));
+      if (m.directives?.length) box.append(stat('Directives', `${m.directives.filter((d: any) => d.action !== 'note').length} applied, ${m.directives.filter((d: any) => d.by === 'guide').length} by the guide`));
+      const list = h('div', { class: 'list' });
+      box.append(list);
+      political().then((P) => {
+        if (!P || !P.nations.length) return;
+        const living = P.nations.filter((n) => n.ended === null).sort((a, b) => b.population - a.population);
+        for (const n of living.slice(0, 14)) {
+          const nc = nationColor(n.id).map(Math.round);
+          const cap = P.byProv.get(n.capital);
+          list.append(h('div', { class: 'item link', onclick: () => cap?.center && R.lookAt(fromLatLon((cap.center[0] * Math.PI) / 180, (cap.center[1] * Math.PI) / 180)) },
+            h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${nc.join(',')})` }), n.name),
+            h('span', { class: 'muted' }, `${n.government} · ${n.culture_name} · ${n.provinces} prov. · ${fmt(n.population / 1e6, 1)} M${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
+        }
+        const ev = P.nationEvents.filter((e) => e.event !== 'railway').slice(-12).reverse();
+        if (ev.length) list.append(h('h4', {}, 'Chronicle (latest)'), ...ev.map((e) => h('div', { class: 'muted small' }, `${e.year}: ${e.text}`)));
       });
       break;
     }
@@ -1702,11 +2113,16 @@ function describe(d: any): string {
     const s = P.byState.get(d.state);
     const r = s ? P.byRegion.get(s.region) : null;
     const ct = s ? P.byCont.get(s.continent) : null;
-    if (s) parts.push(`state ${s.name}${r ? ', ' + r.name : ''}${ct ? ', ' + ct.name : ''}`);
+    if (s) parts.push(`state ${s.name} (#${s.id})${r ? ', ' + r.name + ' (region #' + r.id + ')' : ''}${ct ? ', ' + ct.name : ''}`);
   }
-  if (P && d.culture) {
-    const c = P.byCulture.get(d.culture), g = c ? P.byGroup.get(c.group) : null;
-    if (c) parts.push(`${c.name} culture${g ? ' (' + g.name + ')' : ''}`);
+  if (d.owner) {
+    const n = SIM.nations.get(d.owner) ?? P?.byNation.get(d.owner);
+    parts.push(n ? `${n.name} (nation #${n.id}, ${n.government})` : `nation #${d.owner}`);
+  } else if (d.owner === 0 && d.water === 0) parts.push('no ruler');
+  if (d.railway) parts.push(d.railway === 2 ? 'railway station' : 'railway');
+  if (d.culture) {
+    const c = SIM.cultures.get(d.culture) ?? P?.byCulture.get(d.culture), g = c && P ? P.byGroup.get(c.group) : null;
+    if (c) parts.push(`${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}`);
   }
   if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
   if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);

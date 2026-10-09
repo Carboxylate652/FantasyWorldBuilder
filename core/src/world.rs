@@ -5,7 +5,7 @@
 //! ```text
 //! world.json            seed, parameters, step cache keys and metadata
 //! sketch.json           continent sketch strokes, plate pins, motion arrows
-//! overrides/*.json      user edit layers (plates, elevation, biomes, barriers, sites, fertility, states, provinces, bands, attraction)
+//! overrides/*.json      user edit layers (plates, elevation, biomes, barriers, sites, fertility, states, provinces, bands, attraction, directives)
 //! imports.json          files that replace a stage result (e.g. an edited heightmap)
 //! fields/<step>/*.bin   one little-endian binary file per field
 //! export/               the Paradox-style map package
@@ -107,6 +107,28 @@ impl World {
         ran
     }
 
+    /// Bring every step before `step` up to date, then call `f` with the
+    /// context `step` would run in (for a live, step-by-step simulation).
+    pub fn with_ctx<R>(&mut self, step: Step, progress: &(dyn Fn(Step, f32, &str) + Sync), f: impl FnOnce(&Ctx) -> R) -> R {
+        if step.index() > 0 {
+            self.run_to(STEPS[step.index() - 1], progress);
+        }
+        let grid = self.grid();
+        let k = step.index();
+        let input = Upstream { steps: self.steps[..k].iter().map(|d| d.as_ref().unwrap()).collect() };
+        let pf = |fr: f32, m: &str| progress(step, fr, m);
+        let ctx = Ctx { grid: &grid, params: &self.params, edits: &self.edits, input, progress_fn: &pf };
+        f(&ctx)
+    }
+
+    /// Store a step's result computed outside `run_to` (a live simulation run
+    /// to its end), under the current input hash. The run must be the one
+    /// `run_to` would compute for the same inputs.
+    pub fn put_step(&mut self, step: Step, out: stages::StepOutput, millis: u64) {
+        let h = self.expected_hashes();
+        self.steps[step.index()] = Some(StepData { hash: h[step.index()], fields: out.fields, meta: out.meta, millis });
+    }
+
     /// Latest available version of a field (later steps shadow earlier ones).
     /// Returns the field, the step that produced it, and whether that step is stale.
     pub fn field(&self, name: &str) -> Option<(&Field, Step, bool)> {
@@ -169,6 +191,7 @@ impl World {
         write_json(&dir.join("overrides").join("fertility.json"), &self.edits.overrides.fertility)?;
         write_json(&dir.join("overrides").join("bands.json"), &self.edits.overrides.bands)?;
         write_json(&dir.join("overrides").join("attraction.json"), &self.edits.overrides.attraction)?;
+        write_json(&dir.join("overrides").join("directives.json"), &self.edits.overrides.directives)?;
         write_json(&dir.join("imports.json"), &self.edits.imports)?;
         Ok(())
     }
@@ -191,6 +214,7 @@ impl World {
             fertility: read_json(&dir.join("overrides").join("fertility.json")).unwrap_or_default(),
             bands: read_json(&dir.join("overrides").join("bands.json")).unwrap_or_default(),
             attraction: read_json(&dir.join("overrides").join("attraction.json")).unwrap_or_default(),
+            directives: read_json(&dir.join("overrides").join("directives.json")).unwrap_or_default(),
         };
         let mut w = World::new(params);
         let imports = read_json(&dir.join("imports.json")).unwrap_or_default();

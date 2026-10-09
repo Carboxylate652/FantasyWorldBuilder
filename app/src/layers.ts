@@ -147,7 +147,8 @@ export type Legend = { title: string; items?: LegendItem[]; gradient?: { stops: 
 export type LayerId =
   | 'sketch' | 'plates' | 'crust' | 'boundaries' | 'elevation' | 'temperature' | 'precipitation'
   | 'continentality' | 'currents' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress'
-  | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population' | 'attraction';
+  | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population' | 'attraction'
+  | 'nations' | 'railways';
 
 export type LayerDef = {
   id: LayerId;
@@ -186,6 +187,8 @@ export const LAYERS: LayerDef[] = [
   { id: 'culture_groups', label: 'Culture groups', fields: ['culture_group', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'attraction', label: 'Attraction', fields: ['attraction', 'population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'population', label: 'Population density', fields: ['population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
+  { id: 'nations', label: 'Nations', fields: ['owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'railways', label: 'Railways', fields: ['railway', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
 ];
 
 /** Same colours as states.png (core/src/export.rs state_color). */
@@ -211,6 +214,11 @@ export const DEPOSITS = ['copper', 'gold', 'silver', 'iron', 'coal', 'salt', 'oi
 export function cultureColor(id: number, group: number): RGB {
   const h = ((((group * 137.508) % 360) + ((id * 67) % 40) - 20) % 360 + 360) % 360;
   return hsl(h, 0.42 + 0.12 * (id % 3), 0.42 + 0.07 * (id % 4)).map((v) => Math.floor(v)) as RGB;
+}
+
+/** Nation colour (same formula as nation_color in core/src/stages/nations.rs). */
+export function nationColor(id: number): RGB {
+  return hsl((id * 137.508 + 20) % 360, 0.5 + 0.15 * (id % 3), 0.42 + 0.08 * (id % 4)).map((v) => Math.floor(v)) as RGB;
 }
 
 export function groupColor(group: number): RGB {
@@ -485,6 +493,28 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
         ...(id === 'cultures' ? [{ color: [90, 90, 90] as RGB, label: 'Thin line: culture border' }] : []),
         { color: [150, 146, 138], label: 'Unsettled land' },
       ] };
+      break;
+    }
+    case 'nations':
+    case 'railways': {
+      const ow = f['owner'], rw = f['railway'], pk = f['province_kind'];
+      const rail = id === 'railways';
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const o = ow ? ow[i] : 0;
+        let c: RGB = o ? nationColor(o) : [150, 146, 138];
+        if (rail) {
+          c = mix(c, [205, 200, 190], 0.65);
+          const r = rw ? rw[i] : 0;
+          if (r === 2) c = [200, 30, 30];
+          else if (r === 1) c = [35, 35, 35];
+        }
+        put(i, c, 0.88 + 0.12 * sh(i));
+      }
+      legend = rail
+        ? { title: 'Railways (industrial era)', items: [{ color: [35, 35, 35], label: 'Track' }, { color: [200, 30, 30], label: 'Station' }, { color: [150, 146, 138], label: 'No ruler' }] }
+        : { title: 'Nations (hover for the owner)', items: [{ color: [20, 20, 20], label: 'Border' }, { color: [150, 146, 138], label: 'No ruler' }] };
       break;
     }
     case 'attraction': {
