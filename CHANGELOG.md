@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0-beta.3 (unreleased)
+## 0.1.0-beta.3
 
 Groundwork before Stage 4.
 
