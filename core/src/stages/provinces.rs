@@ -28,6 +28,7 @@ use super::biomes::{terrain, TERRAIN};
 use super::habitability::role;
 use super::hydrology::water;
 use super::partition::{self, NONE};
+use super::resources as goods;
 use super::{Ctx, StepOutput};
 use crate::edits::{stroke_coverage, Tool};
 use crate::fields::{Field, Fields};
@@ -242,7 +243,9 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let mut merged = 0usize;
     // The cell under each merge's end: the merged province keeps that cell's state.
     let mut merge_ends: Vec<usize> = Vec::new();
-    for s in &ctx.edits.overrides.provinces {
+    // Edits that no longer fit this map, by their index in the provinces layer.
+    let mut unapplied = Vec::new();
+    for (k, s) in ctx.edits.overrides.provinces.iter().enumerate() {
         if s.tool != Tool::ProvinceMerge || s.points.len() < 2 {
             continue;
         }
@@ -252,6 +255,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             label.iter_mut().filter(|x| **x == a).for_each(|x| *x = b);
             merged += 1;
             merge_ends.push(g.nearest(Vec3::from_lat_lon_deg(end[0], end[1]), None));
+        } else {
+            unapplied.push(super::unapplied("provinces", k, s, if a == NONE || b == NONE { "an end is not in a province" } else { "already one province" }));
         }
     }
     if merged > 0 {
@@ -397,7 +402,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         }
     }
     let mut moved_to_state = 0usize;
-    for s in &ctx.edits.overrides.provinces {
+    for (k, s) in ctx.edits.overrides.provinces.iter().enumerate() {
         if s.tool != Tool::ProvinceToState || s.points.len() < 2 {
             continue;
         }
@@ -405,6 +410,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         let end = *s.points.last().unwrap();
         let c = g.nearest(Vec3::from_lat_lon_deg(end[0], end[1]), None);
         if p == NONE || state[c] == 0 || !matches!(provs[p as usize].kind, kind::LAND | kind::WASTELAND) {
+            unapplied.push(super::unapplied("provinces", k, s, "start is not a land province or end is not in a state"));
             continue;
         }
         provs[p as usize].state = state[c];
@@ -421,6 +427,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let rwidth = ctx.input.f32("river_width");
     let site = ctx.input.f32("site");
     let site_kind = ctx.input.u8("site_kind");
+    let temp = ctx.input.f32("temp");
+    let temp_adj = ctx.input.f32("temp_adjust");
     let mut sig = vec![super::resources::Signals::default(); count];
     let mut river = vec![false; count];
     let mut pinned = vec![false; count];
@@ -435,13 +443,19 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             continue;
         }
         let e = elev[i] as f64;
+        let t_mean = (0..12).map(|m| temp[m * n + i] as f64).sum::<f64>() / 12.0 + temp_adj[i] as f64;
+        s.temp_c += a * t_mean;
+        s.elev_m += a * e.max(0.0);
         s.rain_mm += a * p_ann[i] as f64;
         s.orogen += a * (stress[i] as f64 * 2.0).min(1.0);
         if crust[i] == 1 && stress[i] <= 0.0 {
             s.shield += a * (1.0 - ((e - 600.0) / 1400.0).clamp(0.0, 1.0));
         }
-        if crust[i] == 1 && stress[i] < 0.1 && e < 600.0 && p_ann[i] > 700.0 {
-            s.coal += a;
+        if crust[i] == 1 && stress[i] < 0.1 && e < 600.0 {
+            s.sediment += a;
+            if p_ann[i] > 700.0 {
+                s.coal += a;
+            }
         }
         let dry_basin = lake_cls[i] == super::hydrology::lake::DRY
             || g.neighbors(i).iter().any(|&j| lake_cls[j as usize] == super::hydrology::lake::SALT)
@@ -579,12 +593,14 @@ pub fn run(ctx: &Ctx) -> StepOutput {
 
     // Map editor renames.
     let mut renamed = vec![false; count];
-    for s in &ctx.edits.overrides.provinces {
+    for (k, s) in ctx.edits.overrides.provinces.iter().enumerate() {
         if s.tool == Tool::RenameProvince && !s.points.is_empty() && !s.name.trim().is_empty() {
             let p = at(&label, s.points[0]);
             if p != NONE {
                 pnames[p as usize] = s.name.trim().to_string();
                 renamed[p as usize] = true;
+            } else {
+                unapplied.push(super::unapplied("provinces", k, s, "not in a province"));
             }
         }
     }
@@ -605,9 +621,9 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         let v = s.value.round() as i64;
         for p in hit.into_iter().filter(|&p| p != NONE).map(|p| p as usize) {
             match v {
-                1..=14 => good_set[p] = Some(v as u8),
-                101..=106 => deposit_ops[p].push((true, (v - 101) as usize)),
-                201..=206 => deposit_ops[p].push((false, (v - 201) as usize)),
+                v if (1..=goods::TRADE_GOODS.len() as i64).contains(&v) && v as usize != goods::NONE_VALUE => good_set[p] = Some(v as u8),
+                v if (101..101 + goods::DEPOSITS.len() as i64).contains(&v) => deposit_ops[p].push((true, (v - 101) as usize)),
+                v if (201..201 + goods::DEPOSITS.len() as i64).contains(&v) => deposit_ops[p].push((false, (v - 201) as usize)),
                 _ => {}
             }
         }
@@ -812,7 +828,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             }
             let tg = match good_set[p] {
                 Some(v) => super::resources::TRADE_GOODS[v as usize - 1],
-                None if pr.kind == kind::LAND => super::resources::trade_good(pr.terrain, s, &dep),
+                None if pr.kind == kind::LAND => super::resources::trade_good(seed, ids[p], pr.terrain, s, &dep),
                 None => "none",
             };
             good[p] = super::resources::good_index(tg);
@@ -864,6 +880,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "painted_cells": painted,
             "merged_by_editor": merged,
             "moved_to_state": moved_to_state,
+            "unapplied_edits": unapplied,
             "import": import_info,
             "table": {
                 "provinces": provinces_json,

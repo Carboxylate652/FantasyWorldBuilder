@@ -10,7 +10,7 @@
 //! Stage 2 layers: provinces.png (one unique RGB colour per province, no
 //! anti-aliasing), definition.csv (CK3 / Victoria 3 format), provinces.csv,
 //! states.csv, regions.csv, continents.csv, adjacencies.csv (straits) and
-//! province_adjacency.csv (every border, typed), plus
+//! province_adjacency.csv (every border, typed), trade_goods.csv, plus
 //! states.png, a reference map of states with province and state borders.
 
 use crate::export_clean as clean;
@@ -460,7 +460,7 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         "provinces": {
             "provinces.png": "one unique RGB colour per province, nearest-cell sampling (no anti-aliasing); borders are noise-warped by up to a third of a grid cell; islets and ponds made only by detail noise are removed, stray pieces merged and X-crossings broken up (see province_cleanup)",
             "definition.csv": "id;r;g;b;name;x; (CK3 / Victoria 3), first row 0;0;0;0;x;x;",
-            "provinces.csv": "id;name;kind (land, wasteland, lake, sea);band (sea: coastal, shelf, open);state;region;continent;terrain;area_km2;habitability;coastal;lat;lon;neighbors;trade_good;resources (copper, gold, silver, iron, coal, salt; fish for sea zones);rain_mm;river;spring (0–1 strength of its best spring or site pin)",
+            "provinces.csv": "id;name;kind (land, wasteland, lake, sea);band (sea: coastal, shelf, open);state;region;continent;terrain;area_km2;habitability;coastal;lat;lon;neighbors;trade_good (see trade_goods.csv);resources (copper, gold, silver, iron, coal, salt, oil; fish for sea zones);rain_mm;river;spring (0–1 strength of its best spring or site pin)",
             "states.csv": "id;key;name;region;continent;capital_province;area_km2;habitability;provinces;province_colors (Victoria 3 style xRRGGBB)",
             "regions.csv": "id;key;name;continent;states",
             "continents.csv": "id;name;area_km2;states;regions",
@@ -470,6 +470,7 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
             "culture_groups.csv": "id;name;color;population;cultures",
             "culture_events.csv": "year;event (emerged, split, merged, extinct);culture;other (parent of a split, culture a merge went into)",
             "province_cultures.csv": "province;population;culture (majority);shares (culture:share, shares ≥ 5%)",
+            "trade_goods.csv": "good;kind (trade good, deposit, sea zone);category (staple, cash crop, livestock, forest, mineral, energy, sea);provinces;area_km2 — how much of the world has each good",
             "province_adjacency.csv": "from;to;type;border_km;barrier;crossing_km — every border between two provinces; type: land, river (along a border river), impassable (wasteland), coast (land–sea), lake, sea, strait (crossing_km = width); barrier = mean crossing cost of the border (0 = open)",
         },
         "province_cleanup": clean_report,
@@ -724,7 +725,7 @@ fn csv_text(v: &serde_json::Value) -> String {
 }
 
 /// definition.csv, provinces.csv, states.csv, regions.csv, continents.csv,
-/// adjacencies.csv, province_adjacency.csv.
+/// adjacencies.csv, province_adjacency.csv, trade_goods.csv.
 fn write_tables(dir: &Path, t: &serde_json::Value, wpx: usize, hpx: usize, o: &ExportOptions) -> Result<Vec<String>, String> {
     let empty = vec![];
     let arr = |k: &str| t[k].as_array().unwrap_or(&empty);
@@ -792,7 +793,38 @@ fn write_tables(dir: &Path, t: &serde_json::Value, wpx: usize, hpx: usize, o: &E
         pa += &format!("{};{};{};{};{};{}\n", a["from"], a["to"], csv_text(&a["type"]), a["border_km"], a["barrier"], a.get("crossing_km").map_or(String::new(), |v| v.to_string()));
     }
     write("province_adjacency.csv", pa)?;
-    Ok(["definition.csv", "provinces.csv", "states.csv", "regions.csv", "continents.csv", "adjacencies.csv", "province_adjacency.csv"].map(String::from).to_vec())
+    write("trade_goods.csv", trade_goods_table(t))?;
+    Ok(["definition.csv", "provinces.csv", "states.csv", "regions.csv", "continents.csv", "adjacencies.csv", "province_adjacency.csv", "trade_goods.csv"].map(String::from).to_vec())
+}
+
+/// trade_goods.csv: every trade good and deposit with the provinces that have
+/// it and their land area, in the order of resources::TRADE_GOODS and DEPOSITS.
+fn trade_goods_table(t: &serde_json::Value) -> String {
+    use crate::stages::resources::{category, DEPOSITS, TRADE_GOODS};
+    let mut rows: Vec<(&str, &str, u64, f64)> = TRADE_GOODS.iter().filter(|g| **g != "none").map(|g| (*g, "trade good", 0, 0.0)).collect();
+    rows.extend(DEPOSITS.iter().map(|d| (*d, "deposit", 0, 0.0)));
+    rows.push(("fish", "sea zone", 0, 0.0));
+    for p in t["provinces"].as_array().into_iter().flatten() {
+        let area = p["area_km2"].as_f64().unwrap_or(0.0);
+        let sea = p["kind"].as_str() == Some("sea");
+        let mut add = |name: &str, kind: &str| {
+            if let Some(r) = rows.iter_mut().find(|r| r.0 == name && r.1 == kind) {
+                r.2 += 1;
+                r.3 += area;
+            }
+        };
+        if let Some(g) = p["trade_good"].as_str() {
+            add(g, "trade good");
+        }
+        for d in p["resources"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+            add(d, if sea { "sea zone" } else { "deposit" });
+        }
+    }
+    let mut out = String::from("good;kind;category;provinces;area_km2\n");
+    for (name, kind, n, area) in rows {
+        out += &format!("{name};{kind};{};{n};{:.0}\n", category(name, kind), area);
+    }
+    out
 }
 
 /// cultures.png: provinces coloured by majority culture, culture borders dark,

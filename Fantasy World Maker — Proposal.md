@@ -246,6 +246,13 @@ These go beyond the brief. Each one reuses data the pipeline already produces, s
 | GeoJSON / Azgaar-style JSON export | Use with GIS tools and other generators | Province polygons | After M6 |
 | Headless CLI | Batch generation, seed sweeps, automated tests | Rust core | M0 |
 
+**As built (before Stage 4).** Three of these additions are in, plus update checks:
+
+- *Override layers:* edits are stored as strokes in latitude and longitude rather than keyed by cell and ID, so they replay on any seed or grid size; an edit log keyed by IDs would break as soon as the IDs change. The cost is that some edits stop applying after a big change (a merge whose end is now sea). The states and provinces steps report those edits, and the Overrides panel and `worldgen overrides prune` remove them. Layers can be exported to an override bundle and imported into another world.
+- *Headless CLI:* besides generation, export, sweeps and the determinism check, `worldgen validate` checks a world's tables against each other and against the grid (exit code 1 on errors), `worldgen edit` and `worldgen overrides` script edits, and `sweep.csv` tabulates a seed sweep. CI runs the tests and a CLI smoke test on every push.
+- *Resources and trade goods:* metals, coal, salt and fish as planned, plus oil and the plantation-era cash crops (cotton, sugar, coffee, tea, tobacco, rubber, silk) that a 1910–1920 start date needs. Cash crops follow climate (temperature, rain, elevation), not just terrain.
+- *Updates:* the app checks the GitHub releases at startup and installs a newer version on request, verifying the download against GitHub's SHA-256 digest.
+
 ## Roadmap
 
 There are seven milestones, each ending in something you can use and a pass/fail check. Durations will be set once the stack and the target game are decided.

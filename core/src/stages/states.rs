@@ -128,8 +128,11 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let before = seeds.len();
     let mut count = partition::merge_small(g, &mut st, seeds.len(), &area, &vec![sp.min_state_area_km2; seeds.len()], |_, _| true);
     // Map editor: merge the state under each drag's start into the one under its end.
+    // Edits that no longer fit this map (after a seed or sketch change) are
+    // listed in `unapplied_edits`, by their index in the states layer.
     let mut merged = 0usize;
-    for s in &ctx.edits.overrides.states {
+    let mut unapplied = Vec::new();
+    for (k, s) in ctx.edits.overrides.states.iter().enumerate() {
         if s.tool != Tool::StateMerge || s.points.len() < 2 {
             continue;
         }
@@ -138,6 +141,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         if a != NONE && b != NONE && a != b {
             st.iter_mut().filter(|x| **x == a).for_each(|x| *x = b);
             merged += 1;
+        } else {
+            unapplied.push(super::unapplied("states", k, s, if a == NONE || b == NONE { "an end is not on land" } else { "already one state" }));
         }
     }
     if merged > 0 {
@@ -327,7 +332,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     }
     // Map editor renames.
     let mut renamed = vec![false; count];
-    for s in &ctx.edits.overrides.states {
+    for (e, s) in ctx.edits.overrides.states.iter().enumerate() {
         if s.tool != Tool::RenameState || s.points.is_empty() || s.name.trim().is_empty() {
             continue;
         }
@@ -335,6 +340,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         if k != NONE {
             state_names[k as usize] = s.name.trim().to_string();
             renamed[k as usize] = true;
+        } else {
+            unapplied.push(super::unapplied("states", e, s, "not on land"));
         }
     }
 
@@ -433,6 +440,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "fragments_moved": moved,
             "painted_cells": painted,
             "merged_by_editor": merged,
+            "unapplied_edits": unapplied,
             "table": { "states": states_json, "regions": regions_json, "continents": conts_json },
         }),
     }

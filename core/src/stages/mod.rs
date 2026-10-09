@@ -209,7 +209,13 @@ pub fn run_step(step: Step, ctx: &Ctx) -> StepOutput {
 
 /// Algorithm version of each step. Bump a step's number whenever its model
 /// changes, so results cached by an older build are recomputed, not reused.
-pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 2, 2, 4, 6, 2, 5, 2, 5, 5];
+/// An override stroke that had no effect on this map (its target is gone or
+/// moved after a seed, sketch or upstream change), for the overrides report.
+pub(crate) fn unapplied(layer: &str, index: usize, s: &crate::edits::Stroke, reason: &str) -> serde_json::Value {
+    serde_json::json!({ "layer": layer, "index": index, "tool": s.tool, "at": s.points.first(), "reason": reason })
+}
+
+pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 2, 2, 4, 6, 2, 5, 3, 6, 5];
 
 /// Cache keys: each step hashes only the inputs it actually reads, chained to
 /// the previous step's key, so a change only invalidates what depends on it.

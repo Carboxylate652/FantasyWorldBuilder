@@ -199,8 +199,13 @@ export function stateColor(id: number): RGB {
 export const TRADE_GOODS: [string, RGB][] = [
   ['grain', [226, 196, 86]], ['wine', [140, 40, 90]], ['horses', [170, 120, 70]], ['wool', [220, 220, 205]], ['cattle', [190, 150, 110]],
   ['wood', [50, 120, 50]], ['furs', [110, 80, 60]], ['spices', [220, 90, 40]], ['fish', [70, 150, 200]], ['stone', [140, 140, 140]],
-  ['metals', [90, 90, 120]], ['dates', [210, 140, 40]], ['salt', [245, 245, 250]], ['camels', [200, 170, 120]],
+  ['metals', [90, 90, 120]], ['dates', [210, 140, 40]], ['salt', [245, 245, 250]], ['camels', [200, 170, 120]], ['none', [120, 120, 120]],
+  ['cotton', [250, 240, 225]], ['sugar', [150, 210, 120]], ['coffee', [100, 60, 35]], ['tea', [120, 170, 90]], ['tobacco', [180, 130, 50]],
+  ['rubber', [30, 80, 40]], ['silk', [235, 160, 200]],
 ];
+
+/** Deposits in the goods editor's numbering (101 + index adds, 201 + index removes), as in resources::DEPOSITS. */
+export const DEPOSITS = ['copper', 'gold', 'silver', 'iron', 'coal', 'salt', 'oil'];
 
 /** Culture colour: its group's hue, shifted a little per culture (same as culture_color in core/src/stages/cultures.rs). */
 export function cultureColor(id: number, group: number): RGB {
@@ -461,7 +466,7 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
         const g = tg ? tg[i] : 0;
         put(i, g > 0 && g <= TRADE_GOODS.length ? TRADE_GOODS[g - 1][1] : [120, 120, 120], 0.85 + 0.15 * sh(i));
       }
-      legend = { title: 'Trade goods (hover a province for its deposits)', items: TRADE_GOODS.map(([label, color]) => ({ color, label })) };
+      legend = { title: 'Trade goods (hover a province for its deposits)', items: TRADE_GOODS.filter(([label]) => label !== 'none').map(([label, color]) => ({ color, label })) };
       break;
     }
     case 'cultures':

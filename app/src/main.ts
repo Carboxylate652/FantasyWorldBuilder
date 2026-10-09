@@ -1,7 +1,7 @@
 import './style.css';
 import * as api from './api';
 import { Grid, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
-import { BOUNDARY, KOPPEN, LAYERS, MONTHS, TERRAIN, colorize, cultureColor, groupColor, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
+import { BOUNDARY, DEPOSITS, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
 import { EDITOR_TOOLS, STAGE2_START, STAGE3_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
@@ -32,7 +32,12 @@ type Status = {
   can_undo: boolean;
   can_redo: boolean;
   dirty: boolean;
+  override_edits: number;
 };
+
+type Asset = { name: string; url: string; size: number; sha256: string | null };
+type Release = { tag: string; version: string; name: string; url: string; prerelease: boolean; published_at: string; notes: string; installer: Asset | null; portable: Asset | null };
+type UpdateCheck = { current: string; include_prereleases: boolean; latest: Release | null; update_available: boolean; installed: boolean };
 
 const S = {
   status: null as Status | null,
@@ -46,6 +51,9 @@ const S = {
   openStep: 'sketch',
   /** Map editor toolbar shown (province, state and goods tools). */
   editor: false,
+  /** Version of this build and the last update check. */
+  version: '',
+  update: null as UpdateCheck | null,
   overlays: { rivers: true, wind: false, motion: false, edits: true, borders: false },
   political: null as Political | null,
   exag: 0,
@@ -108,6 +116,7 @@ async function boot() {
       api.isTauri ? String(e) : h('span', {}, 'Start it with ', h('code', {}, 'worldgen serve --static app/dist'), '.')));
     return;
   }
+  void startupUpdateCheck();
   // A fresh session: generate the sketch so there is something to look at.
   if (S.status!.steps[1].state === 'empty') await run('sketch');
 }
@@ -583,6 +592,7 @@ function renderTopbar() {
       h('label', { class: 'check', title: 'Relief exaggeration on the globe' }, 'Relief',
         h('input', { type: 'range', min: 0, max: 40, step: 1, value: S.exag, oninput: (e: Event) => { S.exag = Number((e.target as HTMLInputElement).value); refreshLayer(); } }))),
     h('div', { class: 'spacer' }),
+    btn(st.override_edits ? `Overrides (${st.override_edits})` : 'Overrides', onOverrides, { title: 'Override layers: every hand edit, by layer; export them to reuse in another world' }),
     btn('Edit map', () => {
       S.editor = !S.editor;
       if (!S.editor && EDITOR_TOOLS.includes(S.tool)) S.tool = 'navigate';
@@ -590,6 +600,8 @@ function renderTopbar() {
       renderToolbar();
     }, { class: S.editor ? 'on' : '', title: 'Map editor: merge, move and rename provinces and states, paint trade goods' }),
     stageButtons(st),
+    btn(S.update?.update_available ? `v${S.update.latest!.version} available` : S.version ? `v${S.version}` : 'About', onAbout,
+      { class: S.update?.update_available ? 'update' : 'ghost', title: 'Version and updates' }),
   );
 }
 
@@ -701,6 +713,233 @@ function onExport() {
     ),
   );
   document.body.append(dlg);
+}
+
+// ------------------------------------------------------------------ override layers
+
+function stepTitle(key: string): string {
+  return STEPS.find((s) => s.key === key)?.title ?? key;
+}
+
+async function onOverrides() {
+  const box = h('div', { class: 'modal wide' });
+  const dlg = h('div', { class: 'modal-back', onclick: (e: Event) => { if (e.target === dlg) dlg.remove(); } }, box);
+  document.body.append(dlg);
+  let replace = false;
+  const render = async () => {
+    let r: any;
+    try {
+      r = await api.json('overrides');
+    } catch (e) {
+      toast(String(e), true);
+      dlg.remove();
+      return;
+    }
+    const sel = new Set<string>(r.layers.filter((l: any) => l.edits > 0).map((l: any) => l.layer));
+    const after = async (cmd: string, args: any) => {
+      await mutate(cmd, args);
+      await render();
+    };
+    const stale = ['states', 'provinces'].some((k) => S.status!.steps.find((s) => s.key === k)?.state !== 'done');
+    const byLayer = new Map<string, any[]>();
+    for (const u of r.unapplied) byLayer.set(u.layer, [...(byLayer.get(u.layer) ?? []), u]);
+    box.innerHTML = '';
+    box.append(
+      h('h2', {}, 'Override layers'),
+      h('p', { class: 'muted' }, 'Every hand edit lives here, apart from the generated map, and is replayed whenever a stage runs again, so regenerating never wipes it. Edits are stored by latitude and longitude: they survive a new seed or grid size, and can be exported to start another world from them.'),
+      h('table', { class: 'ovr' },
+        h('tr', {}, h('th', { title: 'Include in export' }, 'Export'), h('th', {}, 'Layer'), h('th', { class: 'num' }, 'Edits'), h('th', {}, 'Feeds step'), h('th', {}, '')),
+        ...r.layers.map((l: any) => h('tr', { class: l.edits ? '' : 'muted' },
+          h('td', {}, h('input', { type: 'checkbox', checked: sel.has(l.layer), disabled: !l.edits, onchange: (e: Event) => ((e.target as HTMLInputElement).checked ? sel.add(l.layer) : sel.delete(l.layer)) })),
+          h('td', {}, l.title), h('td', { class: 'num' }, String(l.edits)), h('td', {}, stepTitle(l.step)),
+          h('td', {}, h('button', { disabled: !l.edits, onclick: () => { if (confirm(`Clear all ${l.edits} edits of “${l.title}”? (Undo brings them back.)`)) void after('clear_layer', { layer: l.layer }); } }, 'Clear'))))),
+      r.unapplied.length
+        ? h('div', { class: 'unapplied' },
+          h('b', {}, `${r.unapplied.length} edit${r.unapplied.length > 1 ? 's' : ''} no longer appl${r.unapplied.length > 1 ? 'y' : 'ies'}`),
+          h('span', { class: 'muted' }, ' — their target is gone after a seed, sketch or upstream change.'),
+          h('ul', {}, ...r.unapplied.slice(0, 12).map((u: any) => h('li', {}, `${u.tool.replace(/_/g, ' ')} at ${u.at ? `${u.at[0].toFixed(1)}°, ${u.at[1].toFixed(1)}°` : '?'}: ${u.reason}`))),
+          r.unapplied.length > 12 ? h('div', { class: 'muted' }, `and ${r.unapplied.length - 12} more`) : null,
+          h('button', { onclick: async () => {
+            for (const [layer, list] of byLayer) await mutate('remove_edits', { layer, indices: list.map((u) => u.index) });
+            await render();
+          } }, 'Remove them'))
+        : h('p', { class: 'muted' }, stale ? 'Generate Stage 2 to check that every state and province edit still applies.' : 'Every state and province edit applies to the current map.'),
+      h('div', { class: 'actions' },
+        h('button', { disabled: !r.total, onclick: () => exportOverrides([...sel]) }, 'Export…'),
+        h('button', { onclick: async () => { if (await importOverrides(replace)) await render(); } }, 'Import…'),
+        h('label', { class: 'check', title: 'Imported layers replace the edits of the same layers instead of adding to them' },
+          h('input', { type: 'checkbox', checked: replace, onchange: (e: Event) => (replace = (e.target as HTMLInputElement).checked) }), 'Replace on import'),
+        h('span', { class: 'spacer' }),
+        h('button', { onclick: () => dlg.remove() }, 'Close')),
+    );
+  };
+  await render();
+}
+
+async function exportOverrides(layers: string[]) {
+  if (!layers.length) return toast('Tick at least one layer to export', true);
+  const path = await api.pickSaveFile('Export override layers', 'Override bundle', ['json'], 'my-edits.fwm-overrides.json');
+  if (!path) return;
+  try {
+    const r = await api.json('export_overrides', { path, layers });
+    toast(`Exported ${r.layers.map((l: any) => `${l.layer} (${l.edits})`).join(', ')}`);
+  } catch (e) {
+    toast(String(e), true);
+  }
+}
+
+async function importOverrides(replace: boolean): Promise<boolean> {
+  const path = await api.pickFile('Import override layers', 'Override bundle', ['json']);
+  if (!path) return false;
+  try {
+    const st = await api.json<Status & { imported: { layer: string; edits: number }[] }>('import_overrides', { path, replace });
+    invalidate();
+    await refreshStatus(st);
+    toast(`${replace ? 'Replaced' : 'Added'} ${st.imported.map((l) => `${l.layer} (${l.edits})`).join(', ')}. Generate again to apply them.`);
+    return true;
+  } catch (e) {
+    toast(String(e), true);
+    return false;
+  }
+}
+
+// ------------------------------------------------------------------ updates
+
+type UpdatePrefs = { auto: boolean; betas: boolean | null; skip: string | null };
+
+function updatePrefs(): UpdatePrefs {
+  const d: UpdatePrefs = { auto: true, betas: null, skip: null };
+  try {
+    return { ...d, ...JSON.parse(localStorage.getItem('fwm.update') ?? '{}') };
+  } catch {
+    return d;
+  }
+}
+
+function saveUpdatePrefs(p: UpdatePrefs) {
+  try {
+    localStorage.setItem('fwm.update', JSON.stringify(p));
+  } catch { /* private mode: settings last for this session only */ }
+}
+
+/** At startup: learn this build's version and, unless turned off, ask GitHub for a newer release. */
+async function startupUpdateCheck() {
+  try {
+    S.version = (await api.json('app_version')).version;
+  } catch {
+    return;
+  }
+  renderTopbar();
+  const p = updatePrefs();
+  if (!p.auto) return;
+  try {
+    S.update = await api.json<UpdateCheck>('update_check', { include_prereleases: p.betas });
+  } catch {
+    return; // offline or rate-limited: stay quiet, the About dialog can retry
+  }
+  renderTopbar();
+  if (S.update.update_available && S.update.latest!.version !== p.skip) showUpdateBanner(S.update);
+}
+
+function showUpdateBanner(c: UpdateCheck) {
+  document.querySelector('#update-banner')?.remove();
+  const rel = c.latest!;
+  const bar = h('div', { id: 'update-banner' },
+    h('span', {}, h('b', {}, `Fantasy World Maker ${rel.version} is available`), ` (you have ${c.current}).`),
+    h('button', { class: 'primary', onclick: () => installUpdate(c) }, c.installed ? 'Install and restart' : 'Download'),
+    h('button', { onclick: () => openRelease(rel.url) }, 'What’s new'),
+    h('button', { onclick: () => {
+      saveUpdatePrefs({ ...updatePrefs(), skip: rel.version });
+      bar.remove();
+    } }, 'Skip this version'),
+    h('button', { class: 'ghost', title: 'Remind me next time', onclick: () => bar.remove() }, '×'));
+  $('#topbar').after(bar);
+}
+
+async function openRelease(url: string) {
+  if (!api.isTauri) {
+    window.open(url, '_blank', 'noopener');
+    return;
+  }
+  try {
+    await api.json('update_open', { url });
+  } catch (e) {
+    toast(String(e), true);
+  }
+}
+
+async function installUpdate(c: UpdateCheck) {
+  const rel = c.latest!;
+  if (!api.isTauri || !c.installed || !rel.installer) {
+    // Portable copy or browser UI: the new zip comes from the release page.
+    await openRelease(rel.url);
+    return;
+  }
+  if (S.status?.dirty && !confirm(`The app closes to install ${rel.version}, and unsaved changes to this world will be lost.\n\nChoose Cancel to save first.`)) return;
+  const prog = $('#progress');
+  const poll = setInterval(async () => {
+    try {
+      const p = await api.json('progress');
+      if (p.running && p.task === 'update') {
+        prog.innerHTML = '';
+        prog.append(h('span', {}, `Update: ${p.msg}`), h('progress', { max: 1, value: p.frac }));
+      }
+    } catch { /* ignore */ }
+  }, 200);
+  try {
+    await api.json('update_install', { include_prereleases: c.include_prereleases });
+    toast(`Installing ${rel.version}: the app closes and the installer opens. Your worlds are kept.`);
+  } catch (e) {
+    toast(`Update failed: ${e}`, true);
+  } finally {
+    clearInterval(poll);
+    prog.textContent = '';
+  }
+}
+
+function onAbout() {
+  const p = updatePrefs();
+  const result = h('div', { class: 'result' });
+  const show = (c: UpdateCheck) => {
+    result.innerHTML = '';
+    const rel = c.latest;
+    if (!rel) {
+      result.append(h('div', {}, `No ${c.include_prereleases ? '' : 'stable '}release on GitHub yet.`));
+      return;
+    }
+    result.append(...[
+      h('div', {}, c.update_available ? h('b', {}, `${rel.version} is available`) : `You have the newest ${c.include_prereleases ? '' : 'stable '}release.`,
+        h('span', { class: 'muted' }, ` · ${rel.name}${rel.published_at ? `, ${rel.published_at.slice(0, 10)}` : ''}`)),
+      rel.notes ? h('pre', { class: 'notes' }, rel.notes.slice(0, 1500)) : null,
+      h('div', { class: 'row' },
+        c.update_available ? h('button', { class: 'primary', onclick: () => installUpdate(c) }, api.isTauri && c.installed ? 'Install and restart' : 'Download') : null,
+        h('button', { onclick: () => openRelease(rel.url) }, 'Release page')),
+      api.isTauri && !c.installed ? h('div', { class: 'muted' }, 'This is the portable copy: download the new zip and unzip it over this folder, or use the installer.') : null,
+    ].filter((x): x is HTMLElement => x !== null));
+  };
+  const check = async () => {
+    result.textContent = 'Asking GitHub…';
+    try {
+      S.update = await api.json<UpdateCheck>('update_check', { include_prereleases: updatePrefs().betas });
+      show(S.update);
+      renderTopbar();
+    } catch (e) {
+      result.textContent = String(e);
+    }
+  };
+  const isBeta = /-/.test(S.version);
+  const dlg = h('div', { class: 'modal-back', onclick: (e: Event) => { if (e.target === dlg) dlg.remove(); } },
+    h('div', { class: 'modal' },
+      h('h2', {}, 'Fantasy World Maker'),
+      h('p', {}, `Version ${S.version || 'unknown'}`, h('span', { class: 'muted' }, ' · releases come from GitHub (Carboxylate652/FantasyWorldBuilder)')),
+      h('div', { class: 'form' },
+        h('label', {}, h('span', {}, 'Check for updates at startup'), h('input', { type: 'checkbox', checked: p.auto, onchange: (e: Event) => saveUpdatePrefs({ ...updatePrefs(), auto: (e.target as HTMLInputElement).checked }) })),
+        h('label', { title: 'Default: on while you run a beta' }, h('span', {}, 'Include betas'),
+          h('input', { type: 'checkbox', checked: p.betas ?? isBeta, onchange: (e: Event) => { saveUpdatePrefs({ ...updatePrefs(), betas: (e.target as HTMLInputElement).checked }); void check(); } }))),
+      result,
+      h('div', { class: 'actions' }, h('button', { onclick: () => dlg.remove() }, 'Close'), h('button', { class: 'primary', onclick: check }, 'Check now'))));
+  document.body.append(dlg);
+  if (S.update) show(S.update);
 }
 
 // ------------------------------------------------------------------ step cards
@@ -1124,10 +1363,13 @@ function renderToolbar() {
   }
   if (t.value === 'bands') bb.append(h('label', {}, h('span', {}, 'Bands'), h('input', { type: 'number', step: 1, min: 1, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'goods') {
-    const goods = ['grain', 'wine', 'horses', 'wool', 'cattle', 'wood', 'furs', 'spices', 'fish', 'stone', 'metals', 'dates', 'salt', 'camels'];
-    const deps = ['copper', 'gold', 'silver', 'iron', 'coal', 'salt'];
+    const goods = TRADE_GOODS.map(([g], i) => [g, i + 1] as const).filter(([g]) => g !== 'none');
+    const crops = new Set(['cotton', 'sugar', 'coffee', 'tea', 'tobacco', 'rubber', 'silk']);
+    const deps = DEPOSITS;
+    const opt = ([g, v]: readonly [string, number]) => h('option', { value: v, selected: val === v }, g);
     bb.append(h('label', {}, h('span', {}, 'Paint'), h('select', { onchange: (e: Event) => setVal(Number((e.target as HTMLSelectElement).value)) },
-      h('optgroup', { label: 'Trade good' }, ...goods.map((g, i) => h('option', { value: i + 1, selected: val === i + 1 }, g))),
+      h('optgroup', { label: 'Trade good' }, ...goods.filter(([g]) => !crops.has(g)).map(opt)),
+      h('optgroup', { label: 'Cash crop' }, ...goods.filter(([g]) => crops.has(g)).map(opt)),
       h('optgroup', { label: 'Add deposit' }, ...deps.map((d, i) => h('option', { value: 101 + i, selected: val === 101 + i }, `+ ${d}`))),
       h('optgroup', { label: 'Remove deposit' }, ...deps.map((d, i) => h('option', { value: 201 + i, selected: val === 201 + i }, `− ${d}`))))));
   }
