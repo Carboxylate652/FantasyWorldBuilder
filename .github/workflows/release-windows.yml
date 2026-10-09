@@ -53,6 +53,22 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
 
+      - name: Read this version's release notes
+        id: notes
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const lines = readFileSync('CHANGELOG.md', 'utf8').split(/\r?\n/);
+          const start = lines.indexOf(`## ${process.env.TAG.slice(1)}`);
+          if (start < 0) throw new Error(`No changelog entry for ${process.env.TAG}`);
+          const rest = lines.slice(start + 1);
+          const end = rest.findIndex(line => line.startsWith('## '));
+          const notes = rest.slice(0, end < 0 ? rest.length : end).join('\n').trim();
+          if (!notes) throw new Error('Release notes are empty');
+          appendFileSync(process.env.GITHUB_OUTPUT, `notes<<FWM_RELEASE_NOTES\n${notes}\nFWM_RELEASE_NOTES\n`);
+          JS
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: swatinem/rust-cache@v2
@@ -64,7 +80,7 @@ jobs:
       - name: Test the simulation core, the updater and the guide
         run: cargo test --release -p worldcore -p fwm-update -p fwm-guide
 
-      - name: Build the installer and publish the release
+      - name: Build the installer and create a draft release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,6 +90,8 @@ jobs:
           releaseCommitish: ${{ github.sha }}
           releaseName: Fantasy World Maker ${{ env.TAG }}
           releaseBody: |
+            ${{ steps.notes.outputs.notes }}
+
             Windows build of Fantasy World Maker. See the assets below:
 
             - **`…_x64-setup.exe`**: installer (recommended).
@@ -84,13 +102,16 @@ jobs:
             Requirements: 64-bit Windows 10 or 11 with Microsoft Edge WebView2 (preinstalled on Windows 11 and up-to-date Windows 10; the installer fetches it if missing).
 
             The files are not code-signed, so Windows SmartScreen may warn on first launch: choose *More info → Run anyway*.
-          releaseDraft: false
+          releaseDraft: true
           prerelease: ${{ contains(env.TAG, '-') }}
 
       - name: Build the CLI and the portable zip
         shell: pwsh
         run: |
           cargo build --release -p worldgen
+          if ($LASTEXITCODE -ne 0) { throw "CLI build failed" }
+          $version = & target/release/worldgen.exe version
+          if ($version -ne "worldgen $($env:TAG.TrimStart('v'))") { throw "CLI version mismatch: $version" }
           $dir = "FantasyWorldMaker-$env:TAG-windows-x64-portable"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target/release/worldbuilder-app.exe $dir/
@@ -98,5 +119,20 @@ jobs:
           Copy-Item README.md, LICENSE $dir/
           Compress-Archive -Path "$dir/*" -DestinationPath "$dir.zip" -Force
           gh release upload $env:TAG "$dir.zip" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Portable ZIP upload failed" }
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify assets and publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $releaseJson = gh release view $env:TAG --json assets,isDraft
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect the draft release" }
+          $release = $releaseJson | ConvertFrom-Json
+          $installer = @($release.assets | Where-Object { $_.name.EndsWith('-setup.exe') -and $_.size -gt 0 })
+          $portable = @($release.assets | Where-Object { $_.name -eq "FantasyWorldMaker-$env:TAG-windows-x64-portable.zip" -and $_.size -gt 0 })
+          if ($installer.Count -ne 1 -or $portable.Count -ne 1) { throw "Installer or portable ZIP missing" }
+          gh release edit $env:TAG --draft=false
+          if ($LASTEXITCODE -ne 0) { throw "Release publication failed" }
