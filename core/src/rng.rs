@@ -34,6 +34,8 @@ pub mod stream {
     pub const NAMES: u64 = 13;
     pub const PROVINCE_COLORS: u64 = 14;
     pub const BORDER_NOISE: u64 = 15;
+    pub const CULTURES: u64 = 16;
+    pub const COMMUNITIES: u64 = 17;
 }
 
 #[derive(Clone, Debug)]

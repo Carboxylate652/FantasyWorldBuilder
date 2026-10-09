@@ -9,9 +9,11 @@
 //!
 //! Stage 2 layers: provinces.png (one unique RGB colour per province, no
 //! anti-aliasing), definition.csv (CK3 / Victoria 3 format), provinces.csv,
-//! states.csv, regions.csv, continents.csv and adjacencies.csv (straits), plus
+//! states.csv, regions.csv, continents.csv, adjacencies.csv (straits) and
+//! province_adjacency.csv (every border, typed), trade_goods.csv, plus
 //! states.png, a reference map of states with province and state borders.
 
+use crate::export_clean as clean;
 use crate::fields::Field;
 use crate::grid::Grid;
 use crate::noise::Noise;
@@ -228,21 +230,86 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         }
         None => None,
     };
-    let prov_info = province_info(w);
-    let mut states_w = match layers.province {
-        Some(_) => {
-            files.push("states.png".into());
-            Some(encoder(mk("states.png")?, png::ColorType::Rgb, png::BitDepth::Eight, None).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?)
+    // Provinces first: rasterise, clean up, write provinces.png and states.png.
+    // The clean-up's surface fixes then feed the other layers.
+    let lat_span = opts.lat_max - opts.lat_min;
+    let mut clean_report = None;
+    let raster = match (layers.province, layers.prov_class.as_deref()) {
+        (Some(prov), Some(cls)) => {
+            progress(0.0, "Rasterising provinces");
+            let mut ids = vec![0u32; wpx * hpx];
+            let mut pcls = vec![0u8; wpx * hpx];
+            ids.par_chunks_mut(wpx).zip(pcls.par_chunks_mut(wpx)).enumerate().for_each(|(y, (ri, rc))| {
+                let lat = (opts.lat_max - (y as f64 + 0.5) / hpx as f64 * lat_span).to_radians();
+                let mut hint = None;
+                for x in 0..wpx {
+                    let lon = (-180.0 + (x as f64 + 0.5) / wpx as f64 * 360.0).to_radians();
+                    let p = Vec3::from_lat_lon(lat, lon);
+                    let (v, tri, wt) = grid.locate(p, hint);
+                    hint = Some(v);
+                    let (c, id) = province_pixel(&grid, &layers, prov, cls, &noise, opts, r_km, p, tri, wt);
+                    ri[x] = id;
+                    rc[x] = c;
+                }
+            });
+            progress(0.25, "Cleaning up province pieces");
+            let wm = layers.water.ok_or("no water map")?;
+            let (land_body, _) = crate::graph::components(&grid, |i| wm[i] != 1);
+            let (sea_body, _) = crate::graph::components(&grid, |i| wm[i] == 1);
+            let anchors: Vec<clean::Anchor> = (0..grid.len())
+                .filter_map(|i| {
+                    let (lat, lon) = (grid.lat[i].to_degrees(), grid.lon[i].to_degrees());
+                    if lat < opts.lat_min || lat > opts.lat_max {
+                        return None;
+                    }
+                    let x = (((lon + 180.0) / 360.0 * wpx as f64).floor() as usize).min(wpx - 1);
+                    let y = (((opts.lat_max - lat) / lat_span * hpx as f64).floor() as usize).min(hpx - 1);
+                    let c = match wm[i] {
+                        1 => clean::SEA,
+                        2 => clean::LAKE,
+                        _ => clean::LAND,
+                    };
+                    let body = if c == clean::SEA { sea_body[i] } else { land_body[i] };
+                    Some(clean::Anchor { px: y * wpx + x, cls: c, id: prov[i], body })
+                })
+                .collect();
+            let mut r = clean::ProvRaster { w: wpx, h: hpx, ids, cls: pcls };
+            let scale = clean::row_scale(wpx, hpx, opts.lat_max, opts.lat_min, grid.len());
+            let prov_info = province_info(w);
+            let max_id = prov_info.keys().chain(r.ids.iter()).max().copied().unwrap_or(0) as usize;
+            let mut kind_of = vec![clean::UNKNOWN; max_id + 1];
+            for (&id, &(k, _)) in &prov_info {
+                kind_of[id as usize] = match k {
+                    3 => clean::SEA,
+                    2 => clean::LAKE,
+                    _ => clean::LAND,
+                };
+            }
+            clean_report = Some(clean::clean(&mut r, &anchors, &scale, &kind_of));
+            progress(0.3, "Writing provinces.png");
+            let mut pw = encoder(mk("provinces.png")?, png::ColorType::Rgb, png::BitDepth::Eight, None).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?;
+            let mut sw = encoder(mk("states.png")?, png::ColorType::Rgb, png::BitDepth::Eight, None).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?;
+            let mut line = vec![0u8; wpx * 3];
+            for y in 0..hpx {
+                let row = &r.ids[y * wpx..(y + 1) * wpx];
+                for (x, id) in row.iter().enumerate() {
+                    line[x * 3..x * 3 + 3].copy_from_slice(&layers.prov_rgb.get(id).copied().unwrap_or([0, 0, 0]));
+                }
+                pw.write_all(&line).map_err(|e| e.to_string())?;
+                let prev = if y > 0 { &r.ids[(y - 1) * wpx..y * wpx] } else { &[][..] };
+                sw.write_all(&states_row(row, prev, &prov_info)).map_err(|e| e.to_string())?;
+            }
+            pw.finish().map_err(|e| e.to_string())?;
+            sw.finish().map_err(|e| e.to_string())?;
+            files.extend(["provinces.png".to_string(), "states.png".to_string()]);
+            if let Some(cm) = w.meta(Step::Cultures).filter(|_| fresh(Step::Cultures)) {
+                progress(0.33, "Writing cultures.png");
+                write_cultures_png(dir, &r, &cm["table"], &prov_info, wpx, hpx)?;
+                files.push("cultures.png".into());
+            }
+            Some(r)
         }
-        None => None,
-    };
-    let mut prev_ids: Vec<u32> = Vec::new();
-    let mut prov_w = match layers.province {
-        Some(_) => {
-            files.push("provinces.png".into());
-            Some(encoder(mk("provinces.png")?, png::ColorType::Rgb, png::BitDepth::Eight, None).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?)
-        }
-        None => None,
+        _ => None,
     };
     let mut climate_w = match layers.t_mean {
         Some(_) => {
@@ -257,10 +324,9 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
 
     let mut water = vec![false; wpx * hpx];
     let band = 128usize;
-    let lat_span = opts.lat_max - opts.lat_min;
     let sea = opts.sea_level_value as f64;
     for y0 in (0..hpx).step_by(band) {
-        progress(0.85 * y0 as f32 / hpx as f32, "Rasterising");
+        progress(if raster.is_some() { 0.35 + 0.5 * y0 as f32 / hpx as f32 } else { 0.85 * y0 as f32 / hpx as f32 }, "Rasterising");
         let y1 = (y0 + band).min(hpx);
         let rows: Vec<RowOut> = (y0..y1)
             .into_par_iter()
@@ -273,7 +339,8 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
                     let p = Vec3::from_lat_lon(lat, lon);
                     let (v, tri, wt) = grid.locate(p, hint);
                     hint = Some(v);
-                    sample(&grid, &layers, &noise, opts, r_km, p, tri, wt, sea, &mut row, x);
+                    let surf = raster.as_ref().map(|r| r.cls[y * wpx + x]);
+                    sample(&grid, &layers, &noise, opts, r_km, p, tri, wt, sea, &mut row, x, surf);
                 }
                 row
             })
@@ -293,21 +360,7 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
                 cw.write_all(&row.temp).map_err(|e| e.to_string())?;
                 pw.write_all(&row.precip).map_err(|e| e.to_string())?;
             }
-            if let Some(pw) = prov_w.as_mut() {
-                pw.write_all(&row.prov).map_err(|e| e.to_string())?;
-            }
-            if let Some(sw) = states_w.as_mut() {
-                let line = states_row(&row.prov_id, &prev_ids, &prov_info);
-                sw.write_all(&line).map_err(|e| e.to_string())?;
-                prev_ids.clone_from(&row.prov_id);
-            }
         }
-    }
-    if let Some(pw) = prov_w {
-        pw.finish().map_err(|e| e.to_string())?;
-    }
-    if let Some(sw) = states_w {
-        sw.finish().map_err(|e| e.to_string())?;
     }
     height8.finish().map_err(|e| e.to_string())?;
     height16.finish().map_err(|e| e.to_string())?;
@@ -373,11 +426,18 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         files.push("rivers.geojson".into());
     }
 
-    // Stage 2 tables.
+    // Stage 2 tables (with Stage 3 names when cultures are up to date) and Stage 3 tables.
     if layers.province.is_some() {
         progress(0.95, "Writing province tables");
-        let table = &w.meta(Step::Provinces).ok_or("no provinces")?["table"];
-        files.extend(write_tables(dir, table, wpx, hpx, opts)?);
+        let mut table = w.meta(Step::Provinces).ok_or("no provinces")?["table"].clone();
+        let cultures = w.meta(Step::Cultures).filter(|_| fresh(Step::Cultures));
+        if let Some(cm) = cultures {
+            crate::stages::cultures::apply_names(&mut table, &cm["table"]);
+        }
+        files.extend(write_tables(dir, &table, wpx, hpx, opts)?);
+        if let Some(cm) = cultures {
+            files.extend(write_culture_tables(dir, &cm["table"])?);
+        }
     }
 
     progress(0.97, "Writing package description");
@@ -398,14 +458,22 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         "rivers_geojson": "rivers.geojson: one LineString per river from source to confluence or mouth, with width_m and discharge_m3s per vertex (width = a·Q^b)",
         "river_width": { "coeff": w.params.hydrology.width_coeff, "exponent": w.params.hydrology.width_exponent },
         "provinces": {
-            "provinces.png": "one unique RGB colour per province, nearest-cell sampling (no anti-aliasing); borders are noise-warped by up to a third of a grid cell",
+            "provinces.png": "one unique RGB colour per province, nearest-cell sampling (no anti-aliasing); borders are noise-warped by up to a third of a grid cell; islets and ponds made only by detail noise are removed, stray pieces merged and X-crossings broken up (see province_cleanup)",
             "definition.csv": "id;r;g;b;name;x; (CK3 / Victoria 3), first row 0;0;0;0;x;x;",
-            "provinces.csv": "id;name;kind (land, wasteland, lake, sea);band (sea: coastal, shelf, open);state;region;continent;terrain;area_km2;habitability;coastal;lat;lon;neighbors",
+            "provinces.csv": "id;name;kind (land, wasteland, lake, sea);band (sea: coastal, shelf, open);state;region;continent;terrain;area_km2;habitability;coastal;lat;lon;neighbors;trade_good (see trade_goods.csv);resources (copper, gold, silver, iron, coal, salt, oil; fish for sea zones);rain_mm;river;spring (0–1 strength of its best spring or site pin)",
             "states.csv": "id;key;name;region;continent;capital_province;area_km2;habitability;provinces;province_colors (Victoria 3 style xRRGGBB)",
             "regions.csv": "id;key;name;continent;states",
             "continents.csv": "id;name;area_km2;states;regions",
             "adjacencies.csv": "CK3 layout: From;To;Type;Through;start_x;start_y;stop_x;stop_y;Comment — sea crossings between provinces on different landmasses",
+            "cultures.png": "reference map: provinces coloured by majority culture (group hue), culture borders dark, culture group borders black, unsettled land grey",
+            "cultures.csv": "id;name;group;color;parent;alive;population;provinces;founded_year;ended_year;fate;fate_other — every culture that ever existed (the family tree: parent, and for ended ones whether they merged into fate_other or died out)",
+            "culture_groups.csv": "id;name;color;population;cultures",
+            "culture_events.csv": "year;event (emerged, split, merged, extinct);culture;other (parent of a split, culture a merge went into)",
+            "province_cultures.csv": "province;population;culture (majority);shares (culture:share, shares ≥ 5%)",
+            "trade_goods.csv": "good;kind (trade good, deposit, sea zone);category (staple, cash crop, livestock, forest, mineral, energy, sea);provinces;area_km2 — how much of the world has each good",
+            "province_adjacency.csv": "from;to;type;border_km;barrier;crossing_km — every border between two provinces; type: land, river (along a border river), impassable (wasteland), coast (land–sea), lake, sea, strait (crossing_km = width); barrier = mean crossing cost of the border (0 = open)",
         },
+        "province_cleanup": clean_report,
         "params": w.params,
         "files": files,
     });
@@ -416,8 +484,6 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
 }
 
 struct RowOut {
-    prov: Vec<u8>,
-    prov_id: Vec<u32>,
     water: Vec<bool>,
     h8: Vec<u8>,
     h16: Vec<u8>,
@@ -429,8 +495,6 @@ struct RowOut {
 impl RowOut {
     fn new(w: usize) -> RowOut {
         RowOut {
-            prov: vec![0; w * 3],
-            prov_id: vec![0; w],
             water: vec![false; w],
             h8: vec![0; w],
             h16: vec![0; w * 2],
@@ -442,9 +506,8 @@ impl RowOut {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn sample(g: &Grid, l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, tri: [u32; 3], wt: [f64; 3], sea: f64, row: &mut RowOut, x: usize) {
-    let c = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+/// Elevation with detail noise, land/sea state, lake flag and heaviest corner of a pixel.
+fn surface(l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, c: [usize; 3], wt: [f64; 3]) -> (f64, bool, Option<bool>, usize) {
     let interp = |v: &[f32]| -> f64 { v[c[0]] as f64 * wt[0] + v[c[1]] as f64 * wt[1] + v[c[2]] as f64 * wt[2] };
     let mut e = interp(l.elev);
     if o.detail_noise {
@@ -456,7 +519,34 @@ fn sample(g: &Grid, l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: 
     let is_lake = l.lake.map(|lk| lk[c[kmax]] == 1 || lk[c[kmax]] == 2);
     // Dry basins below sea level (all corners land in the water map) stay land.
     let dry_basin = l.water.is_some_and(|wm| c.iter().all(|&k| wm[k] == 0));
-    let land = e > 0.0 || dry_basin;
+    (e, e > 0.0 || dry_basin, is_lake, kmax)
+}
+
+/// One pixel of every layer. `surf` is the cleaned province raster's surface
+/// class for this pixel: it can turn a noise islet into sea or a pond into land.
+#[allow(clippy::too_many_arguments)]
+fn sample(g: &Grid, l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, tri: [u32; 3], wt: [f64; 3], sea: f64, row: &mut RowOut, x: usize, surf: Option<u8>) {
+    let c = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+    let interp = |v: &[f32]| -> f64 { v[c[0]] as f64 * wt[0] + v[c[1]] as f64 * wt[1] + v[c[2]] as f64 * wt[2] };
+    let (mut e, mut land, mut is_lake, _) = surface(l, noise, o, r_km, p, c, wt);
+    match surf {
+        Some(clean::LAND) => {
+            if !land {
+                land = true;
+                e = e.max(1.0);
+            }
+            is_lake = is_lake.map(|_| false);
+        }
+        Some(clean::SEA) => {
+            if land {
+                land = false;
+                e = e.min(-1.0);
+            }
+            is_lake = is_lake.map(|_| false);
+        }
+        Some(_) => is_lake = Some(true),
+        None => {}
+    }
     row.water[x] = !land || is_lake == Some(true);
     let h8 = if land {
         sea + 1.0 + (e / o.max_elevation_m).clamp(0.0, 1.0) * (254.0 - sea)
@@ -500,15 +590,17 @@ fn sample(g: &Grid, l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: 
         row.temp[x * 3..x * 3 + 3].copy_from_slice(&temperature_color(interp(t) as f32));
         row.precip[x * 3..x * 3 + 3].copy_from_slice(&precip_color(interp(pa) as f32));
     }
-    if let (Some(prov), Some(cls)) = (l.province, l.prov_class.as_deref()) {
-        // Surface class of this pixel, consistent with the heightmap coastline.
-        let want: u8 = if is_lake == Some(true) { 2 } else if land { 0 } else { 1 };
-        let id = province_at(g, l, prov, cls, p, c, wt, want).or_else(|| if want == 2 { province_at(g, l, prov, cls, p, c, wt, 0) } else { None });
-        let id = id.unwrap_or(prov[c[kmax]]);
-        let rgb = l.prov_rgb.get(&id).copied().unwrap_or([0, 0, 0]);
-        row.prov[x * 3..x * 3 + 3].copy_from_slice(&rgb);
-        row.prov_id[x] = id;
-    }
+}
+
+/// Surface class and province of a pixel, before clean-up.
+#[allow(clippy::too_many_arguments)]
+fn province_pixel(g: &Grid, l: &Layers, prov: &[u32], cls: &[u8], noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, tri: [u32; 3], wt: [f64; 3]) -> (u8, u32) {
+    let c = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+    let (_, land, is_lake, kmax) = surface(l, noise, o, r_km, p, c, wt);
+    // Surface class of this pixel, consistent with the heightmap coastline.
+    let want: u8 = if is_lake == Some(true) { clean::LAKE } else if land { clean::LAND } else { clean::SEA };
+    let id = province_at(g, l, prov, cls, p, c, wt, want).or_else(|| if want == clean::LAKE { province_at(g, l, prov, cls, p, c, wt, clean::LAND) } else { None });
+    (want, id.unwrap_or(prov[c[kmax]]))
 }
 
 /// Province for a pixel of surface class `want`: the heaviest matching corner
@@ -632,7 +724,8 @@ fn csv_text(v: &serde_json::Value) -> String {
     }
 }
 
-/// definition.csv, provinces.csv, states.csv, regions.csv, continents.csv, adjacencies.csv.
+/// definition.csv, provinces.csv, states.csv, regions.csv, continents.csv,
+/// adjacencies.csv, province_adjacency.csv, trade_goods.csv.
 fn write_tables(dir: &Path, t: &serde_json::Value, wpx: usize, hpx: usize, o: &ExportOptions) -> Result<Vec<String>, String> {
     let empty = vec![];
     let arr = |k: &str| t[k].as_array().unwrap_or(&empty);
@@ -640,16 +733,18 @@ fn write_tables(dir: &Path, t: &serde_json::Value, wpx: usize, hpx: usize, o: &E
     let mut colors = std::collections::HashMap::new();
 
     let mut def = String::from("0;0;0;0;x;x;\n");
-    let mut prov = String::from("id;name;kind;band;state;region;continent;terrain;area_km2;habitability;coastal;lat;lon;neighbors\n");
+    let mut prov = String::from("id;name;kind;band;state;region;continent;terrain;area_km2;habitability;coastal;lat;lon;neighbors;trade_good;resources;rain_mm;river;spring\n");
     for p in arr("provinces") {
         let c = &p["color"];
         let rgb = [c[0].as_u64().unwrap_or(0), c[1].as_u64().unwrap_or(0), c[2].as_u64().unwrap_or(0)];
         colors.insert(p["id"].as_u64().unwrap_or(0), format!("x{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
         def += &format!("{};{};{};{};{};x;\n", p["id"], rgb[0], rgb[1], rgb[2], csv_text(&p["name"]));
+        let opt = |v: &serde_json::Value| if v.is_null() { String::new() } else { csv_text(v) };
         prov += &format!(
-            "{};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
+            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
             p["id"], csv_text(&p["name"]), csv_text(&p["kind"]), csv_text(&p["band"]), p["state"], p["region"], p["continent"],
             csv_text(&p["terrain"]), p["area_km2"], p["habitability"], p["coastal"], p["center"][0], p["center"][1], csv_text(&p["neighbors"]),
+            opt(&p["trade_good"]), opt(&p["resources"]), opt(&p["rain_mm"]), opt(&p["river"]), opt(&p["site"]),
         );
     }
     write("definition.csv", def)?;
@@ -693,7 +788,135 @@ fn write_tables(dir: &Path, t: &serde_json::Value, wpx: usize, hpx: usize, o: &E
         adj += &format!("{};{};sea;{};{};{};{};{};{} km strait\n", a["from"], a["to"], a["through"], s.0, s.1, e.0, e.1, a["km"]);
     }
     write("adjacencies.csv", adj)?;
-    Ok(["definition.csv", "provinces.csv", "states.csv", "regions.csv", "continents.csv", "adjacencies.csv"].map(String::from).to_vec())
+    let mut pa = String::from("from;to;type;border_km;barrier;crossing_km\n");
+    for a in arr("adjacency") {
+        pa += &format!("{};{};{};{};{};{}\n", a["from"], a["to"], csv_text(&a["type"]), a["border_km"], a["barrier"], a.get("crossing_km").map_or(String::new(), |v| v.to_string()));
+    }
+    write("province_adjacency.csv", pa)?;
+    write("trade_goods.csv", trade_goods_table(t))?;
+    Ok(["definition.csv", "provinces.csv", "states.csv", "regions.csv", "continents.csv", "adjacencies.csv", "province_adjacency.csv", "trade_goods.csv"].map(String::from).to_vec())
+}
+
+/// trade_goods.csv: every trade good and deposit with the provinces that have
+/// it and their land area, in the order of resources::TRADE_GOODS and DEPOSITS.
+fn trade_goods_table(t: &serde_json::Value) -> String {
+    use crate::stages::resources::{category, DEPOSITS, TRADE_GOODS};
+    let mut rows: Vec<(&str, &str, u64, f64)> = TRADE_GOODS.iter().filter(|g| **g != "none").map(|g| (*g, "trade good", 0, 0.0)).collect();
+    rows.extend(DEPOSITS.iter().map(|d| (*d, "deposit", 0, 0.0)));
+    rows.push(("fish", "sea zone", 0, 0.0));
+    for p in t["provinces"].as_array().into_iter().flatten() {
+        let area = p["area_km2"].as_f64().unwrap_or(0.0);
+        let sea = p["kind"].as_str() == Some("sea");
+        let mut add = |name: &str, kind: &str| {
+            if let Some(r) = rows.iter_mut().find(|r| r.0 == name && r.1 == kind) {
+                r.2 += 1;
+                r.3 += area;
+            }
+        };
+        if let Some(g) = p["trade_good"].as_str() {
+            add(g, "trade good");
+        }
+        for d in p["resources"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+            add(d, if sea { "sea zone" } else { "deposit" });
+        }
+    }
+    let mut out = String::from("good;kind;category;provinces;area_km2\n");
+    for (name, kind, n, area) in rows {
+        out += &format!("{name};{kind};{};{n};{:.0}\n", category(name, kind), area);
+    }
+    out
+}
+
+/// cultures.png: provinces coloured by majority culture, culture borders dark,
+/// culture group borders black, empty land grey, water blue.
+fn write_cultures_png(dir: &Path, r: &clean::ProvRaster, t: &serde_json::Value, info: &std::collections::HashMap<u32, (u8, u16)>, wpx: usize, hpx: usize) -> Result<(), String> {
+    let mut cult_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for p in t["provinces"].as_array().into_iter().flatten() {
+        cult_of.insert(p["id"].as_u64().unwrap_or(0) as u32, p["culture"].as_u64().unwrap_or(0) as u32);
+    }
+    let mut look: std::collections::HashMap<u32, ([u8; 3], u32)> = std::collections::HashMap::new();
+    for c in t["cultures"].as_array().into_iter().flatten() {
+        let col = &c["color"];
+        let rgb = [col[0].as_u64().unwrap_or(0) as u8, col[1].as_u64().unwrap_or(0) as u8, col[2].as_u64().unwrap_or(0) as u8];
+        look.insert(c["id"].as_u64().unwrap_or(0) as u32, (rgb, c["group"].as_u64().unwrap_or(0) as u32));
+    }
+    // (culture, group, class) per province id: class 0 land, 1 empty land, 2 lake, 3 sea.
+    let key = |id: u32| -> (u32, u32, u8) {
+        let k = info.get(&id).map_or(3, |x| x.0);
+        if k >= 2 {
+            return (0, 0, k);
+        }
+        let c = cult_of.get(&id).copied().unwrap_or(0);
+        match look.get(&c) {
+            Some(&(_, g)) if c > 0 => (c, g, 0),
+            _ => (0, 0, 1),
+        }
+    };
+    let file = File::create(dir.join("cultures.png")).map_err(|e| format!("cultures.png: {e}"))?;
+    let mut e = png::Encoder::new(BufWriter::new(file), wpx as u32, hpx as u32);
+    e.set_color(png::ColorType::Rgb);
+    e.set_depth(png::BitDepth::Eight);
+    e.set_compression(png::Compression::Fast);
+    let mut wr = e.write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?;
+    let mut line = vec![0u8; wpx * 3];
+    let mut prev: Vec<(u32, u32, u8)> = Vec::new();
+    for y in 0..hpx {
+        let row: Vec<(u32, u32, u8)> = r.ids[y * wpx..(y + 1) * wpx].iter().map(|&id| key(id)).collect();
+        for x in 0..wpx {
+            let (c, g, k) = row[x];
+            let mut rgb = match k {
+                0 => look[&c].0,
+                1 => [150, 146, 138],
+                2 => [110, 160, 215],
+                _ => [40, 70, 120],
+            };
+            let nbs = [if x > 0 { Some(row[x - 1]) } else { None }, prev.get(x).copied()];
+            for nb in nbs.into_iter().flatten() {
+                if k <= 1 && nb.2 <= 1 && nb.0 != c {
+                    rgb = if nb.1 != g { [15, 15, 15] } else { rgb.map(|v| (v as f64 * 0.6) as u8) };
+                }
+            }
+            line[x * 3..x * 3 + 3].copy_from_slice(&rgb);
+        }
+        wr.write_all(&line).map_err(|e| e.to_string())?;
+        prev = row;
+    }
+    wr.finish().map_err(|e| e.to_string())
+}
+
+/// cultures.csv, culture_groups.csv, culture_events.csv, province_cultures.csv.
+fn write_culture_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>, String> {
+    let empty = vec![];
+    let arr = |k: &str| t[k].as_array().unwrap_or(&empty);
+    let write = |name: &str, text: String| std::fs::write(dir.join(name), text).map_err(|e| format!("{name}: {e}"));
+    let hexc = |c: &serde_json::Value| format!("x{:02X}{:02X}{:02X}", c[0].as_u64().unwrap_or(0), c[1].as_u64().unwrap_or(0), c[2].as_u64().unwrap_or(0));
+    let opt = |v: &serde_json::Value| if v.is_null() { String::new() } else { v.to_string() };
+    let mut cu = String::from("id;name;group;color;parent;alive;population;provinces;founded_year;ended_year;fate;fate_other\n");
+    for c in arr("cultures") {
+        cu += &format!(
+            "{};{};{};{};{};{};{};{};{};{};{};{}\n",
+            c["id"], csv_text(&c["name"]), c["group"], hexc(&c["color"]), c["parent"], c["alive"], c["population"], c["provinces"],
+            c["founded_year"], opt(&c["ended_year"]), csv_text(&c["fate"]), c["fate_other"],
+        );
+    }
+    write("cultures.csv", cu)?;
+    let mut gr = String::from("id;name;color;population;cultures\n");
+    for g in arr("groups") {
+        gr += &format!("{};{};{};{};{}\n", g["id"], csv_text(&g["name"]), hexc(&g["color"]), g["population"], csv_text(&g["cultures"]));
+    }
+    write("culture_groups.csv", gr)?;
+    let mut ev = String::from("year;event;culture;other\n");
+    for e in arr("events") {
+        ev += &format!("{};{};{};{}\n", e["year"], csv_text(&e["kind"]), e["culture"], e["other"]);
+    }
+    write("culture_events.csv", ev)?;
+    let mut pc = String::from("province;population;culture;shares\n");
+    for p in arr("provinces") {
+        let shares: Vec<String> = p["shares"].as_array().into_iter().flatten().map(|s| format!("{}:{}", s[0], s[1])).collect();
+        pc += &format!("{};{};{};{}\n", p["id"], p["population"], p["culture"], shares.join(" "));
+    }
+    write("province_cultures.csv", pc)?;
+    Ok(["cultures.csv", "culture_groups.csv", "culture_events.csv", "province_cultures.csv"].map(String::from).to_vec())
 }
 
 /// River chains, biggest first: each runs from a source down its main stem to

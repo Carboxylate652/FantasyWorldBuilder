@@ -1,17 +1,20 @@
 import './style.css';
 import * as api from './api';
 import { Grid, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
-import { BOUNDARY, KOPPEN, LAYERS, MONTHS, TERRAIN, colorize, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
+import { BOUNDARY, DEPOSITS, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
-import { STAGE2_START, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
+import { EDITOR_TOOLS, STAGE2_START, STAGE3_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
 
 // ------------------------------------------------------------------ state
 
-/** States, regions, continents, provinces and straits of the latest run, indexed by id. */
+/** States, regions, continents, provinces and straits of the latest run, plus
+ *  cultures when they are up to date, indexed by id. */
 type Political = {
   states: any[]; regions: any[]; continents: any[]; provinces: any[]; adjacencies: any[];
+  cultures: any[]; groups: any[]; events: any[];
   byState: Map<number, any>; byRegion: Map<number, any>; byProv: Map<number, any>; byCont: Map<number, any>;
+  byCulture: Map<number, any>; byGroup: Map<number, any>;
 };
 
 type StepStatus = { key: string; title: string; state: 'done' | 'stale' | 'empty'; millis: number; meta: any };
@@ -21,13 +24,20 @@ type Status = {
   edits: {
     elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_strokes: number; pins: any[]; arrows: any[];
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
+    site_pins: number; sites: { lat: number; lon: number; population: number }[];
+    fertility_strokes: number; attraction_strokes: number; band_pins: { lat: number; lon: number; bands: number }[];
   };
   grid: { level: number; cells: number; spacing_km: number };
   path: string | null;
   can_undo: boolean;
   can_redo: boolean;
   dirty: boolean;
+  override_edits: number;
 };
+
+type Asset = { name: string; url: string; size: number; sha256: string | null };
+type Release = { tag: string; version: string; name: string; url: string; prerelease: boolean; published_at: string; notes: string; installer: Asset | null; portable: Asset | null };
+type UpdateCheck = { current: string; include_prereleases: boolean; latest: Release | null; update_available: boolean; installed: boolean };
 
 const S = {
   status: null as Status | null,
@@ -39,6 +49,11 @@ const S = {
   toolValue: {} as Record<string, number>,
   pinKind: 'auto',
   openStep: 'sketch',
+  /** Map editor toolbar shown (province, state and goods tools). */
+  editor: false,
+  /** Version of this build and the last update check. */
+  version: '',
+  update: null as UpdateCheck | null,
   overlays: { rivers: true, wind: false, motion: false, edits: true, borders: false },
   political: null as Political | null,
   exag: 0,
@@ -101,6 +116,7 @@ async function boot() {
       api.isTauri ? String(e) : h('span', {}, 'Start it with ', h('code', {}, 'worldgen serve --static app/dist'), '.')));
     return;
   }
+  void startupUpdateCheck();
   // A fresh session: generate the sketch so there is something to look at.
   if (S.status!.steps[1].state === 'empty') await run('sketch');
 }
@@ -136,7 +152,9 @@ async function political(): Promise<Political | null> {
     const idx = (a: any[] | undefined) => new Map<number, any>((a ?? []).map((x) => [x.id, x]));
     S.political = {
       states: t.states ?? [], regions: t.regions ?? [], continents: t.continents ?? [], provinces: t.provinces ?? [], adjacencies: t.adjacencies ?? [],
+      cultures: t.cultures ?? [], groups: t.culture_groups ?? [], events: t.culture_events ?? [],
       byState: idx(t.states), byRegion: idx(t.regions), byProv: idx(t.provinces), byCont: idx(t.continents),
+      byCulture: idx(t.cultures), byGroup: idx(t.culture_groups),
     };
   } catch {
     return null;
@@ -192,7 +210,9 @@ function stepOfLayer(id: LayerId): string {
     sketch: 'Continent sketch', plates: 'Plates', crust: 'Plates', boundaries: 'Tectonic relief', elevation: 'Tectonic relief',
     stress: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', continentality: 'Climate',
     currents: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
-    habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
+    habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
+    resources: 'Provinces',
+    cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures', attraction: 'Cultures',
   };
   return m[id];
 }
@@ -305,9 +325,15 @@ async function refreshOverlays() {
   // state borders over any other layer with the Borders overlay.
   const lay = S.layer;
   const political = lay === 'states' || lay === 'provinces' || lay === 'regions';
-  const stf = political || S.overlays.borders ? await getField('state') : null;
+  const cultural = lay === 'cultures' || lay === 'culture_groups';
+  const stf = cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
   if (stf && !stf.stale) {
     const L = new Lines();
+    // Culture layers: culture borders as hairlines, group borders as ribbons.
+    if (lay === 'cultures') {
+      const cu = await getField('culture');
+      if (cu) for (const [a, b] of cellEdges(g, cu.values, (x, y) => x > 0 && y > 0)) L.seg(a, b, [0.05, 0.05, 0.05, 0.45], 0.0024);
+    }
     if (lay === 'states' || lay === 'provinces') {
       const pv = await getField('province'), pk = await getField('province_kind');
       if (pv && pk) {
@@ -388,6 +414,29 @@ function drawEditMarkers() {
     }
     L.seg(offset(p, e, n, -r * 0.5, 0), offset(p, e, n, r * 0.5, 0), col, 0.004);
     L.seg(offset(p, e, n, 0, -r * 0.5), offset(p, e, n, 0, r * 0.5), col, 0.004);
+  }
+  for (const s of st.edits.sites ?? []) {
+    const p = fromLatLon((s.lat * Math.PI) / 180, (s.lon * Math.PI) / 180);
+    const [e, n] = eastNorth(p);
+    const r = 0.018;
+    const col: [number, number, number, number] = [1, 0.25, 0.8, 1];
+    const pts = [[0, r], [r, 0], [0, -r], [-r, 0], [0, r]];
+    for (let k = 0; k < 4; k++) L.seg(offset(p, e, n, pts[k][0], pts[k][1]), offset(p, e, n, pts[k + 1][0], pts[k + 1][1]), col, 0.004);
+  }
+  // Founding-band pins (filled, size by bands) and, without pins, where the
+  // random founders started (hollow).
+  const ring = (p: Vec3, r: number, col: [number, number, number, number], fill: boolean) => {
+    const [e, n] = eastNorth(p);
+    for (let k = 0; k < 16; k++) {
+      const a1 = (k / 16) * 2 * Math.PI, a2 = ((k + 1) / 16) * 2 * Math.PI;
+      L.seg(offset(p, e, n, Math.cos(a1) * r, Math.sin(a1) * r), offset(p, e, n, Math.cos(a2) * r, Math.sin(a2) * r), col, 0.004);
+      if (fill) L.seg(p, offset(p, e, n, Math.cos(a1) * r, Math.sin(a1) * r), col, 0.004);
+    }
+  };
+  for (const b of st.edits.band_pins ?? []) ring(fromLatLon((b.lat * Math.PI) / 180, (b.lon * Math.PI) / 180), 0.01 + 0.004 * Math.sqrt(b.bands), [1, 0.85, 0.2, 1], true);
+  if (!(st.edits.band_pins ?? []).length) {
+    const founders = st.steps.find((s) => s.key === 'cultures')?.meta?.founders ?? [];
+    for (const f of founders) ring(fromLatLon((f.lat * Math.PI) / 180, (f.lon * Math.PI) / 180), 0.012, [1, 0.85, 0.2, 0.7], false);
   }
   for (const a of st.edits.arrows) {
     const p = fromLatLon((a.lat * Math.PI) / 180, (a.lon * Math.PI) / 180);
@@ -543,8 +592,27 @@ function renderTopbar() {
       h('label', { class: 'check', title: 'Relief exaggeration on the globe' }, 'Relief',
         h('input', { type: 'range', min: 0, max: 40, step: 1, value: S.exag, oninput: (e: Event) => { S.exag = Number((e.target as HTMLInputElement).value); refreshLayer(); } }))),
     h('div', { class: 'spacer' }),
-    h('button', { class: 'primary', disabled: S.busy, onclick: () => run('provinces') }, 'Generate all'),
+    btn(st.override_edits ? `Overrides (${st.override_edits})` : 'Overrides', onOverrides, { title: 'Override layers: every hand edit, by layer; export them to reuse in another world' }),
+    btn('Edit map', () => {
+      S.editor = !S.editor;
+      if (!S.editor && EDITOR_TOOLS.includes(S.tool)) S.tool = 'navigate';
+      renderTopbar();
+      renderToolbar();
+    }, { class: S.editor ? 'on' : '', title: 'Map editor: merge, move and rename provinces and states, paint trade goods' }),
+    stageButtons(st),
+    btn(S.update?.update_available ? `v${S.update.latest!.version} available` : S.version ? `v${S.version}` : 'About', onAbout,
+      { class: S.update?.update_available ? 'update' : 'ghost', title: 'Version and updates' }),
   );
+}
+
+/** "Next stage" (the first stage not fully generated), one button per stage, and "Generate all". */
+function stageButtons(st: Status): HTMLElement {
+  const done = (step: string) => st.steps.find((s) => s.key === step)?.state === 'done';
+  const next = STAGE_ENDS.find((s) => !done(s.step));
+  return h('div', { class: 'group' },
+    next ? h('button', { class: 'primary', disabled: S.busy, title: `Generate everything up to the end of Stage ${next.stage}`, onclick: () => run(next.step) }, `Next: Stage ${next.stage}`) : null,
+    ...STAGE_ENDS.map((s) => h('button', { disabled: S.busy, class: done(s.step) ? 'done' : '', title: `Generate up to the end of Stage ${s.stage}`, onclick: () => run(s.step) }, done(s.step) ? `Stage ${s.stage} ✓` : `Stage ${s.stage}`)),
+    h('button', { class: next ? '' : 'primary', disabled: S.busy, onclick: () => run(STAGE_ENDS[STAGE_ENDS.length - 1].step) }, 'Generate all'));
 }
 
 function undoTarget(): string | undefined {
@@ -647,6 +715,233 @@ function onExport() {
   document.body.append(dlg);
 }
 
+// ------------------------------------------------------------------ override layers
+
+function stepTitle(key: string): string {
+  return STEPS.find((s) => s.key === key)?.title ?? key;
+}
+
+async function onOverrides() {
+  const box = h('div', { class: 'modal wide' });
+  const dlg = h('div', { class: 'modal-back', onclick: (e: Event) => { if (e.target === dlg) dlg.remove(); } }, box);
+  document.body.append(dlg);
+  let replace = false;
+  const render = async () => {
+    let r: any;
+    try {
+      r = await api.json('overrides');
+    } catch (e) {
+      toast(String(e), true);
+      dlg.remove();
+      return;
+    }
+    const sel = new Set<string>(r.layers.filter((l: any) => l.edits > 0).map((l: any) => l.layer));
+    const after = async (cmd: string, args: any) => {
+      await mutate(cmd, args);
+      await render();
+    };
+    const stale = ['states', 'provinces'].some((k) => S.status!.steps.find((s) => s.key === k)?.state !== 'done');
+    const byLayer = new Map<string, any[]>();
+    for (const u of r.unapplied) byLayer.set(u.layer, [...(byLayer.get(u.layer) ?? []), u]);
+    box.innerHTML = '';
+    box.append(
+      h('h2', {}, 'Override layers'),
+      h('p', { class: 'muted' }, 'Every hand edit lives here, apart from the generated map, and is replayed whenever a stage runs again, so regenerating never wipes it. Edits are stored by latitude and longitude: they survive a new seed or grid size, and can be exported to start another world from them.'),
+      h('table', { class: 'ovr' },
+        h('tr', {}, h('th', { title: 'Include in export' }, 'Export'), h('th', {}, 'Layer'), h('th', { class: 'num' }, 'Edits'), h('th', {}, 'Feeds step'), h('th', {}, '')),
+        ...r.layers.map((l: any) => h('tr', { class: l.edits ? '' : 'muted' },
+          h('td', {}, h('input', { type: 'checkbox', checked: sel.has(l.layer), disabled: !l.edits, onchange: (e: Event) => ((e.target as HTMLInputElement).checked ? sel.add(l.layer) : sel.delete(l.layer)) })),
+          h('td', {}, l.title), h('td', { class: 'num' }, String(l.edits)), h('td', {}, stepTitle(l.step)),
+          h('td', {}, h('button', { disabled: !l.edits, onclick: () => { if (confirm(`Clear all ${l.edits} edits of “${l.title}”? (Undo brings them back.)`)) void after('clear_layer', { layer: l.layer }); } }, 'Clear'))))),
+      r.unapplied.length
+        ? h('div', { class: 'unapplied' },
+          h('b', {}, `${r.unapplied.length} edit${r.unapplied.length > 1 ? 's' : ''} no longer appl${r.unapplied.length > 1 ? 'y' : 'ies'}`),
+          h('span', { class: 'muted' }, ' — their target is gone after a seed, sketch or upstream change.'),
+          h('ul', {}, ...r.unapplied.slice(0, 12).map((u: any) => h('li', {}, `${u.tool.replace(/_/g, ' ')} at ${u.at ? `${u.at[0].toFixed(1)}°, ${u.at[1].toFixed(1)}°` : '?'}: ${u.reason}`))),
+          r.unapplied.length > 12 ? h('div', { class: 'muted' }, `and ${r.unapplied.length - 12} more`) : null,
+          h('button', { onclick: async () => {
+            for (const [layer, list] of byLayer) await mutate('remove_edits', { layer, indices: list.map((u) => u.index) });
+            await render();
+          } }, 'Remove them'))
+        : h('p', { class: 'muted' }, stale ? 'Generate Stage 2 to check that every state and province edit still applies.' : 'Every state and province edit applies to the current map.'),
+      h('div', { class: 'actions' },
+        h('button', { disabled: !r.total, onclick: () => exportOverrides([...sel]) }, 'Export…'),
+        h('button', { onclick: async () => { if (await importOverrides(replace)) await render(); } }, 'Import…'),
+        h('label', { class: 'check', title: 'Imported layers replace the edits of the same layers instead of adding to them' },
+          h('input', { type: 'checkbox', checked: replace, onchange: (e: Event) => (replace = (e.target as HTMLInputElement).checked) }), 'Replace on import'),
+        h('span', { class: 'spacer' }),
+        h('button', { onclick: () => dlg.remove() }, 'Close')),
+    );
+  };
+  await render();
+}
+
+async function exportOverrides(layers: string[]) {
+  if (!layers.length) return toast('Tick at least one layer to export', true);
+  const path = await api.pickSaveFile('Export override layers', 'Override bundle', ['json'], 'my-edits.fwm-overrides.json');
+  if (!path) return;
+  try {
+    const r = await api.json('export_overrides', { path, layers });
+    toast(`Exported ${r.layers.map((l: any) => `${l.layer} (${l.edits})`).join(', ')}`);
+  } catch (e) {
+    toast(String(e), true);
+  }
+}
+
+async function importOverrides(replace: boolean): Promise<boolean> {
+  const path = await api.pickFile('Import override layers', 'Override bundle', ['json']);
+  if (!path) return false;
+  try {
+    const st = await api.json<Status & { imported: { layer: string; edits: number }[] }>('import_overrides', { path, replace });
+    invalidate();
+    await refreshStatus(st);
+    toast(`${replace ? 'Replaced' : 'Added'} ${st.imported.map((l) => `${l.layer} (${l.edits})`).join(', ')}. Generate again to apply them.`);
+    return true;
+  } catch (e) {
+    toast(String(e), true);
+    return false;
+  }
+}
+
+// ------------------------------------------------------------------ updates
+
+type UpdatePrefs = { auto: boolean; betas: boolean | null; skip: string | null };
+
+function updatePrefs(): UpdatePrefs {
+  const d: UpdatePrefs = { auto: true, betas: null, skip: null };
+  try {
+    return { ...d, ...JSON.parse(localStorage.getItem('fwm.update') ?? '{}') };
+  } catch {
+    return d;
+  }
+}
+
+function saveUpdatePrefs(p: UpdatePrefs) {
+  try {
+    localStorage.setItem('fwm.update', JSON.stringify(p));
+  } catch { /* private mode: settings last for this session only */ }
+}
+
+/** At startup: learn this build's version and, unless turned off, ask GitHub for a newer release. */
+async function startupUpdateCheck() {
+  try {
+    S.version = (await api.json('app_version')).version;
+  } catch {
+    return;
+  }
+  renderTopbar();
+  const p = updatePrefs();
+  if (!p.auto) return;
+  try {
+    S.update = await api.json<UpdateCheck>('update_check', { include_prereleases: p.betas });
+  } catch {
+    return; // offline or rate-limited: stay quiet, the About dialog can retry
+  }
+  renderTopbar();
+  if (S.update.update_available && S.update.latest!.version !== p.skip) showUpdateBanner(S.update);
+}
+
+function showUpdateBanner(c: UpdateCheck) {
+  document.querySelector('#update-banner')?.remove();
+  const rel = c.latest!;
+  const bar = h('div', { id: 'update-banner' },
+    h('span', {}, h('b', {}, `Fantasy World Maker ${rel.version} is available`), ` (you have ${c.current}).`),
+    h('button', { class: 'primary', onclick: () => installUpdate(c) }, c.installed ? 'Install and restart' : 'Download'),
+    h('button', { onclick: () => openRelease(rel.url) }, 'What’s new'),
+    h('button', { onclick: () => {
+      saveUpdatePrefs({ ...updatePrefs(), skip: rel.version });
+      bar.remove();
+    } }, 'Skip this version'),
+    h('button', { class: 'ghost', title: 'Remind me next time', onclick: () => bar.remove() }, '×'));
+  $('#topbar').after(bar);
+}
+
+async function openRelease(url: string) {
+  if (!api.isTauri) {
+    window.open(url, '_blank', 'noopener');
+    return;
+  }
+  try {
+    await api.json('update_open', { url });
+  } catch (e) {
+    toast(String(e), true);
+  }
+}
+
+async function installUpdate(c: UpdateCheck) {
+  const rel = c.latest!;
+  if (!api.isTauri || !c.installed || !rel.installer) {
+    // Portable copy or browser UI: the new zip comes from the release page.
+    await openRelease(rel.url);
+    return;
+  }
+  if (S.status?.dirty && !confirm(`The app closes to install ${rel.version}, and unsaved changes to this world will be lost.\n\nChoose Cancel to save first.`)) return;
+  const prog = $('#progress');
+  const poll = setInterval(async () => {
+    try {
+      const p = await api.json('progress');
+      if (p.running && p.task === 'update') {
+        prog.innerHTML = '';
+        prog.append(h('span', {}, `Update: ${p.msg}`), h('progress', { max: 1, value: p.frac }));
+      }
+    } catch { /* ignore */ }
+  }, 200);
+  try {
+    await api.json('update_install', { include_prereleases: c.include_prereleases });
+    toast(`Installing ${rel.version}: the app closes and the installer opens. Your worlds are kept.`);
+  } catch (e) {
+    toast(`Update failed: ${e}`, true);
+  } finally {
+    clearInterval(poll);
+    prog.textContent = '';
+  }
+}
+
+function onAbout() {
+  const p = updatePrefs();
+  const result = h('div', { class: 'result' });
+  const show = (c: UpdateCheck) => {
+    result.innerHTML = '';
+    const rel = c.latest;
+    if (!rel) {
+      result.append(h('div', {}, `No ${c.include_prereleases ? '' : 'stable '}release on GitHub yet.`));
+      return;
+    }
+    result.append(...[
+      h('div', {}, c.update_available ? h('b', {}, `${rel.version} is available`) : `You have the newest ${c.include_prereleases ? '' : 'stable '}release.`,
+        h('span', { class: 'muted' }, ` · ${rel.name}${rel.published_at ? `, ${rel.published_at.slice(0, 10)}` : ''}`)),
+      rel.notes ? h('pre', { class: 'notes' }, rel.notes.slice(0, 1500)) : null,
+      h('div', { class: 'row' },
+        c.update_available ? h('button', { class: 'primary', onclick: () => installUpdate(c) }, api.isTauri && c.installed ? 'Install and restart' : 'Download') : null,
+        h('button', { onclick: () => openRelease(rel.url) }, 'Release page')),
+      api.isTauri && !c.installed ? h('div', { class: 'muted' }, 'This is the portable copy: download the new zip and unzip it over this folder, or use the installer.') : null,
+    ].filter((x): x is HTMLElement => x !== null));
+  };
+  const check = async () => {
+    result.textContent = 'Asking GitHub…';
+    try {
+      S.update = await api.json<UpdateCheck>('update_check', { include_prereleases: updatePrefs().betas });
+      show(S.update);
+      renderTopbar();
+    } catch (e) {
+      result.textContent = String(e);
+    }
+  };
+  const isBeta = /-/.test(S.version);
+  const dlg = h('div', { class: 'modal-back', onclick: (e: Event) => { if (e.target === dlg) dlg.remove(); } },
+    h('div', { class: 'modal' },
+      h('h2', {}, 'Fantasy World Maker'),
+      h('p', {}, `Version ${S.version || 'unknown'}`, h('span', { class: 'muted' }, ' · releases come from GitHub (Carboxylate652/FantasyWorldBuilder)')),
+      h('div', { class: 'form' },
+        h('label', {}, h('span', {}, 'Check for updates at startup'), h('input', { type: 'checkbox', checked: p.auto, onchange: (e: Event) => saveUpdatePrefs({ ...updatePrefs(), auto: (e.target as HTMLInputElement).checked }) })),
+        h('label', { title: 'Default: on while you run a beta' }, h('span', {}, 'Include betas'),
+          h('input', { type: 'checkbox', checked: p.betas ?? isBeta, onchange: (e: Event) => { saveUpdatePrefs({ ...updatePrefs(), betas: (e.target as HTMLInputElement).checked }); void check(); } }))),
+      result,
+      h('div', { class: 'actions' }, h('button', { onclick: () => dlg.remove() }, 'Close'), h('button', { class: 'primary', onclick: check }, 'Check now'))));
+  document.body.append(dlg);
+  if (S.update) show(S.update);
+}
+
 // ------------------------------------------------------------------ step cards
 
 function renderSteps() {
@@ -660,6 +955,7 @@ function renderSteps() {
       h('input', { type: 'checkbox', checked: S.autoRun, onchange: (e: Event) => (S.autoRun = (e.target as HTMLInputElement).checked) }), 'Auto-update')));
   STEPS.forEach((ui, idx) => {
     if (idx === STAGE2_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 2 · States and provinces')));
+    if (idx === STAGE3_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 3 · Cultures')));
     box.append(stepCard(ui, idx, st.steps[idx]));
   });
   box.scrollTop = scroll;
@@ -726,10 +1022,26 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
   if (ui.key === 'habitability') {
     body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.barrier_strokes} barrier strokes`),
       h('button', { class: 'small', disabled: !e.barrier_strokes, onclick: () => mutate('clear_layer', { layer: 'barriers' }) }, 'Clear barriers')));
+    body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.site_pins} site pins`),
+      h('button', { class: 'small', disabled: !e.site_pins, onclick: () => mutate('clear_layer', { layer: 'sites' }) }, 'Clear pins')));
   }
   if (ui.key === 'states') {
     body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.state_strokes} state paint strokes`),
       h('button', { class: 'small', disabled: !e.state_strokes, onclick: () => mutate('clear_layer', { layer: 'states' }) }, 'Clear paint')));
+    body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.fertility_strokes} fertility strokes`),
+      h('button', { class: 'small', disabled: !e.fertility_strokes, onclick: () => mutate('clear_layer', { layer: 'fertility' }, 'habitability') }, 'Clear fertility')));
+  }
+  if (ui.key === 'cultures') {
+    const pins = e.band_pins ?? [];
+    const founders = S.status!.steps.find((x) => x.key === 'cultures')?.meta?.founders ?? [];
+    body.append(h('h4', {}, 'Founding peoples'),
+      h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, pins.length
+        ? `${pins.length} founding-band pins (${pins.reduce((a, b) => a + b.bands, 0)} bands) replace the random founders.`
+        : `Random founders (hollow circles on the map). Pin them to move or resize them.`),
+        !pins.length && founders.length ? h('button', { class: 'small', onclick: () => pinFounders(founders) }, 'Pin these') : null,
+        h('button', { class: 'small', disabled: !pins.length, onclick: () => mutate('clear_layer', { layer: 'bands' }, 'cultures') }, 'Clear pins')),
+      h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, `${e.attraction_strokes} attraction strokes`),
+        h('button', { class: 'small', disabled: !e.attraction_strokes, onclick: () => mutate('clear_layer', { layer: 'attraction' }, 'cultures') }, 'Clear attraction')));
   }
   if (ui.key === 'provinces') {
     const imp = e.province_import;
@@ -815,6 +1127,22 @@ function paramInput(p: Param): HTMLElement {
   return h('label', { class: slider ? 'has-range' : '' }, label, h('div', { class: 'row' }, slider, num, extra));
 }
 
+/** Turn the random founders of the last run into pins (one band each), so they can be moved, resized or removed. */
+async function pinFounders(founders: { lat: number; lon: number; bands: number }[]) {
+  try {
+    for (const f of founders) {
+      await api.json('add_stroke', { stroke: { tool: 'band_pin', value: f.bands, radius_km: 100, points: [[f.lat, f.lon]] } });
+    }
+    const st = await api.json<Status>('status', {});
+    S.status = st;
+    invalidate();
+    await refreshStatus(st);
+    toast(`Pinned ${founders.length} founders`);
+  } catch (err) {
+    toast(String(err), true);
+  }
+}
+
 function stat(k: string, v: string) {
   return h('div', { class: 'stat' }, h('span', {}, k), h('b', {}, v));
 }
@@ -888,6 +1216,7 @@ function summary(key: string, m: any): HTMLElement {
     case 'habitability':
       box.append(stat('Mean habitability', fmt(m.mean_habitability, 2)), stat('Habitable land (≥ 0.4)', `${fmt(m.habitable_share * 100)} %`),
         stat('Border rivers', `${fmt(m.border_river_km)} km`), stat('Backbone rivers', `${fmt(m.backbone_river_km)} km`));
+      if (m.springs !== undefined) box.append(stat('Springs in dry land', fmt(m.springs)));
       if (m.painted_cells) box.append(stat('Painted cells', fmt(m.painted_cells)));
       break;
     case 'states': {
@@ -910,9 +1239,50 @@ function summary(key: string, m: any): HTMLElement {
       });
       break;
     }
+    case 'cultures': {
+      box.append(stat('Cultures', `${fmt(m.cultures)} in ${fmt(m.groups)} groups`), stat('Population', `${fmt(m.population / 1e6, 1)} M of ${fmt(m.capacity / 1e6, 1)} M possible`),
+        stat('History', `${fmt(m.years)} years: ${fmt(m.splits)} splits, ${fmt(m.merged)} merges, ${fmt(m.extinct)} died out`), stat('Bands', fmt(m.bands)));
+      if (m.desert_towns !== undefined) {
+        const by = Object.entries(m.desert_towns_by_cause ?? {}).map(([k, v]) => `${v} ${k}`).join(', ');
+        box.append(stat('Desert towns (dry, no river, ≥ 10,000 people)', `${fmt(m.desert_towns)}${by ? ' — ' + by : ''}`));
+      }
+      const list = h('div', { class: 'list' });
+      box.append(list);
+      political().then((P) => {
+        if (!P || !P.cultures.length) return;
+        const yr = (y: number) => `year ${fmt(y)}`;
+        for (const g of P.groups.slice(0, 12)) {
+          const gc = groupColor(g.id).map(Math.round);
+          list.append(h('div', { class: 'item' }, h('b', {}, h('i', { class: 'swatch', style: `background: rgb(${gc.join(',')})` }), g.name),
+            h('span', { class: 'muted' }, `${fmt(g.population / 1e6, 1)} M people`)));
+          const members = (g.cultures as number[]).map((c) => P.byCulture.get(c)).filter(Boolean).sort((a, b) => b.population - a.population);
+          for (const c of members) {
+            const cc = cultureColor(c.id, c.group).map(Math.round);
+            const parent = c.parent ? P.byCulture.get(c.parent) : null;
+            const origin = parent ? `Split from ${parent.name} in ${yr(c.founded_year)}` : `Emerged in ${yr(c.founded_year)}`;
+            list.append(h('div', { class: 'item', title: origin },
+              h('span', {}, '\u00a0\u00a0', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name),
+              h('span', { class: 'muted' }, `${fmt(c.population / 1e6, 2)} M · ${c.provinces} prov.${parent ? ' · from ' + parent.name : ''}`)));
+          }
+        }
+        const recent = P.events.filter((e) => e.kind !== 'emerged').slice(-8).reverse();
+        if (recent.length) list.append(h('div', { class: 'item' }, h('b', {}, 'Latest events')));
+        for (const e of recent) {
+          const a = P.byCulture.get(e.culture)?.name ?? `#${e.culture}`, b = P.byCulture.get(e.other)?.name ?? '';
+          const text = e.kind === 'split' ? `${a} split from ${b}` : e.kind === 'merged' ? `${a} merged into ${b}` : `${a} died out`;
+          list.append(h('div', { class: 'item' }, h('span', {}, text), h('span', { class: 'muted' }, yr(e.year))));
+        }
+      });
+      break;
+    }
     case 'provinces': {
       box.append(stat('Provinces', fmt(m.provinces)), stat('Land', fmt(m.land)), stat('Wasteland', fmt(m.wasteland)), stat('Lakes', fmt(m.lakes)),
         stat('Sea zones', fmt(m.sea)), stat('Median land province', `${fmt(m.median_land_km2 / 1000, 1)}k km²`), stat('Strait crossings', fmt(m.straits)));
+      if (m.borders) {
+        const b = m.borders;
+        box.append(stat('Land borders', `${fmt(b.land ?? 0)} open · ${fmt(b.river ?? 0)} river · ${fmt(b.impassable ?? 0)} impassable`),
+          stat('Coast and sea borders', `${fmt(b.coast ?? 0)} coast · ${fmt(b.sea ?? 0)} sea · ${fmt(b.lake ?? 0)} lake`));
+      }
       if (m.import?.error) box.append(h('div', { class: 'error' }, `Import failed, generated provinces shown: ${m.import.error}`));
       else if (m.import) {
         box.append(stat('Imported from', String(m.import.png).split(/[\\/]/).pop() ?? ''));
@@ -953,7 +1323,8 @@ function renderToolbar() {
   const tb = $('#toolbar');
   tb.innerHTML = '';
   const open = STEPS.find((s) => s.key === S.openStep);
-  const ids: ToolId[] = ['navigate', ...(open?.tools ?? [])];
+  const ids: ToolId[] = ['navigate', ...(S.editor ? EDITOR_TOOLS : open?.tools ?? [])];
+  if (S.editor) tb.append(h('div', { class: 'tb-hint' }, 'Map editor'));
   for (const id of ids) {
     const t = TOOLS.find((x) => x.id === id)!;
     tb.append(h('button', { class: S.tool === id ? 'on' : '', title: `${t.hint}${t.key ? ` (${t.key.toUpperCase()})` : ''}`, onclick: () => { S.tool = id; renderToolbar(); } }, t.label));
@@ -975,13 +1346,34 @@ function renderToolbar() {
       out.textContent = fmt(S.brush[key]);
     } }), out);
   };
-  if (t.value !== 'pin' && S.tool !== 'arrow') {
+  if (t.value !== 'pin' && S.tool !== 'arrow' && !t.gesture) {
     bb.append(slider('Radius', 'radius_km', 30, 3000, 10, (v) => `${v} km`), slider('Strength', 'strength', 0.05, 1, 0.05, (v) => v.toFixed(2)), slider('Hardness', 'hardness', 0, 0.95, 0.05, (v) => v.toFixed(2)));
     if (t.scatter) bb.append(slider('Scatter', 'scatter', 0.05, 1, 0.05, (v) => v.toFixed(2)), slider('Grain', 'grain_km', 40, 1500, 10, (v) => `${v} km`));
   }
   const val = S.toolValue[t.id] ?? t.defaultValue ?? 0;
   const setVal = (v: number) => (S.toolValue[t.id] = v);
   if (t.value === 'metres') bb.append(h('label', {}, h('span', {}, S.tool === 'flatten' ? 'Target (m)' : 'Amount (m)'), h('input', { type: 'number', step: 50, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
+  if (t.value === 'fertility' || t.value === 'attraction') {
+    const out = h('b', {}, (val > 0 ? '+' : '') + val.toFixed(2));
+    bb.append(h('label', {}, h('span', {}, t.value === 'fertility' ? 'Fertility (− barren, + fertile)' : 'Attraction (− ghost town, + metropolis)'), h('input', { type: 'range', min: -1, max: 1, step: 0.05, value: val, oninput: (e: Event) => {
+      const v = Number((e.target as HTMLInputElement).value);
+      setVal(v);
+      out.textContent = (v > 0 ? '+' : '') + v.toFixed(2);
+    } }), out));
+  }
+  if (t.value === 'bands') bb.append(h('label', {}, h('span', {}, 'Bands'), h('input', { type: 'number', step: 1, min: 1, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
+  if (t.value === 'goods') {
+    const goods = TRADE_GOODS.map(([g], i) => [g, i + 1] as const).filter(([g]) => g !== 'none');
+    const crops = new Set(['cotton', 'sugar', 'coffee', 'tea', 'tobacco', 'rubber', 'silk']);
+    const deps = DEPOSITS;
+    const opt = ([g, v]: readonly [string, number]) => h('option', { value: v, selected: val === v }, g);
+    bb.append(h('label', {}, h('span', {}, 'Paint'), h('select', { onchange: (e: Event) => setVal(Number((e.target as HTMLSelectElement).value)) },
+      h('optgroup', { label: 'Trade good' }, ...goods.filter(([g]) => !crops.has(g)).map(opt)),
+      h('optgroup', { label: 'Cash crop' }, ...goods.filter(([g]) => crops.has(g)).map(opt)),
+      h('optgroup', { label: 'Add deposit' }, ...deps.map((d, i) => h('option', { value: 101 + i, selected: val === 101 + i }, `+ ${d}`))),
+      h('optgroup', { label: 'Remove deposit' }, ...deps.map((d, i) => h('option', { value: 201 + i, selected: val === 201 + i }, `− ${d}`))))));
+  }
+  if (t.value === 'people') bb.append(h('label', {}, h('span', {}, 'Population'), h('input', { type: 'number', step: 1000, min: 0, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'barrier') bb.append(h('label', {}, h('span', {}, 'Barrier strength'), h('input', { type: 'number', step: 1, min: 0, max: 50, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'speed') bb.append(h('label', {}, h('span', {}, 'Speed (mm/yr)'), h('input', { type: 'number', step: 5, min: 1, max: 300, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'plate') {
@@ -1034,6 +1426,7 @@ function toast(msg: string, err = false) {
 
 type Drag =
   | { kind: 'nav'; x: number; y: number }
+  | { kind: 'link'; start: Vec3; end: Vec3 }
   | { kind: 'stroke'; points: Vec3[]; base: Map<number, number>; dmin: Map<number, number>; noise: Map<number, number>; seed: number; gen: Noise | null }
   | { kind: 'arrow'; start: Vec3 };
 
@@ -1070,6 +1463,10 @@ function bindCanvas() {
       return;
     }
     const tdef = TOOLS.find((x) => x.id === S.tool)!;
+    if (tdef.gesture) {
+      drag = { kind: 'link', start: p, end: p };
+      return;
+    }
     const seed = Math.floor(Math.random() * 2 ** 32);
     drag = { kind: 'stroke', points: [p], base: new Map(), dmin: new Map(), noise: new Map(), seed, gen: tdef.scatter ? new Noise(seed, SCATTER_STREAM) : null };
     paintPreview(drag, p);
@@ -1107,6 +1504,14 @@ function bindCanvas() {
       drawBrush(p, drag.points);
       return;
     }
+    if (drag?.kind === 'link' && p) {
+      drag.end = p;
+      const L = new Lines();
+      L.seg(drag.start, p, [1, 0.85, 0.2, 1], 0.006);
+      const [a, b] = L.sets();
+      R.setOverlay('brush', a, b);
+      return;
+    }
     if (drag?.kind === 'arrow' && p) {
       const L = new Lines();
       L.seg(drag.start, p, [1, 0.35, 0.3, 1], 0.006);
@@ -1137,6 +1542,28 @@ function bindCanvas() {
         points: d.points.map((p) => toLatLon(p).map((v) => +((v * 180) / Math.PI).toFixed(4))),
       };
       drawBrush(null);
+      await mutate('add_stroke', { stroke }, t.step);
+    } else if (d.kind === 'link') {
+      R.setOverlay('brush', null, null);
+      const t = TOOLS.find((x) => x.id === S.tool)!;
+      const deg = (p: Vec3) => toLatLon(p).map((v) => +((v * 180) / Math.PI).toFixed(4));
+      const moved = Math.acos(Math.max(-1, Math.min(1, d.start[0] * d.end[0] + d.start[1] * d.end[1] + d.start[2] * d.end[2]))) > 0.004;
+      if (t.gesture === 'link' && !moved && t.id !== 'band_pin') {
+        toast('Drag from the first place to the second.');
+        return;
+      }
+      let name = '';
+      if (t.rename) {
+        name = window.prompt(t.id === 'rename_state' ? 'New state name' : 'New province name')?.trim() ?? '';
+        if (!name) return;
+      }
+      const stroke = {
+        tool: t.rust ?? S.tool,
+        radius_km: S.brush.radius_km,
+        value: S.toolValue[t.id] ?? t.defaultValue ?? 0,
+        points: (moved && t.gesture === 'link' ? [d.start, d.end] : [d.start]).map(deg),
+        name,
+      };
       await mutate('add_stroke', { stroke }, t.step);
     } else if (d.kind === 'arrow') {
       const [x, y] = pos(e);
@@ -1265,7 +1692,11 @@ function describe(d: any): string {
   const P = S.political;
   if (P && d.province) {
     const p = P.byProv.get(d.province);
-    if (p) parts.push(`${p.name} (province ${p.id}, ${p.kind}${p.band ? ' ' + p.band : ''}, ${Math.round(p.area_km2 / 1000)}k km²)`);
+    if (p) {
+      parts.push(`${p.name} (province ${p.id}, ${p.kind}${p.band ? ' ' + p.band : ''}, ${Math.round(p.area_km2 / 1000)}k km²)`);
+      const goods = [p.trade_good && p.trade_good !== 'none' ? p.trade_good : null, ...(p.resources ?? [])].filter(Boolean);
+      if (goods.length) parts.push(goods.join(', '));
+    }
   }
   if (P && d.state) {
     const s = P.byState.get(d.state);
@@ -1273,6 +1704,12 @@ function describe(d: any): string {
     const ct = s ? P.byCont.get(s.continent) : null;
     if (s) parts.push(`state ${s.name}${r ? ', ' + r.name : ''}${ct ? ', ' + ct.name : ''}`);
   }
+  if (P && d.culture) {
+    const c = P.byCulture.get(d.culture), g = c ? P.byGroup.get(c.group) : null;
+    if (c) parts.push(`${c.name} culture${g ? ' (' + g.name + ')' : ''}`);
+  }
+  if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
+  if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
   return parts.join('  ·  ');
 }
 
@@ -1291,7 +1728,7 @@ function bindKeys() {
     if (e.key === 'g') setView(0);
     if (e.key === 'f') setView(1);
     const open = STEPS.find((s) => s.key === S.openStep);
-    const t = TOOLS.find((x) => x.key === e.key && (x.id === 'navigate' || open?.tools.includes(x.id)));
+    const t = TOOLS.find((x) => x.key === e.key && (x.id === 'navigate' || (S.editor ? EDITOR_TOOLS : open?.tools ?? []).includes(x.id)));
     if (t) { S.tool = t.id; renderToolbar(); }
   });
 }

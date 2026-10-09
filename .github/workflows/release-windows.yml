@@ -1,0 +1,102 @@
+# Windows release: build the desktop app on a Windows runner, run the core
+# tests, and publish a GitHub release with the NSIS installer and a portable
+# zip (app + worldgen CLI). Tags with a hyphen (beta, rc) become pre-releases.
+#
+# Triggers:
+# - pushing a version tag (v0.1.0-beta.1, v0.2.0, ...);
+# - pushing a commit whose message contains "[release v0.1.0-beta.1]": the
+#   release (and its tag) is created on that commit;
+# - running the workflow by hand with a tag name.
+
+name: Release (Windows)
+
+on:
+  push:
+    tags: ['v*']
+    branches: ['**']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and release (must already exist)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/') || contains(github.event.head_commit.message, '[release v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Release tag
+        shell: bash
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [[ -n "$INPUT_TAG" ]]; then tag="$INPUT_TAG"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then tag="${GITHUB_REF#refs/tags/}"
+          elif [[ "$MESSAGE" =~ \[release\ (v[0-9A-Za-z.+-]+)\] ]]; then tag="${BASH_REMATCH[1]}"
+          else echo "No release tag found" >&2; exit 1; fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          # Built into the app and the CLI: the version the update check compares.
+          echo "FWM_RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "Releasing $tag"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Install UI dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Test the simulation core and the updater
+        run: cargo test --release -p worldcore -p fwm-update
+
+      - name: Build the installer and publish the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: app
+          tagName: ${{ env.TAG }}
+          releaseCommitish: ${{ github.sha }}
+          releaseName: Fantasy World Maker ${{ env.TAG }}
+          releaseBody: |
+            Windows build of Fantasy World Maker. See the assets below:
+
+            - **`…_x64-setup.exe`**: installer (recommended).
+            - **`FantasyWorldMaker-${{ env.TAG }}-windows-x64-portable.zip`**: no install; unzip and run `worldbuilder-app.exe`. Also contains the `worldgen.exe` command-line tool.
+
+            Updating: from 0.1.0-beta.3 on, the app checks GitHub at startup and offers *Install and restart* when a newer release is out (it can be turned off under the version button in the top bar). Earlier versions need this download once.
+
+            Requirements: 64-bit Windows 10 or 11 with Microsoft Edge WebView2 (preinstalled on Windows 11 and up-to-date Windows 10; the installer fetches it if missing).
+
+            The files are not code-signed, so Windows SmartScreen may warn on first launch: choose *More info → Run anyway*.
+          releaseDraft: false
+          prerelease: ${{ contains(env.TAG, '-') }}
+
+      - name: Build the CLI and the portable zip
+        shell: pwsh
+        run: |
+          cargo build --release -p worldgen
+          $dir = "FantasyWorldMaker-$env:TAG-windows-x64-portable"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/release/worldbuilder-app.exe $dir/
+          Copy-Item target/release/worldgen.exe $dir/
+          Copy-Item README.md, LICENSE $dir/
+          Compress-Archive -Path "$dir/*" -DestinationPath "$dir.zip" -Force
+          gh release upload $env:TAG "$dir.zip" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

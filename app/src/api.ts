@@ -77,3 +77,13 @@ export async function pickFile(title: string, kind: string, extensions: string[]
 }
 
 export const pickPng = (title: string) => pickFile(title, 'PNG image', ['png']);
+
+/** A file to write (Tauri: save dialog; browser: a path on the machine running worldgen serve). */
+export async function pickSaveFile(title: string, kind: string, extensions: string[], defaultPath: string): Promise<string | null> {
+  if (isTauri) {
+    const dlg = await import('@tauri-apps/plugin-dialog');
+    const p = await dlg.save({ title, defaultPath, filters: [{ name: kind, extensions }] });
+    return p ?? null;
+  }
+  return window.prompt(`${title}\nFile path on the machine running worldgen serve:`, defaultPath) || null;
+}

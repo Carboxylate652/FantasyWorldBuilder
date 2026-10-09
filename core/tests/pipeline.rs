@@ -157,6 +157,111 @@ fn scatter_noise_reference_values() {
     assert!(got.iter().all(|v| v.abs() <= 1.2));
 }
 
+/// Stage 3: cultures emerge and settle the land, the family tree is consistent
+/// (parents existed before their daughters, ended cultures have a fate),
+/// provinces carry cultures and populations, and the export writes the tables.
+#[test]
+fn cultures_emerge_and_are_consistent() {
+    use worldcore::fields::Field;
+    let mut p = WorldParams::default();
+    p.planet.seed = 4;
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 200;
+    p.cultures.max_bands = 600;
+    let mut w = World::new(p);
+    w.run_to(LAST, &|_, _, _| {});
+    let m = w.meta(Step::Cultures).unwrap();
+    let t = &m["table"];
+    let cultures = t["cultures"].as_array().unwrap();
+    let alive: Vec<&serde_json::Value> = cultures.iter().filter(|c| c["alive"] == true).collect();
+    assert!(alive.len() >= 3, "only {} cultures", alive.len());
+    assert!(m["population"].as_f64().unwrap() > 0.5 * m["capacity"].as_f64().unwrap(), "land barely settled: {m}");
+    let by_id: std::collections::HashMap<u64, &serde_json::Value> = cultures.iter().map(|c| (c["id"].as_u64().unwrap(), c)).collect();
+    let groups = t["groups"].as_array().unwrap().len() as u64;
+    for c in cultures {
+        let parent = c["parent"].as_u64().unwrap();
+        if parent > 0 {
+            assert!(by_id[&parent]["founded_year"].as_f64().unwrap() < c["founded_year"].as_f64().unwrap(), "culture {} older than its parent", c["id"]);
+        }
+        if c["alive"] == true {
+            assert!(c["population"].as_f64().unwrap() > 0.0);
+            assert!((1..=groups).contains(&c["group"].as_u64().unwrap()));
+        } else {
+            assert!(c["fate"] == "merged" || c["fate"] == "extinct");
+            assert!(c["ended_year"].as_f64().unwrap() >= c["founded_year"].as_f64().unwrap());
+        }
+    }
+    for e in t["events"].as_array().unwrap() {
+        assert!(by_id.contains_key(&e["culture"].as_u64().unwrap()));
+    }
+    // Province cultures agree with the cell field and are living cultures.
+    let cult = match w.field("culture") { Some((Field::U16(v), _, _)) => v.clone(), _ => panic!("culture field") };
+    let prov = match w.field("province") { Some((Field::U32(v), _, _)) => v.clone(), _ => panic!("province field") };
+    let pc: std::collections::HashMap<u64, u64> = t["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["culture"].as_u64().unwrap())).collect();
+    for i in 0..cult.len() {
+        if let Some(&c) = pc.get(&(prov[i] as u64)) {
+            assert_eq!(cult[i] as u64, c);
+            if c > 0 {
+                assert_eq!(by_id[&c]["alive"], true);
+            }
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("fwm-cult-{}", std::process::id()));
+    let opts = ExportOptions { width: 1024, height: 512, ..Default::default() };
+    let r = export(&mut w, &dir, &opts, &|_, _| {}).unwrap();
+    for f in ["cultures.png", "cultures.csv", "culture_groups.csv", "culture_events.csv", "province_cultures.csv"] {
+        assert!(r.files.iter().any(|x| x == f), "{f} not exported");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Settlement sites and resources: springs only appear in dry land, land
+/// provinces get trade goods and some deposits, and a site pin in a desert
+/// grows a town of about the population it asks for.
+#[test]
+fn springs_resources_and_site_pins() {
+    use worldcore::edits::{Stroke, Tool};
+    use worldcore::fields::Field;
+    let mut p = WorldParams::default();
+    p.planet.seed = 4;
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 200;
+    let mut w = World::new(p.clone());
+    w.run_to(LAST, &|_, _, _| {});
+    let f32f = |w: &World, n: &str| match w.field(n) { Some((Field::F32(v), _, _)) => v.clone(), _ => panic!("{n}") };
+    let site = f32f(&w, "site");
+    let rain = f32f(&w, "p_ann");
+    for i in 0..site.len() {
+        if site[i] > 0.0 {
+            assert!(rain[i] < p.habitability.spring_max_precip_mm as f32, "spring in wet land at cell {i}");
+        }
+    }
+    let provs = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().clone();
+    let land: Vec<&serde_json::Value> = provs.iter().filter(|p| p["kind"] == "land").collect();
+    assert!(land.iter().all(|p| p["trade_good"].is_string()));
+    let with_deposits = land.iter().filter(|p| !p["resources"].as_array().unwrap().is_empty()).count();
+    assert!(with_deposits > 0 && with_deposits < land.len(), "{with_deposits} of {} land provinces have deposits", land.len());
+    assert!(w.meta(Step::Cultures).unwrap()["desert_towns"].is_u64());
+
+    // Pin a town in the driest land province that has people around.
+    let dry = land.iter().filter(|p| !p["river"].as_bool().unwrap()).min_by(|a, b| a["rain_mm"].as_f64().partial_cmp(&b["rain_mm"].as_f64()).unwrap()).unwrap();
+    let (lat, lon) = (dry["center"][0].as_f64().unwrap(), dry["center"][1].as_f64().unwrap());
+    let pid = dry["id"].as_u64().unwrap();
+    w.edits.add_stroke(Stroke { tool: Tool::SitePin, value: 40_000.0, points: vec![[lat, lon]], ..Default::default() });
+    assert!(!w.is_fresh(Step::Habitability));
+    w.run_to(LAST, &|_, _, _| {});
+    let prov_field = match w.field("province") { Some((Field::U32(v), _, _)) => v.clone(), _ => panic!() };
+    // Provinces are regenerated around the pin: find the one holding it now.
+    let g = w.grid();
+    let cell = g.nearest(worldcore::vec3::Vec3::from_lat_lon_deg(lat, lon), None);
+    let now = prov_field[cell] as u64;
+    let c = &w.meta(Step::Cultures).unwrap()["table"]["provinces"];
+    let pop = c.as_array().unwrap().iter().find(|p| p["id"].as_u64() == Some(now)).map(|p| p["population"].as_f64().unwrap()).unwrap();
+    assert!(pop >= 0.8 * 40_000.0, "pinned town in province {now} (was {pid}) holds only {pop}");
+}
+
 /// Stage 2: every land cell is in a state and a province, ids and colours are
 /// unique, state tables agree with the cells, and an exported provinces.png
 /// imports back to (almost) the same cells.
@@ -191,12 +296,52 @@ fn states_and_provinces_round_trip() {
         assert!(ids.insert(p["id"].as_u64().unwrap()));
         assert!(colors.insert(p["color"].to_string()), "duplicate colour {}", p["color"]);
     }
+    let by_id: std::collections::HashMap<u64, &serde_json::Value> = provs.iter().map(|p| (p["id"].as_u64().unwrap(), p)).collect();
     for s in t["states"].as_array().unwrap() {
         for pid in s["provinces"].as_array().unwrap() {
             let p = provs.iter().find(|p| &p["id"] == pid).unwrap();
             assert_eq!(p["state"], s["id"]);
         }
+        // Every state has a capital in it; a land capital carries the state's name.
+        let cap = by_id[&s["capital_province"].as_u64().unwrap()];
+        assert_eq!(cap["state"], s["id"], "capital of state {} is outside it", s["id"]);
+        if cap["kind"] == "land" {
+            assert_eq!(cap["name"], s["name"]);
+        }
     }
+    let mut names = std::collections::HashSet::new();
+    for p in provs {
+        assert!(names.insert(p["name"].as_str().unwrap()), "province name {} used twice", p["name"]);
+    }
+
+    // Every pair of neighbouring provinces has one typed border, and the type fits the kinds.
+    let adj = t["adjacency"].as_array().unwrap();
+    let mut borders = std::collections::HashMap::new();
+    for a in adj {
+        let (f, to, ty) = (a["from"].as_u64().unwrap(), a["to"].as_u64().unwrap(), a["type"].as_str().unwrap());
+        assert!(f < to);
+        assert!(borders.insert((f, to, ty == "strait"), ty).is_none(), "border {f}-{to} listed twice");
+        let kinds = [by_id[&f]["kind"].as_str().unwrap(), by_id[&to]["kind"].as_str().unwrap()];
+        let land = |k: &str| k == "land" || k == "wasteland";
+        let ok = match ty {
+            "land" | "river" => kinds == ["land", "land"],
+            "impassable" => land(kinds[0]) && land(kinds[1]) && kinds.contains(&"wasteland"),
+            "coast" => kinds.contains(&"sea") && kinds.iter().any(|k| land(k)),
+            "lake" => kinds.contains(&"lake"),
+            "sea" => kinds == ["sea", "sea"],
+            "strait" => true,
+            _ => false,
+        };
+        assert!(ok, "border {f}-{to} of type {ty} between {kinds:?}");
+    }
+    for p in provs {
+        let a = p["id"].as_u64().unwrap();
+        for b in p["neighbors"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()) {
+            assert!(borders.contains_key(&(a.min(b), a.max(b), false)), "neighbours {a} and {b} have no border");
+        }
+    }
+
+    let n_provs = provs.len();
 
     let dir = std::env::temp_dir().join(format!("fwm-prov-{}", std::process::id()));
     let opts = ExportOptions { width: 2048, height: 1024, ..Default::default() };
@@ -205,6 +350,14 @@ fn states_and_provinces_round_trip() {
     let csv = dir.join("definition.csv").display().to_string();
     let (imp, rep) = worldcore::province_import::describe(&png, Some(&csv), None, None).unwrap();
     assert!(rep.ok, "{:?}", rep.errors);
+    // The export clean-up leaves every province some pixels, no X-crossings and
+    // (almost) no provinces in pieces.
+    for warning in &rep.warnings {
+        assert!(!warning.contains("no pixels") && !warning.contains("X-crossings"), "{warning}");
+    }
+    let pkg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap()).unwrap();
+    let split = pkg["province_cleanup"]["split_provinces"].as_u64().unwrap() as usize;
+    assert!(split * 100 <= n_provs, "{split} of {n_provs} provinces are in pieces");
     w.edits.imports.provinces = Some(imp);
     assert!(!w.is_fresh(Step::Provinces) && w.is_fresh(Step::States));
     w.run_to(LAST, &|_, _, _| {});
@@ -212,4 +365,227 @@ fn states_and_provinces_round_trip() {
     let same = prov.iter().zip(&back).filter(|(a, b)| a == b).count() as f64 / prov.len() as f64;
     assert!(same > 0.98, "only {:.1}% of cells kept their province", same * 100.0);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Map editor and pre-culture edits: fertility paint, province and state
+/// merges, moving a province to another state, renames, the goods editor and
+/// founding-band pins (add, move, erase).
+#[test]
+fn map_editor_and_founders() {
+    use worldcore::edits::{Stroke, Tool};
+    use worldcore::fields::Field;
+    let mut p = WorldParams::default();
+    p.planet.seed = 4;
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 60;
+    let mut w = World::new(p);
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let table = w.meta(Step::Provinces).unwrap()["table"].clone();
+    let land: Vec<serde_json::Value> = table["provinces"].as_array().unwrap().iter().filter(|p| p["kind"] == "land").cloned().collect();
+    let ll = |p: &serde_json::Value| [p["center"][0].as_f64().unwrap(), p["center"][1].as_f64().unwrap()];
+    let n_prov = table["provinces"].as_array().unwrap().len();
+    let n_states = table["states"].as_array().unwrap().len();
+    // Two land provinces of different states, and a third in yet another state.
+    let a = &land[0];
+    let b = land.iter().find(|p| p["state"] != a["state"]).unwrap();
+    let c = land.iter().find(|p| p["state"] != a["state"] && p["state"] != b["state"]).unwrap();
+    let pt = |q: &serde_json::Value| ll(q);
+    let stroke = |tool: Tool, points: Vec<[f64; 2]>, value: f64, name: &str| Stroke { tool, points, value, radius_km: 300.0, name: name.into(), ..Default::default() };
+    w.edits.add_stroke(stroke(Tool::FertilityPaint, vec![pt(c)], 1.0, ""));
+    w.edits.add_stroke(stroke(Tool::StateMerge, vec![pt(b), pt(c)], 0.0, ""));
+    w.edits.add_stroke(stroke(Tool::ProvinceMerge, vec![pt(a), pt(b)], 0.0, ""));
+    w.edits.add_stroke(stroke(Tool::RenameProvince, vec![pt(b)], 0.0, "Testburg"));
+    w.edits.add_stroke(stroke(Tool::RenameState, vec![pt(b)], 0.0, "Testland"));
+    w.edits.add_stroke(stroke(Tool::GoodsPaint, vec![pt(b)], 2.0, ""));
+    w.edits.add_stroke(stroke(Tool::GoodsPaint, vec![pt(b)], 101.0, ""));
+    // Founders: two pins, then move the first and erase the second.
+    let far = land.iter().max_by(|x, y| {
+        let d = |q: &serde_json::Value| (q["center"][0].as_f64().unwrap() - a["center"][0].as_f64().unwrap()).abs();
+        d(x).partial_cmp(&d(y)).unwrap()
+    }).unwrap();
+    w.edits.add_stroke(stroke(Tool::BandPin, vec![pt(a)], 5.0, ""));
+    w.edits.add_stroke(stroke(Tool::BandPin, vec![pt(far)], 1.0, ""));
+    w.edits.add_stroke(stroke(Tool::BandPin, vec![pt(a), pt(c)], 5.0, ""));
+    assert_eq!(w.edits.overrides.bands.len(), 2, "dragging a pin moves it");
+    assert_eq!(w.edits.overrides.bands[0].points[0], pt(c));
+    w.run_to(LAST, &|_, _, _| {});
+
+    let hab = match w.field("habitability") { Some((Field::F32(v), _, _)) => v.clone(), _ => panic!() };
+    let g = w.grid();
+    let cell = |q: [f64; 2]| g.nearest(worldcore::vec3::Vec3::from_lat_lon_deg(q[0], q[1]), None);
+    assert!(hab[cell(pt(c))] > 0.99, "fertility paint raises habitability");
+    let prov = match w.field("province") { Some((Field::U32(v), _, _)) => v.clone(), _ => panic!() };
+    let state = match w.field("state") { Some((Field::U16(v), Step::Provinces, _)) => v.clone(), _ => panic!() };
+    assert_eq!(prov[cell(pt(a))], prov[cell(pt(b))], "province merge");
+    assert_eq!(state[cell(pt(b))], state[cell(pt(c))], "state merge");
+    let t = &w.meta(Step::Provinces).unwrap()["table"];
+    // (Counts are not compared: fertility paint reshapes provinces and states.)
+    let _ = (n_prov, n_states);
+    let merged = t["provinces"].as_array().unwrap().iter().find(|q| q["id"].as_u64() == Some(prov[cell(pt(b))] as u64)).unwrap();
+    assert_eq!(merged["name"], "Testburg");
+    assert_eq!(merged["trade_good"], "wine");
+    assert!(merged["resources"].as_array().unwrap().iter().any(|r| r == "copper"));
+    let st = t["states"].as_array().unwrap().iter().find(|s| s["id"].as_u64() == Some(state[cell(pt(b))] as u64)).unwrap();
+    assert_eq!(st["name"], "Testland");
+    // Culture names keep the editor's names.
+    let mut named = t.clone();
+    worldcore::stages::cultures::apply_names(&mut named, &w.meta(Step::Cultures).unwrap()["table"]);
+    assert!(named["provinces"].as_array().unwrap().iter().any(|q| q["name"] == "Testburg"));
+    assert!(named["states"].as_array().unwrap().iter().any(|s| s["name"] == "Testland"));
+    let founders = w.meta(Step::Cultures).unwrap()["founders"].as_array().unwrap().clone();
+    assert_eq!(founders.len(), 2);
+    assert!(founders.iter().all(|f| f["pinned"] == true));
+    assert_eq!(founders[0]["bands"], 5);
+    // Erase the second pin: one founding people left.
+    w.edits.add_stroke(stroke(Tool::BandErase, vec![pt(far)], 0.0, ""));
+    assert_eq!(w.edits.overrides.bands.len(), 1);
+}
+
+/// Attraction paint: a metropolis province ends with more people than without
+/// it, a ghost-town province with almost none, and states and provinces stay
+/// the same (attraction acts on the culture simulation only).
+#[test]
+fn attraction_makes_metropolis_and_ghost_town() {
+    use worldcore::edits::{Stroke, Tool};
+    let mut p = WorldParams::default();
+    p.planet.seed = 4;
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 150;
+    let mut w = World::new(p);
+    w.run_to(LAST, &|_, _, _| {});
+    let pop = |w: &World| -> std::collections::HashMap<u64, f64> {
+        w.meta(Step::Cultures).unwrap()["table"]["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["population"].as_f64().unwrap())).collect()
+    };
+    let before = pop(&w);
+    let provs = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().clone();
+    // Two settled land provinces far apart.
+    let settled: Vec<&serde_json::Value> = provs.iter().filter(|p| p["kind"] == "land" && before.get(&p["id"].as_u64().unwrap()).copied().unwrap_or(0.0) > 1000.0).collect();
+    let (a, b) = (settled[0], settled[settled.len() / 2]);
+    let ll = |p: &serde_json::Value| [p["center"][0].as_f64().unwrap(), p["center"][1].as_f64().unwrap()];
+    let brush = |v: f64, at: [f64; 2]| Stroke { tool: Tool::Attraction, value: v, radius_km: 400.0, hardness: 0.9, points: vec![at], ..Default::default() };
+    w.edits.add_stroke(brush(1.0, ll(a)));
+    w.edits.add_stroke(brush(-1.0, ll(b)));
+    assert!(w.is_fresh(Step::Provinces) && !w.is_fresh(Step::Cultures), "attraction only invalidates cultures");
+    w.run_to(LAST, &|_, _, _| {});
+    let after = pop(&w);
+    let (ia, ib) = (a["id"].as_u64().unwrap(), b["id"].as_u64().unwrap());
+    assert!(after[&ia] > 1.5 * before[&ia], "metropolis: {} -> {}", before[&ia], after[&ia]);
+    assert!(after[&ib] < 0.2 * before[&ib], "ghost town: {} -> {}", before[&ib], after[&ib]);
+}
+
+#[test]
+fn override_bundles_carry_edits_to_another_seed() {
+    use worldcore::edits::{EditLayer, Stroke, Tool};
+    let mut a = World::new(small_params(21));
+    let st = |tool: Tool, points: Vec<[f64; 2]>, value: f64| Stroke { tool, points, value, radius_km: 300.0, ..Default::default() };
+    a.edits.add_stroke(st(Tool::FertilityPaint, vec![[10.0, 20.0]], 0.8));
+    a.edits.add_stroke(st(Tool::Attraction, vec![[-5.0, 40.0]], 1.0));
+    a.edits.add_stroke(st(Tool::BandPin, vec![[30.0, 0.0]], 4.0));
+    a.edits.add_stroke(st(Tool::BiomePaint, vec![[0.0, 0.0], [1.0, 1.0]], 3.0));
+    let all = [EditLayer::Fertility, EditLayer::Attraction, EditLayer::Bands, EditLayer::Biomes];
+    let bundle: serde_json::Value = serde_json::from_str(&serde_json::to_string(&a.edits.bundle(&all, 21)).unwrap()).unwrap();
+
+    // Another seed takes the edits as they are (they are stored in lat/lon).
+    let mut b = World::new(small_params(22));
+    b.edits.add_stroke(st(Tool::FertilityPaint, vec![[50.0, 50.0]], -1.0));
+    let taken = b.edits.apply_bundle(&bundle, None, false).unwrap();
+    assert_eq!(taken.len(), 4);
+    assert_eq!(b.edits.overrides.fertility.len(), 2, "added to the existing edits");
+    assert_eq!(b.edits.overrides.attraction, a.edits.overrides.attraction);
+    // Replace swaps a layer; a filter takes only the named layers.
+    let mut c = b.edits.clone();
+    c.apply_bundle(&bundle, Some(&[EditLayer::Fertility]), true).unwrap();
+    assert_eq!(c.overrides.fertility, a.edits.overrides.fertility);
+    assert_eq!(c.overrides.attraction.len(), 1, "filtered out layers are untouched");
+    // Bad bundles change nothing.
+    let mut bad = bundle.clone();
+    bad["layers"]["biomes"] = serde_json::json!([{ "tool": "band_pin", "points": [[0.0, 0.0]] }]);
+    let before = b.edits.clone();
+    assert!(b.edits.apply_bundle(&bad, None, false).is_err(), "a stroke in the wrong layer is refused");
+    assert!(b.edits.apply_bundle(&serde_json::json!({ "format": "x" }), None, false).is_err());
+    assert!(b.edits.apply_bundle(&serde_json::json!({ "format": "fwm-overrides", "version": 99, "layers": {} }), None, false).is_err());
+    assert_eq!(b.edits, before);
+    // Removing by index.
+    assert_eq!(b.edits.remove_strokes(EditLayer::Fertility, &[0, 0, 9]), 1);
+    assert_eq!(b.edits.count(EditLayer::Fertility), 1);
+}
+
+#[test]
+fn validation_and_unapplied_edits() {
+    use worldcore::edits::{Stroke, Tool};
+    let mut w = World::new(small_params(8));
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let rep = worldcore::validate::validate(&mut w);
+    assert!(rep.ok, "a generated world passes: {:?}", rep.errors);
+    assert!(rep.checks.len() >= 6, "checks ran: {:?}", rep.checks);
+    assert!(rep.warnings.is_empty(), "{:?}", rep.warnings);
+
+    // A merge drawn in the open ocean, and a rename of nothing: both are
+    // reported as no longer applying, with their index in the layer.
+    let sea = {
+        let t = &w.meta(Step::Provinces).unwrap()["table"];
+        let p = t["provinces"].as_array().unwrap().iter().find(|p| p["kind"] == "sea" && p["band"] == "open").unwrap().clone();
+        [p["center"][0].as_f64().unwrap(), p["center"][1].as_f64().unwrap()]
+    };
+    let st = |tool: Tool, points: Vec<[f64; 2]>| Stroke { tool, points, name: "Nowhere".into(), ..Default::default() };
+    w.edits.add_stroke(st(Tool::StateMerge, vec![sea, sea]));
+    w.edits.add_stroke(st(Tool::RenameState, vec![sea]));
+    w.edits.add_stroke(st(Tool::ProvinceToState, vec![sea, sea]));
+    assert!(worldcore::validate::validate(&mut w).warnings.iter().any(|m| m.contains("stale")));
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let r = worldcore::api::overrides_report(&w);
+    let un = r["unapplied"].as_array().unwrap();
+    assert_eq!(un.len(), 3, "{un:?}");
+    assert_eq!((un[0]["layer"].as_str(), un[0]["index"].as_u64()), (Some("states"), Some(0)));
+    assert_eq!((un[2]["layer"].as_str(), un[2]["index"].as_u64()), (Some("provinces"), Some(0)));
+    assert_eq!(r["total"], 3);
+    let rep = worldcore::validate::validate(&mut w);
+    assert!(rep.ok && rep.warnings.len() == 3, "{:?}", rep.warnings);
+}
+
+#[test]
+fn cash_crops_oil_and_goods_editor() {
+    use worldcore::edits::{Stroke, Tool};
+    use worldcore::stages::resources::{category, good_index, DEPOSITS, TRADE_GOODS};
+    // Editor numbers stay where they were: old goods and deposits keep their values.
+    assert_eq!(good_index("grain"), 1);
+    assert_eq!(good_index("camels"), 14);
+    assert_eq!(good_index("none"), 0);
+    assert_eq!(good_index("coffee"), 18);
+    assert_eq!(DEPOSITS[5], "salt");
+    assert_eq!(DEPOSITS[6], "oil");
+    assert_eq!(category("rubber", "trade good"), "cash crop");
+    assert_eq!(category("oil", "deposit"), "energy");
+
+    let mut w = World::new(small_params(12));
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let t = w.meta(Step::Provinces).unwrap()["table"].clone();
+    let land: Vec<&serde_json::Value> = t["provinces"].as_array().unwrap().iter().filter(|p| p["kind"] == "land").collect();
+    let crops = land.iter().filter(|p| category(p["trade_good"].as_str().unwrap(), "trade good") == "cash crop" && p["trade_good"] != "wine" && p["trade_good"] != "spices" && p["trade_good"] != "dates").count();
+    let oil = land.iter().filter(|p| p["resources"].as_array().unwrap().iter().any(|r| r == "oil")).count();
+    assert!(crops > 0 && crops < land.len() / 2, "plantation crops: {crops} of {}", land.len());
+    assert!(oil > 0 && oil < land.len() / 5, "oil: {oil} of {}", land.len());
+    assert!(land.iter().all(|p| TRADE_GOODS.contains(&p["trade_good"].as_str().unwrap())));
+
+    // Paint coffee and add oil to one province, remove oil from another.
+    let ll = |p: &serde_json::Value| [p["center"][0].as_f64().unwrap(), p["center"][1].as_f64().unwrap()];
+    let a = land.iter().find(|p| p["area_km2"].as_f64().unwrap() > 20000.0).unwrap();
+    let with_oil = land.iter().find(|p| p["id"] != a["id"] && p["resources"].as_array().unwrap().iter().any(|r| r == "oil")).unwrap();
+    let st = |p: [f64; 2], v: f64| Stroke { tool: Tool::GoodsPaint, points: vec![p], value: v, radius_km: 10.0, ..Default::default() };
+    w.edits.add_stroke(st(ll(a), 18.0));
+    w.edits.add_stroke(st(ll(a), 107.0));
+    w.edits.add_stroke(st(ll(with_oil), 207.0));
+    w.edits.add_stroke(st(ll(with_oil), 15.0)); // "none" is not paintable: ignored
+    let good_before = with_oil["trade_good"].clone();
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let t = &w.meta(Step::Provinces).unwrap()["table"];
+    let find = |id: &serde_json::Value| t["provinces"].as_array().unwrap().iter().find(|p| p["id"] == *id).unwrap().clone();
+    let a2 = find(&a["id"]);
+    assert_eq!(a2["trade_good"], "coffee");
+    assert!(a2["resources"].as_array().unwrap().iter().any(|r| r == "oil"));
+    let o2 = find(&with_oil["id"]);
+    assert!(!o2["resources"].as_array().unwrap().iter().any(|r| r == "oil"));
+    assert_eq!(o2["trade_good"], good_before);
 }
