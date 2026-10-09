@@ -209,7 +209,7 @@ pub fn run_step(step: Step, ctx: &Ctx) -> StepOutput {
 
 /// Algorithm version of each step. Bump a step's number whenever its model
 /// changes, so results cached by an older build are recomputed, not reused.
-pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 2, 2, 4, 6, 2, 4, 1, 4, 3];
+pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 2, 2, 4, 6, 2, 5, 2, 5, 5];
 
 /// Cache keys: each step hashes only the inputs it actually reads, chained to
 /// the previous step's key, so a change only invalidates what depends on it.
@@ -229,10 +229,10 @@ pub fn input_hashes(p: &WorldParams, e: &Edits) -> [u64; N_STEPS] {
     );
     let h5 = hash::combine(h4, hash::json(&("hydrology", &p.hydrology)));
     let h6 = hash::combine(h5, hash::json(&("biomes", &p.biomes, &e.overrides.biomes)));
-    let h7 = hash::combine(h6, hash::json(&("habitability", &p.habitability, &e.overrides.barriers, &e.overrides.sites)));
+    let h7 = hash::combine(h6, hash::json(&("habitability", &p.habitability, &e.overrides.barriers, &e.overrides.sites, &e.overrides.fertility)));
     let h8 = hash::combine(h7, hash::json(&("states", &p.states, &e.overrides.states)));
     let h9 = hash::combine(h8, hash::json(&("provinces", &p.provinces, &e.overrides.provinces, &e.imports.provinces)));
-    let h10 = hash::combine(h9, hash::json(&("cultures", &p.cultures)));
+    let h10 = hash::combine(h9, hash::json(&("cultures", &p.cultures, &e.overrides.bands, &e.overrides.attraction)));
     let h = [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10];
     // Fold in the model versions, preserving the chain (a version bump in one
     // step invalidates every later step too).

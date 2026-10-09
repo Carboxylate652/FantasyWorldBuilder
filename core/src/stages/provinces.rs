@@ -12,6 +12,10 @@
 //!   band-specific size. Large lakes become lake provinces; small lakes join
 //!   the land province around them.
 //! - Province paint moves cells to the province under the stroke's start.
+//! - Map editor: merges join the province under a drag's start to the one
+//!   under its end (an island to the coast across a strait, say); a province
+//!   can be moved to the state under a drag's end; renames replace generated
+//!   names; the goods editor sets trade goods and adds or removes deposits.
 //! - An imported provinces.png replaces all of this: each cell takes its
 //!   province by majority pixel vote, and provinces join the state they overlap most.
 //!
@@ -206,6 +210,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         (label, count)
     };
     let mut label = label;
+    let mut count = count;
     let from_import = defs.is_some();
 
     // Small lakes join the land province around them.
@@ -230,6 +235,46 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         if !changed {
             break;
         }
+    }
+
+    // Map editor: merge the province under each drag's start into the one under its end.
+    let at = |label: &[u32], p: [f64; 2]| label[g.nearest(Vec3::from_lat_lon_deg(p[0], p[1]), None)];
+    let mut merged = 0usize;
+    // The cell under each merge's end: the merged province keeps that cell's state.
+    let mut merge_ends: Vec<usize> = Vec::new();
+    for s in &ctx.edits.overrides.provinces {
+        if s.tool != Tool::ProvinceMerge || s.points.len() < 2 {
+            continue;
+        }
+        let end = *s.points.last().unwrap();
+        let (a, b) = (at(&label, s.points[0]), at(&label, end));
+        if a != NONE && b != NONE && a != b {
+            label.iter_mut().filter(|x| **x == a).for_each(|x| *x = b);
+            merged += 1;
+            merge_ends.push(g.nearest(Vec3::from_lat_lon_deg(end[0], end[1]), None));
+        }
+    }
+    if merged > 0 {
+        let mut map = vec![NONE; count];
+        let mut next = 0u32;
+        for x in label.iter_mut().filter(|x| **x != NONE) {
+            let m = &mut map[*x as usize];
+            if *m == NONE {
+                *m = next;
+                next += 1;
+            }
+            *x = *m;
+        }
+        if let Some(d) = defs.take() {
+            let mut nd: Vec<Option<crate::province_import::Def>> = vec![None; next as usize];
+            for (k, &m) in map.iter().enumerate() {
+                if m != NONE && nd[m as usize].is_none() {
+                    nd[m as usize] = Some(d[k].clone());
+                }
+            }
+            defs = Some(nd.into_iter().map(|x| x.unwrap()).collect());
+        }
+        count = next as usize;
     }
 
     // ------------------------------------------------------------ aggregate
@@ -324,7 +369,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         center: Vec3,
         terrain: u8,
     }
-    let provs: Vec<Prov> = agg
+    let mut provs: Vec<Prov> = agg
         .iter()
         .map(|a| {
             let k = argmax_f(&a.kinds) as u8;
@@ -340,6 +385,32 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             }
         })
         .collect();
+
+    // Map editor: a merged province stays in the state of the province it was
+    // dragged onto; a moved province joins the state under the drag's end.
+    let up_region = ctx.input.u16("region");
+    for &c in &merge_ends {
+        let p = label[c];
+        if p != NONE && state[c] > 0 && matches!(provs[p as usize].kind, kind::LAND | kind::WASTELAND) {
+            provs[p as usize].state = state[c];
+            provs[p as usize].region = up_region[c];
+        }
+    }
+    let mut moved_to_state = 0usize;
+    for s in &ctx.edits.overrides.provinces {
+        if s.tool != Tool::ProvinceToState || s.points.len() < 2 {
+            continue;
+        }
+        let p = at(&label, s.points[0]);
+        let end = *s.points.last().unwrap();
+        let c = g.nearest(Vec3::from_lat_lon_deg(end[0], end[1]), None);
+        if p == NONE || state[c] == 0 || !matches!(provs[p as usize].kind, kind::LAND | kind::WASTELAND) {
+            continue;
+        }
+        provs[p as usize].state = state[c];
+        provs[p as usize].region = up_region[c];
+        moved_to_state += 1;
+    }
 
     // Resource signals, rainfall, rivers and springs per province.
     let stress = ctx.input.f32("stress");
@@ -504,6 +575,42 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             },
             _ => w,
         };
+    }
+
+    // Map editor renames.
+    let mut renamed = vec![false; count];
+    for s in &ctx.edits.overrides.provinces {
+        if s.tool == Tool::RenameProvince && !s.points.is_empty() && !s.name.trim().is_empty() {
+            let p = at(&label, s.points[0]);
+            if p != NONE {
+                pnames[p as usize] = s.name.trim().to_string();
+                renamed[p as usize] = true;
+            }
+        }
+    }
+    // Goods editor: per province, a trade good to force and deposits to add or remove.
+    let mut good_set: Vec<Option<u8>> = vec![None; count];
+    let mut deposit_ops: Vec<Vec<(bool, usize)>> = vec![Vec::new(); count];
+    let mut goods_scratch = Vec::new();
+    for s in &ctx.edits.overrides.provinces {
+        if s.tool != Tool::GoodsPaint {
+            continue;
+        }
+        let mut hit: Vec<u32> = stroke_coverage(g, s, r_km, &mut goods_scratch).into_iter().filter(|x| x.1 >= 0.5).map(|x| label[x.0 as usize]).filter(|&l| l != NONE).collect();
+        if let Some(p) = s.points.first() {
+            hit.push(at(&label, *p));
+        }
+        hit.sort_unstable();
+        hit.dedup();
+        let v = s.value.round() as i64;
+        for p in hit.into_iter().filter(|&p| p != NONE).map(|p| p as usize) {
+            match v {
+                1..=14 => good_set[p] = Some(v as u8),
+                101..=106 => deposit_ops[p].push((true, (v - 101) as usize)),
+                201..=206 => deposit_ops[p].push((false, (v - 201) as usize)),
+                _ => {}
+            }
+        }
     }
 
     // ------------------------------------------------------------ fields
@@ -686,6 +793,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "coastal": a.coastal,
             "center": deg(pr.center),
             "neighbors": neighbors[p],
+            "renamed": renamed[p],
         });
         let s = &sig[p];
         good[p] = 0;
@@ -694,8 +802,19 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             let fish = super::resources::sea_fish(seed, ids[p], pr.band, s.abs_lat);
             j["resources"] = serde_json::json!(if fish { vec!["fish"] } else { vec![] });
         } else if pr.kind == kind::LAND || pr.kind == kind::WASTELAND {
-            let dep = super::resources::deposits(seed, ids[p], s);
-            let tg = if pr.kind == kind::LAND { super::resources::trade_good(pr.terrain, s, &dep) } else { "none" };
+            let mut dep = super::resources::deposits(seed, ids[p], s);
+            for &(add, k) in &deposit_ops[p] {
+                let d = super::resources::DEPOSITS[k];
+                dep.retain(|x| *x != d);
+                if add {
+                    dep.push(d);
+                }
+            }
+            let tg = match good_set[p] {
+                Some(v) => super::resources::TRADE_GOODS[v as usize - 1],
+                None if pr.kind == kind::LAND => super::resources::trade_good(pr.terrain, s, &dep),
+                None => "none",
+            };
             good[p] = super::resources::good_index(tg);
             j["trade_good"] = serde_json::json!(tg);
             j["resources"] = serde_json::json!(dep);
@@ -743,6 +862,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "split_on_grid": split_on_grid,
             "borders": by_type,
             "painted_cells": painted,
+            "merged_by_editor": merged,
+            "moved_to_state": moved_to_state,
             "import": import_info,
             "table": {
                 "provinces": provinces_json,

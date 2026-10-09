@@ -3,6 +3,15 @@
 //! Cultures are not assigned: they emerge from an agent simulation on the
 //! province graph.
 //!
+//! - **Founders:** by default *Founding bands* bands start in random fertile
+//!   provinces, each with its own traits. Founding-band pins replace them: a
+//!   pin starts its number of bands in its province, all with the same
+//!   traits (one people), so a large pin gives a major origin and a small one
+//!   a minor one.
+//! - **Attraction** (a brush, −1 to +1) acts on the simulation alone: an
+//!   attractive province holds up to 5× the people and draws new bands and
+//!   migrants (a metropolis); a repellent one holds as few as none and is
+//!   shunned (a ghost town). Site pins still set their own population.
 //! - **Bands** are groups of people with a home province, a population, a
 //!   vector of cultural traits (Axelrod's model) and an empty polity slot that
 //!   Stage 4 will fill.
@@ -76,6 +85,8 @@ struct Prov {
     name: String,
     /// Mean of habitability^1.5 over the province's cells.
     cap_factor: f64,
+    /// Renamed in the map editor: keeps its name.
+    renamed: bool,
     rain: f64,
     river: bool,
     site: f64,
@@ -231,6 +242,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 continent: (p["continent"].as_u64().unwrap_or(1) as u32).saturating_sub(1),
                 name: p["name"].as_str().unwrap_or("").to_string(),
                 cap_factor: p["capacity_factor"].as_f64().unwrap_or_else(|| p["habitability"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0).powf(1.5)),
+                renamed: p["renamed"].as_bool().unwrap_or(false),
                 rain: p["rain_mm"].as_f64().unwrap_or(1000.0),
                 river: p["river"].as_bool().unwrap_or(false),
                 site: p["site"].as_f64().unwrap_or(0.0),
@@ -260,6 +272,34 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let mut capacity = base_capacity.clone();
     // Site pins: the province holding each pin and the population it should reach.
     let prov_field = ctx.input.u32("province");
+    // Attraction paint, per cell and as a mean per province.
+    let mut attr_cell = vec![0.0f32; ctx.grid.len()];
+    let mut attr = vec![0.0f64; np];
+    if !ctx.edits.overrides.attraction.is_empty() {
+        let mut scratch = Vec::new();
+        for s in &ctx.edits.overrides.attraction {
+            for (c, w) in crate::edits::stroke_coverage(ctx.grid, s, r_km, &mut scratch) {
+                let c = c as usize;
+                match s.tool {
+                    crate::edits::Tool::Attraction => attr_cell[c] = (attr_cell[c] + (s.value.clamp(-1.0, 1.0) * w as f64) as f32).clamp(-1.0, 1.0),
+                    crate::edits::Tool::AttractionErase => attr_cell[c] *= 1.0 - w,
+                    _ => {}
+                }
+            }
+        }
+        let mut cells = vec![0u32; np];
+        for (i, id) in prov_field.iter().enumerate() {
+            if let Some(&p) = index.get(id) {
+                attr[p] += attr_cell[i] as f64;
+                cells[p] += 1;
+            }
+        }
+        for p in 0..np {
+            attr[p] /= cells[p].max(1) as f64;
+        }
+    }
+    // Capacity multiplier: ×5 at +1, ×0 at −1.
+    let pull: Vec<f64> = attr.iter().map(|&a| if a >= 0.0 { 1.0 + 4.0 * a } else { (1.0 + a).powi(2) }).collect();
     let mut pin_pop = vec![0.0f64; np];
     for pin in ctx.input.meta("sites")["pins"].as_array().unwrap_or(&empty) {
         let cell = pin["cell"].as_u64().unwrap_or(0) as usize;
@@ -311,7 +351,30 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     // ------------------------------------------------------------ initial bands
     let mut rng = Rng::new(seed, stream::CULTURES);
     let mut bands = Bands::default();
-    {
+    let mut founders = Vec::new();
+    let deg = |v: Vec3| {
+        let (la, lo) = v.lat_lon();
+        [(la.to_degrees() * 100.0).round() / 100.0, (lo.to_degrees() * 100.0).round() / 100.0]
+    };
+    let pins: Vec<&crate::edits::Stroke> = ctx.edits.overrides.bands.iter().filter(|s| s.tool == crate::edits::Tool::BandPin && !s.points.is_empty()).collect();
+    for pin in &pins {
+        let pt = pin.points[0];
+        let cell = ctx.grid.nearest(Vec3::from_lat_lon_deg(pt[0], pt[1]), None);
+        // The pin's province, or the nearest land province with room if it sits on water or ice.
+        let here = prov_field.get(cell).and_then(|id| index.get(id)).copied().filter(|&p| capacity[p] > 0.0);
+        let p = here.or_else(|| {
+            let v = Vec3::from_lat_lon_deg(pt[0], pt[1]);
+            (0..np).filter(|&q| capacity[q] > 0.0).min_by(|&a, &b| v.angle_to(provs[a].center).partial_cmp(&v.angle_to(provs[b].center)).unwrap())
+        });
+        let Some(p) = p else { continue };
+        let tr: Vec<u8> = (0..nt).map(|_| rng.below(nv as usize) as u8).collect();
+        let k = (pin.value.round() as usize).clamp(1, 200);
+        for _ in 0..k {
+            bands.push(p as u32, (0.5 * split_pop).min(0.5 * capacity[p]).max(1.0), &tr, 0);
+        }
+        founders.push(serde_json::json!({ "lat": pt[0], "lon": pt[1], "province": provs[p].id, "bands": k, "pinned": true }));
+    }
+    if pins.is_empty() {
         let mut order: Vec<(f64, usize)> = (0..np)
             .filter(|&p| capacity[p] > 0.0 && provs[p].kind == kind::LAND)
             .map(|p| (-hash_unit(seed, stream::CULTURES, p as u64).max(1e-12).ln() / capacity[p], p))
@@ -320,6 +383,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         for &(_, p) in order.iter().take(cp.initial_bands.max(1) as usize) {
             let tr: Vec<u8> = (0..nt).map(|_| rng.below(nv as usize) as u8).collect();
             bands.push(p as u32, (0.5 * split_pop).min(0.5 * capacity[p]), &tr, 0);
+            let ll = deg(provs[p].center);
+            founders.push(serde_json::json!({ "lat": ll[0], "lon": ll[1], "province": provs[p].id, "bands": 1, "pinned": false }));
         }
     }
 
@@ -375,6 +440,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                     }
                     k = k.max(irr);
                 }
+                k *= pull[p];
                 if era >= 3 && pin_pop[p] > 0.0 {
                     k = k.max(pin_pop[p]);
                     why[p] |= 8;
@@ -448,7 +514,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 let q = q as usize;
                 let room = capacity[q] - pnow[q];
                 if room > 0.0 && q != p {
-                    let s = room * (-(c as f64) / scale).exp() * (0.5 + 0.5 * rng.f64());
+                    let s = room * (-(c as f64) / scale).exp() * (0.5 + 0.5 * rng.f64()) * (1.0 + attr[q]);
                     if s > any.0 {
                         any = (s, q);
                     }
@@ -675,6 +741,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     // The culture that names each land province (0 = keeps its Stage 2 name).
     let namer: Vec<u32> = (0..np)
         .map(|p| match provs[p].kind {
+            _ if provs[p].renamed => 0,
             kind::LAND | kind::WASTELAND if prov_major[p] > 0 => prov_major[p],
             kind::LAND | kind::WASTELAND => state_major.get(&provs[p].state).copied().unwrap_or(0),
             _ => 0,
@@ -703,7 +770,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     for s in table["states"].as_array().unwrap_or(&empty) {
         let sid = s["id"].as_u64().unwrap_or(0) as u16;
         let cap = s["capital_province"].as_u64().and_then(|c| index.get(&(c as u32))).copied();
-        let name = cap.filter(|&p| namer[p] > 0).map(|p| prov_names[p].trim_end_matches(" Desert").trim_end_matches(" Peaks").trim_end_matches(" Ice").to_string());
+        let name = cap.filter(|&p| namer[p] > 0 && !s["renamed"].as_bool().unwrap_or(false)).map(|p| prov_names[p].trim_end_matches(" Desert").trim_end_matches(" Peaks").trim_end_matches(" Ice").to_string());
         states_json.push(serde_json::json!({
             "id": sid,
             "name": name.unwrap_or_else(|| s["name"].as_str().unwrap_or("").to_string()),
@@ -761,6 +828,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 "id": provs[p].id, "name": prov_names[p], "population": total.round(),
                 "density_km2": (total / provs[p].area.max(1.0) * 100.0).round() / 100.0,
                 "culture": prov_major[p], "shares": shares, "growth": growth,
+                "attraction": (attr[p] * 100.0).round() / 100.0,
             })
         })
         .collect();
@@ -811,6 +879,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     f.put("culture", Field::U16(f_cult));
     f.put("culture_group", Field::U16(f_group));
     f.put("population", Field::F32(f_pop));
+    f.put("attraction", Field::F32(attr_cell));
     StepOutput {
         fields: f,
         meta: serde_json::json!({
@@ -827,6 +896,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "years": year(ticks),
             "checks": checks,
             "desert_towns": n_desert_towns,
+            "founders": founders,
             "desert_towns_by_cause": desert_towns,
             "table": {
                 "cultures": cultures_json,
@@ -1223,6 +1293,7 @@ fn empty_output(n: usize) -> StepOutput {
     f.put("culture", Field::U16(vec![0; n]));
     f.put("culture_group", Field::U16(vec![0; n]));
     f.put("population", Field::F32(vec![0.0; n]));
+    f.put("attraction", Field::F32(vec![0.0; n]));
     StepOutput {
         fields: f,
         meta: serde_json::json!({ "cultures": 0, "groups": 0, "bands": 0, "population": 0, "table": { "cultures": [], "groups": [], "events": [], "provinces": [], "states": [] } }),

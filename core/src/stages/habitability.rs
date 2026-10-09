@@ -11,6 +11,11 @@
 //! value raises habitability in a few cells, so Stage 2 cuts a small, dense
 //! province around it. Site pins place towns no model explains.
 //!
+//! Fertility paint: the user's own fertile (+) or barren (−) land, added to
+//! habitability (0–1) wherever it is painted. Without paint, habitability is
+//! the climate's alone. It shapes state and province seeding and sizes, and
+//! where people live.
+//!
 //! The barrier field is the extra cost of crossing a cell when states and
 //! provinces grow: ridge crests, high ground, border rivers, deep desert, ice and
 //! marsh. Rivers play one of two roles: a wide river through fertile land is a
@@ -199,6 +204,27 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     }
     springs.sort_by(|a, b| b["site"].as_f64().partial_cmp(&a["site"].as_f64()).unwrap());
 
+    // ---- fertility paint
+    let mut fert = vec![0.0f32; n];
+    let mut fert_scratch = Vec::new();
+    for s in &ctx.edits.overrides.fertility {
+        for (c, w) in stroke_coverage(g, s, r_km, &mut fert_scratch) {
+            let c = c as usize;
+            match s.tool {
+                Tool::FertilityPaint => fert[c] = (fert[c] + (s.value.clamp(-1.0, 1.0) * w as f64) as f32).clamp(-1.0, 1.0),
+                Tool::FertilityErase => fert[c] *= 1.0 - w,
+                _ => {}
+            }
+        }
+    }
+    let mut fertility_cells = 0usize;
+    for i in 0..n {
+        if land(i) && fert[i] != 0.0 {
+            hab[i] = (hab[i] + fert[i]).clamp(0.0, 1.0);
+            fertility_cells += 1;
+        }
+    }
+
     // Regional dry habitability and rainfall (a few rings), used to decide each river's role.
     let mut regional = dry.clone();
     let mut regional_p: Vec<f32> = (0..n).map(|i| if land(i) { p_ann[i] } else { 0.0 }).collect();
@@ -344,6 +370,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     f.put("groundwater", Field::F32(gw.iter().map(|&x| x as f32).collect()));
     f.put("site", Field::F32(site));
     f.put("site_kind", Field::U8(kind_of));
+    f.put("fertility", Field::F32(fert));
     StepOutput {
         fields: f,
         meta: serde_json::json!({
@@ -354,6 +381,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             "backbone_river_km": backbone_km,
             "painted_cells": painted,
             "springs": springs.len(),
+            "fertility_cells": fertility_cells,
             "sites": { "springs": springs, "pins": pins },
         }),
     }

@@ -18,7 +18,10 @@ export type Param = {
 export type ToolId =
   | 'navigate' | 'land' | 'sea' | 'mountain' | 'erase_hint' | 'scatter_land' | 'scatter_sea' | 'scatter_mountain' | 'pin' | 'arrow' | 'plate_paint'
   | 'raise' | 'lower' | 'smooth' | 'flatten' | 'biome_paint' | 'biome_erase'
-  | 'barrier_paint' | 'barrier_erase' | 'site_pin' | 'state_paint' | 'province_paint';
+  | 'barrier_paint' | 'barrier_erase' | 'site_pin' | 'state_paint' | 'province_paint'
+  | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase'
+  | 'attraction' | 'attraction_erase'
+  | 'goods_paint' | 'province_merge' | 'state_merge' | 'province_to_state' | 'rename_province' | 'rename_state';
 
 export type ToolDef = {
   id: ToolId;
@@ -27,7 +30,11 @@ export type ToolDef = {
   step: string; // step the edit belongs to (auto-run target)
   rust?: string; // core Tool name when it differs from the id
   scatter?: boolean; // noisy natural edge (scatter brush)
-  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people';
+  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people' | 'fertility' | 'bands' | 'goods' | 'attraction';
+  /** Click (or drag from a start to an end point) instead of painting with a brush. */
+  gesture?: 'point' | 'link';
+  /** Asks for a name when used. */
+  rename?: boolean;
   defaultValue?: number;
   hint: string;
 };
@@ -53,9 +60,27 @@ export const TOOLS: ToolDef[] = [
   { id: 'barrier_paint', label: 'Add barrier', key: 'k', step: 'habitability', value: 'barrier', defaultValue: 6, hint: 'Make land costly to cross, so state and province borders follow your stroke.' },
   { id: 'barrier_erase', label: 'Remove barrier', step: 'habitability', hint: 'Remove barriers under the brush, including border rivers.' },
   { id: 'site_pin', label: 'Site pin', key: 't', step: 'habitability', value: 'people', defaultValue: 50000, hint: 'Click to place a town no model explains (a gambling city, an oil port). It becomes habitable land and, in the last culture era, holds this many people.' },
+  { id: 'fertility_paint', label: 'Fertile land', key: 'i', step: 'habitability', value: 'fertility', defaultValue: 0.5, hint: 'Paint fertile (+) or barren (−) land. It adds to habitability, so states and provinces form, and people settle, where you paint. Without paint, habitability alone is used.' },
+  { id: 'fertility_erase', label: 'Erase fertility', step: 'habitability', hint: 'Remove fertility paint under the brush.' },
+  { id: 'band_pin', label: 'Founding band', key: 'j', step: 'cultures', gesture: 'link', value: 'bands', defaultValue: 3, hint: 'Click to place a founding people with this many bands (all one culture): more bands give a bigger head start. Drag from a pin to move it. Pins replace the random founders.' },
+  { id: 'band_erase', label: 'Remove founder', step: 'cultures', gesture: 'point', hint: 'Click near a founding-band pin to remove it.' },
+  { id: 'attraction', label: 'Attraction', key: 'h', step: 'cultures', value: 'attraction', defaultValue: 0.8, hint: 'Paint where people are drawn (+, up to 5× as many: a metropolis) or driven away (−, down to none: a ghost town) during the culture simulation. States and provinces stay as they are.' },
+  { id: 'attraction_erase', label: 'Erase attraction', step: 'cultures', hint: 'Remove attraction paint under the brush.' },
+  { id: 'goods_paint', label: 'Paint goods', key: 'q', step: 'provinces', value: 'goods', defaultValue: 1, hint: 'Provinces under the brush get this trade good, or gain or lose a deposit.' },
+  { id: 'province_merge', label: 'Merge provinces', key: 'u', step: 'provinces', gesture: 'link', hint: 'Drag from a province (an island, a sliver) onto the province that should absorb it.' },
+  { id: 'state_merge', label: 'Merge states', step: 'states', gesture: 'link', hint: 'Drag from a state onto the state that should absorb it.' },
+  { id: 'province_to_state', label: 'Province → state', step: 'provinces', gesture: 'link', hint: 'Drag from a province into the state it should belong to.' },
+  { id: 'rename_province', label: 'Rename province', step: 'provinces', gesture: 'point', rename: true, hint: 'Click a province and type its new name. Culture names will not replace it.' },
+  { id: 'rename_state', label: 'Rename state', step: 'states', gesture: 'point', rename: true, hint: 'Click a state and type its new name. Culture names will not replace it.' },
   { id: 'state_paint', label: 'Grow state', key: 'e', step: 'states', hint: 'Start the stroke inside a state, then paint: every land cell you cover joins that state.' },
   { id: 'province_paint', label: 'Grow province', key: 'o', step: 'provinces', hint: 'Start inside a province, then paint over its neighbours in the same state.' },
 ];
+
+/** Map editor (top bar): province, state and goods tools, available whatever step is open. */
+export const EDITOR_TOOLS: ToolId[] = ['province_merge', 'state_merge', 'province_to_state', 'province_paint', 'state_paint', 'rename_province', 'rename_state', 'goods_paint'];
+
+/** Last step of each stage (the stage buttons run up to it). */
+export const STAGE_ENDS = [{ stage: 1, step: 'biomes' }, { stage: 2, step: 'provinces' }, { stage: 3, step: 'cultures' }];
 
 /** Index of the first Stage 2 step. */
 export const STAGE2_START = 7;
@@ -194,8 +219,8 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'states', title: 'States', layer: 'states', tools: ['state_paint'],
-    blurb: 'Seeds weighted by habitability grow together; borders settle on barriers, and small islands join the state across the shortest strait. States form regions and continents.',
+    key: 'states', title: 'States', layer: 'states', tools: ['fertility_paint', 'fertility_erase', 'state_paint'],
+    blurb: 'Seeds weighted by habitability grow together; borders settle on barriers, and small islands join the state across the shortest strait. States form regions and continents. Paint fertile or barren land to steer where states, provinces and people go.',
     params: [
       p('states', 'state_area_km2', 'Mean state area (km²)', 10000, 2000000, 1000),
       p('states', 'min_state_area_km2', 'Minimum state area (km²)', 0, 500000, 1000),
@@ -230,7 +255,7 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'cultures', title: 'Cultures', layer: 'cultures', tools: [],
+    key: 'cultures', title: 'Cultures', layer: 'cultures', tools: ['band_pin', 'band_erase', 'attraction', 'attraction_erase'],
     blurb: 'Bands of people spread over the provinces, grow, split and meet. Contact makes them alike, isolation and drift make them differ; where contact stays rare, cultures split. Groups are cultures that stay in touch.',
     params: [
       p('cultures', 'ticks', 'Generations', 20, 2000, 10, 'One generation is a tick of the simulation.'),

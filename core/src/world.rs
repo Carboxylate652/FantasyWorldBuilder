@@ -5,7 +5,7 @@
 //! ```text
 //! world.json            seed, parameters, step cache keys and metadata
 //! sketch.json           continent sketch strokes, plate pins, motion arrows
-//! overrides/*.json      user edit layers (plates, elevation, biomes, barriers, sites, states, provinces)
+//! overrides/*.json      user edit layers (plates, elevation, biomes, barriers, sites, fertility, states, provinces, bands, attraction)
 //! imports.json          files that replace a stage result (e.g. an edited heightmap)
 //! fields/<step>/*.bin   one little-endian binary file per field
 //! export/               the Paradox-style map package
@@ -166,6 +166,9 @@ impl World {
         write_json(&dir.join("overrides").join("states.json"), &self.edits.overrides.states)?;
         write_json(&dir.join("overrides").join("provinces.json"), &self.edits.overrides.provinces)?;
         write_json(&dir.join("overrides").join("sites.json"), &self.edits.overrides.sites)?;
+        write_json(&dir.join("overrides").join("fertility.json"), &self.edits.overrides.fertility)?;
+        write_json(&dir.join("overrides").join("bands.json"), &self.edits.overrides.bands)?;
+        write_json(&dir.join("overrides").join("attraction.json"), &self.edits.overrides.attraction)?;
         write_json(&dir.join("imports.json"), &self.edits.imports)?;
         Ok(())
     }
@@ -185,6 +188,9 @@ impl World {
             states: read_json(&dir.join("overrides").join("states.json")).unwrap_or_default(),
             provinces: read_json(&dir.join("overrides").join("provinces.json")).unwrap_or_default(),
             sites: read_json(&dir.join("overrides").join("sites.json")).unwrap_or_default(),
+            fertility: read_json(&dir.join("overrides").join("fertility.json")).unwrap_or_default(),
+            bands: read_json(&dir.join("overrides").join("bands.json")).unwrap_or_default(),
+            attraction: read_json(&dir.join("overrides").join("attraction.json")).unwrap_or_default(),
         };
         let mut w = World::new(params);
         let imports = read_json(&dir.join("imports.json")).unwrap_or_default();
