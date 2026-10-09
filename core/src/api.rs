@@ -5,6 +5,8 @@ use crate::edits::{EditLayer, Edits, MotionArrow, PlatePin, Stroke};
 use crate::export::{export, ExportOptions};
 use crate::fields::Field;
 use crate::params::WorldParams;
+use crate::stages::cultures::CultureSim;
+use crate::stages::nations::NationSim;
 use crate::stages::{climate, Step, STEPS};
 use crate::world::World;
 use serde_json::{json, Value};
@@ -31,6 +33,92 @@ pub struct Session {
     undo: Vec<Edits>,
     redo: Vec<Edits>,
     pub dirty: bool,
+    /// A Stage 3 or 4 simulation running step by step.
+    pub live: Option<Live>,
+}
+
+pub enum LiveSim {
+    Cultures(Box<CultureSim>),
+    Nations(Box<NationSim>),
+}
+
+/// A live simulation and what it was started from, so a commit can tell
+/// whether its result is still the one a fresh run would give.
+pub struct Live {
+    pub sim: LiveSim,
+    step: Step,
+    upstream_hash: u64,
+    inputs: Value,
+    millis: u64,
+    cache: Option<(Value, crate::fields::Fields)>,
+}
+
+impl Live {
+    pub fn stage(&self) -> &'static str {
+        self.step.key()
+    }
+
+    pub fn done(&self) -> bool {
+        match &self.sim {
+            LiveSim::Cultures(c) => c.done(),
+            LiveSim::Nations(n) => n.done(),
+        }
+    }
+
+    /// Where the run stands: the next generation (Stage 3) or year (Stage 4).
+    pub fn position(&self) -> i64 {
+        match &self.sim {
+            LiveSim::Cultures(c) => c.t as i64,
+            LiveSim::Nations(n) => n.year as i64,
+        }
+    }
+
+    fn step_once(&mut self, progress: &dyn Fn(f32, &str)) {
+        let t0 = std::time::Instant::now();
+        match &mut self.sim {
+            LiveSim::Cultures(c) => c.tick(progress),
+            LiveSim::Nations(n) => n.step(progress),
+        }
+        self.millis += t0.elapsed().as_millis() as u64;
+        self.cache = None;
+    }
+
+    /// Era label at the current position (stepping "to the next era" stops when it changes).
+    fn era(&self) -> String {
+        match &self.sim {
+            LiveSim::Cultures(c) => format!("{}", c.era_of(c.t.min(c.ticks().saturating_sub(1)))),
+            LiveSim::Nations(n) => n.era().to_string(),
+        }
+    }
+
+    pub fn snapshot(&mut self) -> &(Value, crate::fields::Fields) {
+        if self.cache.is_none() {
+            let (mut v, f) = match &self.sim {
+                LiveSim::Cultures(c) => c.snapshot(),
+                LiveSim::Nations(n) => n.snapshot(),
+            };
+            v["done"] = json!(self.done());
+            v["position"] = json!(self.position());
+            self.cache = Some((v, f));
+        }
+        self.cache.as_ref().unwrap()
+    }
+
+    fn info(&self) -> Value {
+        let (pos, end, unit) = match &self.sim {
+            LiveSim::Cultures(c) => (c.t as i64, c.ticks() as i64, "generation"),
+            LiveSim::Nations(n) => (n.year as i64, n.end_year() as i64, "year"),
+        };
+        json!({ "stage": self.stage(), "position": pos, "end": end, "unit": unit, "done": self.done() })
+    }
+}
+
+/// The inputs a live run depends on besides upstream steps and its directives.
+fn live_inputs(w: &World, step: Step) -> Value {
+    match step {
+        Step::Cultures => json!([w.params.cultures, w.edits.overrides.bands, w.edits.overrides.attraction]),
+        _ => json!([w.params.nations]),
+    }
 }
 
 impl Default for Session {
@@ -41,7 +129,7 @@ impl Default for Session {
 
 impl Session {
     pub fn new(params: WorldParams) -> Session {
-        Session { world: World::new(params), path: None, undo: vec![], redo: vec![], dirty: false }
+        Session { world: World::new(params), path: None, undo: vec![], redo: vec![], dirty: false, live: None }
     }
 
     fn snapshot(&mut self) {
@@ -84,6 +172,7 @@ impl Session {
             "can_undo": !self.undo.is_empty(),
             "can_redo": !self.redo.is_empty(),
             "dirty": self.dirty,
+            "live": self.live.as_ref().map(|l| l.info()),
         })
     }
 }
@@ -115,6 +204,19 @@ fn layer_list(w: &World, names: Option<Vec<String>>) -> Result<Vec<EditLayer>, S
         Some(v) => v.iter().map(|k| EditLayer::from_key(k).ok_or(format!("unknown layer `{k}`"))).collect(),
         None => Ok(EditLayer::ALL.into_iter().filter(|&l| w.edits.count(l) > 0).collect()),
     }
+}
+
+fn live_unit_is_year(sim: &LiveSim) -> bool {
+    matches!(sim, LiveSim::Nations(_))
+}
+
+/// The live simulation's summary (for the UI and the AI guide) and the session status.
+fn sim_state(s: &mut Session) -> Result<Reply, String> {
+    let live = s.live.as_mut().ok_or("no live simulation")?;
+    let summary = live.snapshot().0.clone();
+    let mut st = s.status();
+    st["sim"] = summary;
+    Ok(Reply::Json(st))
 }
 
 fn arg<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, String> {
@@ -226,6 +328,12 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 }
                 return Ok(Reply::Bytes(field_bytes(&Field::F32(v), stale, step, None, n)));
             }
+            if let Some(live) = s.live.as_mut() {
+                let step = live.step;
+                if let Some(f) = live.snapshot().1.get(&name) {
+                    return Ok(Reply::Bytes(field_bytes(f, false, step, month, n)));
+                }
+            }
             match s.world.field(&name) {
                 Some((f, step, stale)) => Ok(Reply::Bytes(field_bytes(f, stale, step, month, n))),
                 None => Err(format!("field `{name}` is not available")),
@@ -277,6 +385,19 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                         Field::U16(v) if v.len() == n => json!(v[cell]),
                         Field::U32(v) if v.len() == n => json!(v[cell]),
                         Field::I32(v) if v.len() == n => json!(v[cell]),
+                        _ => continue,
+                    };
+                    out.insert(name.clone(), v);
+                }
+            }
+            // A live simulation's values shadow the committed ones.
+            if let Some(live) = s.live.as_mut() {
+                for (name, f) in &live.snapshot().1 .0 {
+                    let v = match f {
+                        Field::F32(v) if v.len() == n => json!(v[cell]),
+                        Field::U8(v) if v.len() == n => json!(v[cell]),
+                        Field::U16(v) if v.len() == n => json!(v[cell]),
+                        Field::U32(v) if v.len() == n => json!(v[cell]),
                         _ => continue,
                     };
                     out.insert(name.clone(), v);
@@ -436,10 +557,21 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                     t["culture_groups"] = c["groups"].clone();
                     t["culture_events"] = c["events"].clone();
                 }
+                if s.world.is_fresh(Step::Nations) {
+                    if let Some(nm) = pick(Step::Nations) {
+                        t["nations"] = nm["nations"].clone();
+                        t["nation_events"] = nm["events"].clone();
+                        t["railways"] = nm["railways"].clone();
+                        t["city_pins"] = nm["pins"].clone();
+                        t["cities"] = nm["cities"].clone();
+                    }
+                }
             }
             Ok(Reply::Json(t))
         }
         "undo" | "redo" => {
+            // A live run cannot take back what it already simulated: undo ends it.
+            s.live = None;
             let (from, to) = if cmd == "undo" { (&mut s.undo, &mut s.redo) } else { (&mut s.redo, &mut s.undo) };
             if let Some(e) = from.pop() {
                 to.push(std::mem::replace(&mut s.world.edits, e));
@@ -509,6 +641,150 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             Ok(Reply::Json(serde_json::to_value(res?).unwrap()))
         }
         "fingerprint" => Ok(Reply::Json(json!(s.world.fingerprint()))),
+        "sim_actions" => {
+            // The directives a stage offers (also the AI guide's tools).
+            let stage: String = arg(&args, "stage")?;
+            Ok(Reply::Json(json!(crate::directives::actions_for(&stage).iter().map(|a| json!({ "name": a.name, "description": a.description, "schema": a.schema })).collect::<Vec<_>>())))
+        }
+        "sim_start" => {
+            // { stage: "cultures" | "nations" }: earlier steps are brought up to date first.
+            let stage: String = arg(&args, "stage")?;
+            let step = match stage.as_str() {
+                "cultures" => Step::Cultures,
+                "nations" => Step::Nations,
+                _ => return Err(format!("`{stage}` has no step-by-step simulation (cultures, nations)")),
+            };
+            set_progress(progress, |p| *p = ProgressState { running: true, task: "sim".into(), ..Default::default() });
+            let pr = progress.clone();
+            let sim = s.world.with_ctx(step, &move |st: Step, f: f32, m: &str| set_progress(&pr, |p| {
+                p.step = st.key().into();
+                p.frac = f;
+                p.msg = m.into();
+            }), |ctx| match step {
+                Step::Cultures => CultureSim::new(ctx).map(|c| LiveSim::Cultures(Box::new(c))),
+                _ => NationSim::new(ctx).map(|n| LiveSim::Nations(Box::new(n))),
+            });
+            set_progress(progress, |p| p.running = false);
+            let sim = sim.ok_or("nothing to simulate: no land can hold people")?;
+            let k = step.index();
+            s.live = Some(Live { sim, step, upstream_hash: s.world.expected_hashes()[k - 1], inputs: live_inputs(&s.world, step), millis: 0, cache: None });
+            s.dirty = true;
+            sim_state(s)
+        }
+        "sim_step" => {
+            // { steps?, years?, to?: "era" | "end" } — one step (a generation or
+            // years_per_step years) by default.
+            let live = s.live.as_mut().ok_or("no live simulation; start one first")?;
+            let years: Option<f64> = arg(&args, "years")?;
+            let to: Option<String> = arg(&args, "to")?;
+            let per_step = match &live.sim {
+                LiveSim::Cultures(c) => c.years_per_tick(),
+                LiveSim::Nations(n) => n.years_per_step() as f64,
+            };
+            let mut steps: u64 = arg::<Option<u64>>(&args, "steps")?.unwrap_or(1);
+            if let Some(y) = years {
+                steps = (y / per_step.max(1e-9)).ceil().max(1.0) as u64;
+            }
+            set_progress(progress, |p| *p = ProgressState { running: true, task: "sim".into(), step: live.stage().into(), ..Default::default() });
+            let era0 = live.era();
+            let mut k = 0u64;
+            let pr = progress.clone();
+            let report = move |_f: f32, m: &str| set_progress(&pr, |p| p.msg = m.to_string());
+            while !live.done() {
+                match to.as_deref() {
+                    Some("end") => {}
+                    Some("era") if live.era() != era0 => break,
+                    Some("era") => {}
+                    _ if k >= steps => break,
+                    _ => {}
+                }
+                live.step_once(&report);
+                k += 1;
+                if k % 5 == 0 {
+                    let pos = live.position();
+                    set_progress(progress, |p| {
+                        p.frac = 0.0;
+                        p.msg = format!("{} {}", if live_unit_is_year(&live.sim) { "Year" } else { "Generation" }, pos);
+                    });
+                }
+            }
+            set_progress(progress, |p| p.running = false);
+            sim_state(s)
+        }
+        "sim_state" => sim_state(s),
+        "sim_directive" => {
+            // { action, args, note?, by? }: applies from the next step on, and
+            // is stored with the other directives so re-runs replay it.
+            let live = s.live.as_ref().ok_or("no live simulation; start one first")?;
+            let d = crate::directives::Directive {
+                stage: live.stage().into(),
+                at: live.position(),
+                action: arg(&args, "action")?,
+                args: args.get("args").cloned().unwrap_or(json!({})),
+                note: arg::<Option<String>>(&args, "note")?.unwrap_or_default(),
+                by: arg::<Option<String>>(&args, "by")?.unwrap_or_else(|| "user".into()),
+            };
+            crate::directives::validate(&d)?;
+            if live.done() {
+                return Err("the simulation has reached its end; restart it to steer it".into());
+            }
+            s.snapshot();
+            s.world.edits.overrides.directives.push(d.clone());
+            let live = s.live.as_mut().unwrap();
+            match &mut live.sim {
+                LiveSim::Cultures(c) => c.add_directive(d),
+                LiveSim::Nations(n) => n.add_directive(d),
+            }
+            live.cache = None;
+            sim_state(s)
+        }
+        "sim_commit" => {
+            // Run to the end and keep the result as the step's output.
+            let mut live = s.live.take().ok_or("no live simulation")?;
+            set_progress(progress, |p| *p = ProgressState { running: true, task: "sim".into(), step: live.stage().into(), ..Default::default() });
+            let pr = progress.clone();
+            let report = move |f: f32, m: &str| set_progress(&pr, |p| {
+                p.frac = f;
+                p.msg = m.into();
+            });
+            while !live.done() {
+                live.step_once(&report);
+            }
+            let step = live.step;
+            let k = step.index();
+            // Same inputs as a fresh run (upstream, parameters, edits, directives)? Then keep the result.
+            let fresh_dirs: Vec<crate::directives::Directive> = crate::directives::of_stage(&s.world.edits.overrides.directives, step.key()).into_iter().cloned().collect();
+            let sim_dirs = match &live.sim {
+                LiveSim::Cultures(c) => c.directives().to_vec(),
+                LiveSim::Nations(n) => n.directives().to_vec(),
+            };
+            let same = s.world.expected_hashes()[k - 1] == live.upstream_hash && live_inputs(&s.world, step) == live.inputs && fresh_dirs == sim_dirs;
+            if same {
+                let millis = live.millis;
+                let out = match live.sim {
+                    LiveSim::Cultures(c) => c.finish(&report),
+                    LiveSim::Nations(n) => n.finish(),
+                };
+                s.world.put_step(step, out, millis);
+            } else {
+                let pr = progress.clone();
+                s.world.run_to(step, &move |st: Step, f: f32, m: &str| set_progress(&pr, |p| {
+                    p.step = st.key().into();
+                    p.frac = f;
+                    p.msg = m.into();
+                }));
+            }
+            set_progress(progress, |p| p.running = false);
+            s.dirty = true;
+            let mut st = s.status();
+            st["committed"] = json!(step.key());
+            st["replayed"] = json!(!same);
+            Ok(Reply::Json(st))
+        }
+        "sim_cancel" => {
+            s.live = None;
+            Ok(Reply::Json(s.status()))
+        }
         _ => Err(format!("unknown command `{cmd}`")),
     }
 }

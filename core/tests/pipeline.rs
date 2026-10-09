@@ -589,3 +589,271 @@ fn cash_crops_oil_and_goods_editor() {
     assert!(!o2["resources"].as_array().unwrap().iter().any(|r| r == "oil"));
     assert_eq!(o2["trade_good"], good_before);
 }
+
+#[test]
+fn live_steps_and_directives_match_a_fresh_run() {
+    use std::sync::{Arc, Mutex};
+    use worldcore::api::{handle, ProgressState, Reply, Session};
+    let mut p = small_params(17);
+    p.cultures.ticks = 60;
+    p.nations.start_year = 1300;
+    let session = Mutex::new(Session::new(p.clone()));
+    let progress = Arc::new(Mutex::new(ProgressState::default()));
+    let call = |cmd: &str, args: serde_json::Value| -> serde_json::Value {
+        match handle(&session, &progress, cmd, args) {
+            Ok(Reply::Json(v)) => v,
+            Ok(Reply::Bytes(_)) => serde_json::Value::Null,
+            Err(e) => panic!("{cmd}: {e}"),
+        }
+    };
+    // Stage 3, stepped in uneven chunks with directives along the way.
+    let st = call("sim_start", serde_json::json!({ "stage": "cultures" }));
+    assert_eq!(st["live"]["position"], 0);
+    let region = st["sim"]["cultures"].as_array().map(|_| 1).unwrap_or(1);
+    call("sim_step", serde_json::json!({ "steps": 7 }));
+    call("sim_directive", serde_json::json!({ "action": "catastrophe", "args": { "regions": [region], "severity": 0.6 }, "note": "the great plague" }));
+    let st = call("sim_step", serde_json::json!({ "to": "era" }));
+    let c1 = st["sim"]["cultures"][0]["id"].as_u64().unwrap_or(1);
+    call("sim_directive", serde_json::json!({ "action": "drift", "args": { "culture": c1, "factor": 8.0, "years": 300 } }));
+    call("sim_directive", serde_json::json!({ "action": "settle", "args": { "province": st["sim"]["cultures"][0]["regions"][0]["id"], "bands": 3, "culture": null } }));
+    assert!(handle(&session, &progress, "sim_directive", serde_json::json!({ "action": "war", "args": {} })).is_err(), "Stage 4 action refused in Stage 3");
+    call("sim_step", serde_json::json!({ "years": 230 }));
+    let st = call("sim_commit", serde_json::json!({}));
+    assert_eq!(st["replayed"], false, "the live result is kept");
+    // Stage 4 the same way.
+    let st = call("sim_start", serde_json::json!({ "stage": "nations" }));
+    assert_eq!(st["live"]["position"], 1300);
+    let st = call("sim_step", serde_json::json!({ "years": 120 }));
+    let n1 = st["sim"]["nations"][0]["id"].as_u64().expect("nations formed");
+    let n2 = st["sim"]["nations"][1]["id"].as_u64().unwrap_or(n1);
+    call("sim_directive", serde_json::json!({ "action": "aggression", "args": { "nation": n1, "factor": 4.0, "years": 200 } }));
+    call("sim_directive", serde_json::json!({ "action": "peace", "args": { "nation": n1, "target": n2, "years": 100 } }));
+    call("sim_step", serde_json::json!({ "steps": 33 }));
+    call("sim_directive", serde_json::json!({ "action": "split", "args": { "nation": n1, "culture": null }, "note": "civil war" }));
+    call("sim_directive", serde_json::json!({ "action": "rename", "args": { "nation": n2, "name": "Avalon" } }));
+    let st = call("sim_commit", serde_json::json!({}));
+    assert_eq!(st["replayed"], false);
+    let s = session.lock().unwrap();
+    assert_eq!(s.world.edits.overrides.directives.len(), 7);
+    let applied = s.world.meta(Step::Nations).unwrap()["directives"].as_array().unwrap().clone();
+    assert_eq!(applied.len(), 4);
+    assert!(applied.iter().all(|d| d["applied"] == true), "{applied:?}");
+
+    // A fresh world with the same edits gives the same history.
+    let mut fresh = World::new(p);
+    fresh.edits = s.world.edits.clone();
+    fresh.run_to(Step::Nations, &|_, _, _| {});
+    for step in [Step::Cultures, Step::Nations] {
+        assert!(s.world.is_fresh(step));
+        assert_eq!(fresh.meta(step).unwrap()["table"], s.world.meta(step).unwrap()["table"], "{step:?} table");
+        for (name, f) in &s.world.steps[step.index()].as_ref().unwrap().fields.0 {
+            assert!(fresh.steps[step.index()].as_ref().unwrap().fields.get(name) == Some(f), "{step:?} field {name}");
+        }
+    }
+    let names: Vec<&str> = fresh.meta(Step::Nations).unwrap()["table"]["nations"].as_array().unwrap().iter().filter_map(|n| n["name"].as_str()).collect();
+    assert!(names.contains(&"Avalon"), "rename replayed");
+}
+
+#[test]
+fn nations_are_consistent() {
+    use worldcore::fields::Field;
+    let mut p = small_params(23);
+    p.cultures.ticks = 60;
+    let mut w = World::new(p);
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m = w.meta(Step::Nations).unwrap().clone();
+    let t = &m["table"];
+    let nations = t["nations"].as_array().unwrap();
+    assert!(m["nations"].as_u64().unwrap() >= 3, "nations: {}", m["nations"]);
+    assert!(m["ruled_share"].as_f64().unwrap() > 0.5);
+    // Owners exist and are alive; members agree with the province table; capitals are owned.
+    let alive: std::collections::HashMap<u64, &serde_json::Value> = nations.iter().filter(|n| n["ended"].is_null()).map(|n| (n["id"].as_u64().unwrap(), n)).collect();
+    let mut count: std::collections::HashMap<u64, u64> = Default::default();
+    let mut owner_of: std::collections::HashMap<u64, u64> = Default::default();
+    for p in t["provinces"].as_array().unwrap() {
+        let o = p["owner"].as_u64().unwrap();
+        owner_of.insert(p["id"].as_u64().unwrap(), o);
+        if o > 0 {
+            assert!(alive.contains_key(&o), "province owned by dead nation {o}");
+            *count.entry(o).or_insert(0) += 1;
+        }
+    }
+    for (id, n) in &alive {
+        assert_eq!(n["provinces"].as_u64().unwrap(), count.get(id).copied().unwrap_or(0), "nation {id} province count");
+        assert_eq!(owner_of.get(&n["capital"].as_u64().unwrap()), Some(id), "nation {id} owns its capital");
+    }
+    for n in nations.iter().filter(|n| !n["ended"].is_null()) {
+        assert_eq!(n["provinces"], 0);
+    }
+    // The owner field matches the table.
+    let (Some((Field::U16(of), _, _)), Some((Field::U32(pf), _, _))) = (w.field("owner"), w.field("province")) else { panic!() };
+    for (i, &id) in pf.iter().enumerate() {
+        if let Some(&o) = owner_of.get(&(id as u64)) {
+            assert_eq!(of[i] as u64, o);
+        }
+    }
+    // Railways run over their owner's provinces as they were when built, and are
+    // listed with stations at both ends.
+    for r in t["railways"].as_array().unwrap() {
+        let path = r["provinces"].as_array().unwrap();
+        let st = r["stations"].as_array().unwrap();
+        assert!(path.len() >= 2 && st.first() == path.first() && st.last() == path.last());
+        assert!(r["opened"].as_i64().unwrap() >= 1830);
+    }
+    let ev = t["events"].as_array().unwrap();
+    assert!(ev.iter().any(|e| e["event"] == "founded"));
+    assert!(ev.windows(2).all(|w| w[0]["year"].as_i64() <= w[1]["year"].as_i64()), "events in order");
+    assert!(worldcore::validate::validate(&mut w).ok);
+}
+
+#[test]
+fn transport_economy_and_eras() {
+    use worldcore::directives::Directive;
+    let mut p = small_params(23);
+    p.cultures.ticks = 60;
+    let mut w = World::new(p);
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m = w.meta(Step::Nations).unwrap().clone();
+    let t = &m["table"];
+    assert_eq!(m["start_date"], 1949);
+    let np = worldcore::params::NationParams::default();
+    let eras = [np.gunpowder_year, np.shipping_year, np.industrial_year, np.fertilizer_year, np.motor_year, np.air_year];
+    // Each nation's era follows its own technology.
+    let alive: Vec<&serde_json::Value> = t["nations"].as_array().unwrap().iter().filter(|n| n["ended"].is_null()).collect();
+    for n in &alive {
+        let tech = n["tech"].as_f64().unwrap();
+        // (tech is rounded to a tenth)
+        let (lo, hi) = (eras.iter().filter(|&&y| tech - 0.05 >= y as f64).count(), eras.iter().filter(|&&y| tech + 0.05 >= y as f64).count());
+        let era = n["era_index"].as_u64().unwrap() as usize;
+        assert!(lo <= era && era <= hi, "{}: tech {tech}, era {era}", n["name"]);
+        assert!(tech <= 1949.0 + np.tech_lead_years + 0.1);
+        let i = n["integration"].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&i));
+    }
+    let owner: std::collections::HashMap<u64, u64> = t["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["owner"].as_u64().unwrap())).collect();
+    // Roads join neighbours; highways and airports only in the motor and air ages.
+    let pt = w.meta(Step::Provinces).unwrap()["table"].clone();
+    let adj: std::collections::HashSet<(u64, u64)> = pt["adjacency"].as_array().unwrap().iter().map(|a| (a["from"].as_u64().unwrap(), a["to"].as_u64().unwrap())).collect();
+    let roads = t["roads"].as_array().unwrap();
+    assert!(!roads.is_empty(), "no roads");
+    for r in roads {
+        let (a, b) = (r["from"].as_u64().unwrap(), r["to"].as_u64().unwrap());
+        assert!(adj.contains(&(a, b)) || adj.contains(&(b, a)), "road {a}–{b} is not a border");
+        assert!((1..=3).contains(&r["quality"].as_u64().unwrap()));
+    }
+    let air_age = alive.iter().any(|n| n["era_index"].as_u64().unwrap() >= 6);
+    for a in t["airports"].as_array().unwrap() {
+        assert!(air_age, "airport without the air age");
+        assert!(a["opened"].as_i64().unwrap() >= 1800);
+    }
+    // Lines have stations at both ends; junctions are stations of two or more
+    // open lines, and the province table agrees.
+    let lines = t["railways"].as_array().unwrap();
+    for l in lines {
+        let path = l["provinces"].as_array().unwrap();
+        let st = l["stations"].as_array().unwrap();
+        assert!(path.len() >= 2 && st.first() == path.first() && st.last() == path.last());
+        assert!(l["km"].as_f64().unwrap() > 0.0);
+    }
+    let rail: std::collections::HashMap<u64, u64> = t["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["railway"].as_u64().unwrap())).collect();
+    for s in t["stations"].as_array().unwrap() {
+        let n = s["lines"].as_array().unwrap().len();
+        assert_eq!(s["junction"].as_bool().unwrap(), n > 1);
+        assert_eq!(rail[&s["province"].as_u64().unwrap()], if n > 1 { 3 } else { 2 });
+    }
+    // Steering: in 1948 the largest nation leaps ahead, gets a windfall, and
+    // builds a highway, a railway and an airport to an interior province.
+    let big = alive.iter().max_by_key(|n| n["population"].as_u64().unwrap()).unwrap();
+    let (nid, cap) = (big["id"].as_u64().unwrap(), big["capital"].as_u64().unwrap());
+    let mine: Vec<u64> = owner.iter().filter(|(_, &o)| o == nid).map(|(&p, _)| p).collect();
+    let interior = |p: u64| adj.iter().filter(|(a, b)| *a == p || *b == p).all(|(a, b)| owner.get(if *a == p { b } else { a }).is_some_and(|&o| o == nid));
+    let mut far: Vec<u64> = mine.iter().copied().filter(|&p| p != cap && interior(p)).collect();
+    far.sort();
+    let to = *far.last().or(mine.iter().find(|&&p| p != cap)).expect("a second province");
+    let d = |action: &str, args: serde_json::Value| Directive { stage: "nations".into(), at: 1948, action: action.into(), args, note: String::new(), by: "user".into() };
+    w.edits.overrides.directives = vec![
+        d("tech", serde_json::json!({ "nation": nid, "years": 200 })),
+        d("subsidy", serde_json::json!({ "nation": nid, "years": 5 })),
+        d("build_road", serde_json::json!({ "nation": nid, "from": cap, "to": to, "quality": 3 })),
+        d("railway", serde_json::json!({ "nation": nid, "from": to, "to": cap })),
+        d("airport", serde_json::json!({ "nation": nid, "province": to })),
+    ];
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m2 = w.meta(Step::Nations).unwrap().clone();
+    for a in m2["directives"].as_array().unwrap() {
+        assert_eq!(a["applied"], true, "{a}");
+    }
+    let t2 = &m2["table"];
+    let n2 = t2["nations"].as_array().unwrap().iter().find(|n| n["id"] == nid).unwrap();
+    assert_eq!(n2["era"], "air age");
+    assert!(t2["roads"].as_array().unwrap().iter().any(|r| r["quality"] == 3 && (r["from"] == cap || r["to"] == cap)), "highway from the capital");
+    assert!(t2["airports"].as_array().unwrap().iter().any(|a| a["province"] == to));
+    assert!(t2["railways"].as_array().unwrap().iter().any(|l| l["opened"] == 1948 && l["owner"] == nid), "railway of 1948");
+    assert!(worldcore::validate::validate(&mut w).ok);
+}
+
+#[test]
+fn cities_rise_and_fall() {
+    use worldcore::directives::Directive;
+    let mut p = small_params(29);
+    p.cultures.ticks = 60;
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let t = w.meta(Step::Nations).unwrap()["table"].clone();
+    // Capitals become the largest cities.
+    let cities = t["cities"].as_array().unwrap();
+    let caps = cities.iter().take(10).filter(|c| c["capital"] == true).count();
+    assert!(caps >= 6, "capitals among the 10 largest cities: {caps}");
+    // Pins: a boom town and an abandoned city, placed in 1300 on two populous
+    // provinces that are not capitals, then the boom town moved and a capital moved.
+    let pop_of = |w: &World, id: u64| w.meta(Step::Nations).unwrap()["table"]["provinces"].as_array().unwrap().iter().find(|q| q["id"] == id).unwrap()["population"].as_f64().unwrap();
+    let mid: Vec<u64> = cities.iter().skip(20).filter(|c| c["capital"] == false).take(3).map(|c| c["province"].as_u64().unwrap()).collect();
+    let (boom, bust, later) = (mid[0], mid[1], mid[2]);
+    let d = |at: i64, action: &str, args: serde_json::Value| Directive { stage: "nations".into(), at, action: action.into(), args, note: String::new(), by: "user".into() };
+    w.edits.overrides.directives = vec![
+        d(1300, "pin_add", serde_json::json!({ "province": boom, "value": 1.0, "years": null, "label": "silver rush" })),
+        d(1300, "pin_add", serde_json::json!({ "province": bust, "value": -1.0, "years": null, "label": "sacked and abandoned" })),
+        d(1500, "pin_add", serde_json::json!({ "province": later, "value": 0.5, "years": 100, "label": null })),
+        d(1900, "pin_move", serde_json::json!({ "pin": 99, "province": boom })),
+    ];
+    for x in &w.edits.overrides.directives {
+        worldcore::directives::validate(x).unwrap();
+    }
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m = w.meta(Step::Nations).unwrap().clone();
+    let applied = m["directives"].as_array().unwrap();
+    assert_eq!(applied.iter().map(|a| a["applied"] == true).collect::<Vec<_>>(), vec![true, true, true, false], "{applied:?}");
+    let before = |id: u64| t["provinces"].as_array().unwrap().iter().find(|q| q["id"] == id).unwrap()["population"].as_f64().unwrap();
+    assert!(pop_of(&w, boom) > 1.3 * before(boom), "boom town grew: {} vs {}", pop_of(&w, boom), before(boom));
+    assert!(pop_of(&w, bust) < 0.2 * before(bust), "abandoned city emptied: {} vs {}", pop_of(&w, bust), before(bust));
+    let pins = m["table"]["pins"].as_array().unwrap();
+    assert_eq!(pins.len(), 2, "the 100-year pin expired: {pins:?}");
+    assert_eq!(pins[0]["label"], "silver rush");
+    assert!(m["table"]["events"].as_array().unwrap().iter().any(|e| e["event"] == "ruined" || e["event"] == "metropolis"));
+    assert!(worldcore::validate::validate(&mut w).ok);
+
+    // Moving a capital late (dated between two steps: it applies in the step
+    // that covers its year) to a deep interior province, which cannot change
+    // hands in that last step.
+    let ptab = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().clone();
+    let nt = m["table"].clone();
+    let owner: std::collections::HashMap<u64, u64> = nt["provinces"].as_array().unwrap().iter().map(|q| (q["id"].as_u64().unwrap(), q["owner"].as_u64().unwrap())).collect();
+    let (nation, target) = ptab
+        .iter()
+        .filter_map(|q| {
+            let id = q["id"].as_u64()?;
+            let o = *owner.get(&id)?;
+            let nb: Vec<u64> = q["neighbors"].as_array()?.iter().filter_map(|x| x.as_u64()).collect();
+            let cap = nt["nations"].as_array()?.iter().find(|n| n["id"] == o)?["capital"].as_u64()?;
+            (o > 0 && id != cap && nb.len() >= 3 && nb.iter().all(|x| owner.get(x).map_or(true, |&y| y == o))).then_some((o, id))
+        })
+        .next()
+        .expect("an interior province");
+    w.edits.overrides.directives.push(d(1913, "move_capital", serde_json::json!({ "nation": nation, "province": target })));
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m2 = w.meta(Step::Nations).unwrap();
+    assert_eq!(m2["directives"].as_array().unwrap().last().unwrap()["applied"], true);
+    assert!(m2["table"]["events"].as_array().unwrap().iter().any(|e| e["event"] == "capital" && e["year"] == 1912 && e["province"] == target));
+    let n2 = m2["table"]["nations"].as_array().unwrap().iter().find(|n| n["id"] == nation).unwrap();
+    assert_eq!(n2["capital"], target);
+}

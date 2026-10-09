@@ -94,10 +94,12 @@ pub enum EditLayer {
     Fertility,
     Bands,
     Attraction,
+    /// Time-stamped steering of the Stage 3 and 4 simulations (not strokes).
+    Directives,
 }
 
 impl EditLayer {
-    pub const ALL: [EditLayer; 11] = [
+    pub const ALL: [EditLayer; 12] = [
         EditLayer::Sketch,
         EditLayer::Plates,
         EditLayer::Elevation,
@@ -109,6 +111,7 @@ impl EditLayer {
         EditLayer::Provinces,
         EditLayer::Bands,
         EditLayer::Attraction,
+        EditLayer::Directives,
     ];
 
     /// Name used in files, the API and the CLI (same as the serde name).
@@ -125,6 +128,7 @@ impl EditLayer {
             EditLayer::Fertility => "fertility",
             EditLayer::Bands => "bands",
             EditLayer::Attraction => "attraction",
+            EditLayer::Directives => "directives",
         }
     }
 
@@ -144,7 +148,7 @@ impl EditLayer {
             EditLayer::Barriers | EditLayer::Sites | EditLayer::Fertility => Step::Habitability,
             EditLayer::States => Step::States,
             EditLayer::Provinces => Step::Provinces,
-            EditLayer::Bands | EditLayer::Attraction => Step::Cultures,
+            EditLayer::Bands | EditLayer::Attraction | EditLayer::Directives => Step::Cultures,
         }
     }
 
@@ -161,9 +165,12 @@ impl EditLayer {
             EditLayer::Fertility => "Fertility",
             EditLayer::Bands => "Founding bands",
             EditLayer::Attraction => "Attraction",
+            EditLayer::Directives => "Simulation directives (Stages 3 and 4)",
         }
     }
 }
+
+static NO_STROKES: Vec<Stroke> = Vec::new();
 
 /// Format tag of an override bundle file (`*.fwm-overrides.json`).
 pub const BUNDLE_FORMAT: &str = "fwm-overrides";
@@ -255,6 +262,8 @@ pub struct Overrides {
     pub fertility: Vec<Stroke>,
     pub bands: Vec<Stroke>,
     pub attraction: Vec<Stroke>,
+    /// Steering of the Stage 3 and 4 simulations, by hand or by the AI guide.
+    pub directives: Vec<crate::directives::Directive>,
 }
 
 /// How heightmap pixel values map to metres.
@@ -323,6 +332,7 @@ impl Edits {
             EditLayer::Fertility => self.overrides.fertility.push(s),
             EditLayer::Bands => self.add_band_pin(s),
             EditLayer::Attraction => self.overrides.attraction.push(s),
+            EditLayer::Directives => {}
         }
     }
 
@@ -363,6 +373,7 @@ impl Edits {
             EditLayer::Fertility => &o.fertility,
             EditLayer::Bands => &o.bands,
             EditLayer::Attraction => &o.attraction,
+            EditLayer::Directives => &NO_STROKES,
         }
     }
 
@@ -380,13 +391,18 @@ impl Edits {
             EditLayer::Fertility => &mut o.fertility,
             EditLayer::Bands => &mut o.bands,
             EditLayer::Attraction => &mut o.attraction,
+            EditLayer::Directives => unreachable!("directives are not strokes"),
         }
     }
 
     /// Number of edits in a layer (the sketch layer counts its plate pins and
     /// motion arrows too).
     pub fn count(&self, layer: EditLayer) -> usize {
-        self.strokes(layer).len() + if layer == EditLayer::Sketch { self.sketch.pins.len() + self.sketch.arrows.len() } else { 0 }
+        match layer {
+            EditLayer::Sketch => self.sketch.strokes.len() + self.sketch.pins.len() + self.sketch.arrows.len(),
+            EditLayer::Directives => self.overrides.directives.len(),
+            _ => self.strokes(layer).len(),
+        }
     }
 
     /// Remove strokes by index (indices out of range are ignored).
@@ -394,15 +410,20 @@ impl Edits {
         let mut idx: Vec<usize> = indices.to_vec();
         idx.sort_unstable();
         idx.dedup();
-        let v = self.strokes_mut(layer);
-        let mut removed = 0;
-        for &i in idx.iter().rev() {
-            if i < v.len() {
-                v.remove(i);
-                removed += 1;
+        fn drop<T>(v: &mut Vec<T>, idx: &[usize]) -> usize {
+            let mut removed = 0;
+            for &i in idx.iter().rev() {
+                if i < v.len() {
+                    v.remove(i);
+                    removed += 1;
+                }
             }
+            removed
         }
-        removed
+        if layer == EditLayer::Directives {
+            return drop(&mut self.overrides.directives, &idx);
+        }
+        drop(self.strokes_mut(layer), &idx)
     }
 
     /// An override bundle with the given layers: a JSON file that carries
@@ -411,7 +432,11 @@ impl Edits {
     pub fn bundle(&self, layers: &[EditLayer], seed: u64) -> serde_json::Value {
         let mut m = serde_json::Map::new();
         for &l in layers {
-            let v = if l == EditLayer::Sketch { serde_json::to_value(&self.sketch) } else { serde_json::to_value(self.strokes(l)) };
+            let v = match l {
+                EditLayer::Sketch => serde_json::to_value(&self.sketch),
+                EditLayer::Directives => serde_json::to_value(&self.overrides.directives),
+                _ => serde_json::to_value(self.strokes(l)),
+            };
             m.insert(l.key().into(), v.unwrap());
         }
         serde_json::json!({ "format": BUNDLE_FORMAT, "version": BUNDLE_VERSION, "source_seed": seed, "layers": m })
@@ -431,12 +456,19 @@ impl Edits {
         let layers = bundle["layers"].as_object().ok_or("override bundle has no layers")?;
         // Parse everything first, so a bad layer changes nothing.
         let mut parsed: Vec<(EditLayer, Option<Sketch>, Vec<Stroke>)> = Vec::new();
+        let mut directives: Option<Vec<crate::directives::Directive>> = None;
         for (k, v) in layers {
             let l = EditLayer::from_key(k).ok_or_else(|| format!("unknown override layer `{k}`"))?;
             if only.is_some_and(|o| !o.contains(&l)) {
                 continue;
             }
-            if l == EditLayer::Sketch {
+            if l == EditLayer::Directives {
+                let d: Vec<crate::directives::Directive> = serde_json::from_value(v.clone()).map_err(|e| format!("layer directives: {e}"))?;
+                if let Some(bad) = d.iter().find_map(|x| crate::directives::validate(x).err()) {
+                    return Err(format!("layer directives: {bad}"));
+                }
+                directives = Some(d);
+            } else if l == EditLayer::Sketch {
                 let sk: Sketch = serde_json::from_value(v.clone()).map_err(|e| format!("layer sketch: {e}"))?;
                 parsed.push((l, Some(sk), vec![]));
             } else {
@@ -448,6 +480,13 @@ impl Edits {
             }
         }
         let mut out = Vec::new();
+        if let Some(d) = directives {
+            if replace {
+                self.overrides.directives.clear();
+            }
+            out.push((EditLayer::Directives, d.len()));
+            self.overrides.directives.extend(d);
+        }
         for (l, sk, st) in parsed {
             if replace {
                 self.clear_layer(l);
@@ -490,6 +529,7 @@ impl Edits {
             EditLayer::Fertility => self.overrides.fertility.clear(),
             EditLayer::Bands => self.overrides.bands.clear(),
             EditLayer::Attraction => self.overrides.attraction.clear(),
+            EditLayer::Directives => self.overrides.directives.clear(),
         }
     }
 }

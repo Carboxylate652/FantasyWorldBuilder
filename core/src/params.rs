@@ -474,6 +474,135 @@ impl Default for CultureParams {
     }
 }
 
+/// Stage 4: nations and history, from polity formation to the start date.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NationParams {
+    /// Year the first polities can form.
+    pub start_year: i32,
+    /// Year history stops: the map's start date (default 1949: late in the
+    /// second great war's era, early in the cold war's; 1910–1920 for a
+    /// pre-war start).
+    pub start_date: i32,
+    /// Years per simulation step.
+    pub years_per_step: u32,
+    /// People a province needs before a polity can form there.
+    pub found_population: f64,
+    /// Chance per step that a province with that many people and no ruler
+    /// founds a polity (more people, likelier).
+    pub found_rate: f64,
+    /// Expansion attempts per nation and step at aggression 1.
+    pub expansion_rate: f64,
+    /// Cost multiplier for barriers along a border (ridges, rivers, desert).
+    pub barrier_weight: f64,
+    /// Extra cost of taking land of another culture (half for the same group).
+    pub culture_weight: f64,
+    /// Distance from the capital (km) at which expansion costs twice as much.
+    pub reach_km: f64,
+    /// Chance per step of a breakup at instability 1 (mixed cultures, size, spread).
+    pub collapse_rate: f64,
+    /// Share of a province's other cultures that takes its ruler's culture per year.
+    pub assimilation: f64,
+    /// Population growth per year before and during the industrial era.
+    pub growth: f64,
+    pub industrial_growth: f64,
+    /// Era technology years: gunpowder states, ocean shipping (overseas
+    /// colonies), industry (railways, faster growth). Each nation enters an
+    /// era when its own technology reaches the year, not the calendar.
+    pub gunpowder_year: i32,
+    pub shipping_year: i32,
+    pub industrial_year: i32,
+    /// Farthest a colony can lie from its nation's coast (km), with ocean shipping.
+    pub overseas_km: f64,
+    /// Largest cities each nation links by rail.
+    pub railway_cities: u32,
+    /// Years between a nation's railway projects.
+    pub railway_every_years: u32,
+    /// People a railway station draws (railway towns, also in the desert).
+    pub station_people: f64,
+    /// Attraction (0–1) a capital grows into: people move there and it holds more.
+    pub capital_pull: f64,
+    /// Years a new capital takes to grow into its full pull.
+    pub capital_years: f64,
+    /// Share of a conquered province's people lost in the sack (four times for a capital).
+    pub war_sack: f64,
+    /// Attraction lost by a conquered province (devastation: people leave).
+    pub war_devastation: f64,
+    /// Share of devastation that heals each year.
+    pub recovery: f64,
+    /// Share of a nation's people that move each year toward its attractive
+    /// provinces (capitals, stations, city pins), more from devastated land.
+    pub migration: f64,
+    /// Technology years at which synthetic fertilizer, the motor age
+    /// (highways) and the air age (airports) begin. Like the other era years,
+    /// a nation reaches them when its own technology does: rich, large and
+    /// well-connected nations first, others as ideas spread to them.
+    pub fertilizer_year: i32,
+    pub motor_year: i32,
+    pub air_year: i32,
+    /// How much faster a nation catches up per year of technology gap to the
+    /// level its wealth, size and neighbours allow (0.02: a century behind,
+    /// three years of progress per year).
+    pub tech_spread: f64,
+    /// How far ahead of the calendar the most advanced nation can get (years).
+    pub tech_lead_years: f64,
+    /// Share of output collected as taxes (pays the army, roads, railways and airports).
+    pub tax: f64,
+    /// Multipliers on the cost of building and keeping roads, and railways and airports.
+    pub road_cost: f64,
+    pub rail_cost: f64,
+    /// Time lost changing trains at a junction (km of travel on foot).
+    pub transfer_km: f64,
+    /// How many more people farmland holds once a nation uses synthetic fertilizer.
+    pub fertilizer_boost: f64,
+    /// Years between a nation's road projects (and airport projects in the air age).
+    pub road_every_years: u32,
+}
+
+impl Default for NationParams {
+    fn default() -> Self {
+        NationParams {
+            start_year: 800,
+            start_date: 1949,
+            years_per_step: 2,
+            found_population: 60_000.0,
+            found_rate: 0.0015,
+            expansion_rate: 0.8,
+            barrier_weight: 1.0,
+            culture_weight: 1.5,
+            reach_km: 700.0,
+            collapse_rate: 0.01,
+            assimilation: 0.0015,
+            growth: 0.0018,
+            industrial_growth: 0.009,
+            gunpowder_year: 1450,
+            shipping_year: 1500,
+            industrial_year: 1830,
+            overseas_km: 9000.0,
+            railway_cities: 8,
+            railway_every_years: 8,
+            station_people: 15_000.0,
+            capital_pull: 0.5,
+            capital_years: 60.0,
+            war_sack: 0.03,
+            war_devastation: 0.25,
+            recovery: 0.03,
+            migration: 0.002,
+            fertilizer_year: 1909,
+            motor_year: 1920,
+            air_year: 1935,
+            tech_spread: 0.02,
+            tech_lead_years: 10.0,
+            tax: 0.08,
+            road_cost: 1.0,
+            rail_cost: 1.0,
+            transfer_km: 150.0,
+            fertilizer_boost: 1.6,
+            road_every_years: 10,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct WorldParams {
@@ -488,6 +617,7 @@ pub struct WorldParams {
     pub states: StateParams,
     pub provinces: ProvinceParams,
     pub cultures: CultureParams,
+    pub nations: NationParams,
 }
 
 impl WorldParams {

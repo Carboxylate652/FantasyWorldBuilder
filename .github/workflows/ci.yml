@@ -37,18 +37,20 @@ jobs:
           npx tsc --noEmit
           npm run build
 
-      - name: Core and updater tests
-        run: cargo test --release -p worldcore -p fwm-update
+      - name: Core, updater and guide tests
+        run: cargo test --release -p worldcore -p fwm-update -p fwm-guide
 
-      - name: CLI smoke test (generate, validate, overrides)
+      - name: CLI smoke test (generate to Stage 4, directive, validate, overrides, export)
         run: |
           cargo build --release -p worldgen
           W="$RUNNER_TEMP/world"
-          ./target/release/worldgen generate --out "$W" --seed 3 --level 5 --to provinces
+          ./target/release/worldgen generate --out "$W" --seed 3 --level 5 --to nations
           ./target/release/worldgen edit "$W" --tool fertility_paint --at 10,20 --value 0.5
+          ./target/release/worldgen directive "$W" --stage nations --at 1500 --action note --args '{"text":"smoke test"}'
           ./target/release/worldgen overrides "$W" export "$RUNNER_TEMP/edits.json"
           ./target/release/worldgen validate "$W" --run
           ./target/release/worldgen overrides "$W"
+          ./target/release/worldgen export "$W" --width 1024 --height 512
 
       - name: Desktop shell compiles
         run: cargo build -p worldbuilder-app

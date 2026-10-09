@@ -59,6 +59,12 @@ pub fn validate(w: &mut World) -> Report {
         }
     }
 
+    if let Some(m) = w.meta(Step::Nations).cloned() {
+        if m["nations_ever"].as_u64().unwrap_or(0) > 0 {
+            nations(w, &m["table"], &mut r, &mut seen);
+        }
+    }
+
     let rep = crate::api::overrides_report(w);
     r.check("override edits apply");
     for u in rep["unapplied"].as_array().into_iter().flatten() {
@@ -165,6 +171,39 @@ fn political(w: &mut World, t: &Value, r: &mut Report, seen: &mut HashMap<String
             if !known {
                 r.err("deposit", format!("province {}: unknown resource `{d}`", p["id"]), seen);
             }
+        }
+    }
+}
+
+fn nations(w: &World, t: &Value, r: &mut Report, seen: &mut HashMap<String, usize>) {
+    r.check("nations: owners, capitals and province counts");
+    let empty = vec![];
+    let nations = t["nations"].as_array().unwrap_or(&empty);
+    let alive: HashMap<u64, &Value> = nations.iter().filter(|n| n["ended"].is_null()).map(|n| (n["id"].as_u64().unwrap_or(0), n)).collect();
+    let mut count: HashMap<u64, u64> = HashMap::new();
+    let mut owner_of: HashMap<u64, u64> = HashMap::new();
+    for p in t["provinces"].as_array().unwrap_or(&empty) {
+        let (id, o) = (p["id"].as_u64().unwrap_or(0), p["owner"].as_u64().unwrap_or(0));
+        owner_of.insert(id, o);
+        if o > 0 {
+            if !alive.contains_key(&o) {
+                r.err("nation owner", format!("province {id} is owned by nation {o}, which no longer exists"), seen);
+            }
+            *count.entry(o).or_insert(0) += 1;
+        }
+    }
+    for (id, n) in &alive {
+        if n["provinces"].as_u64() != Some(count.get(id).copied().unwrap_or(0)) {
+            r.err("nation size", format!("nation {id} lists {} provinces but owns {}", n["provinces"], count.get(id).copied().unwrap_or(0)), seen);
+        }
+        if owner_of.get(&n["capital"].as_u64().unwrap_or(0)) != Some(id) {
+            r.err("nation capital", format!("nation {id} does not own its capital {}", n["capital"]), seen);
+        }
+    }
+    r.check("nations: owner field matches the table");
+    if let (Some((Field::U16(of), _, _)), Some((Field::U32(pf), _, _))) = (w.field("owner"), w.field("province")) {
+        if let Some(i) = pf.iter().enumerate().find(|(i, id)| owner_of.get(&(**id as u64)).is_some_and(|&o| of[*i] as u64 != o)).map(|x| x.0) {
+            r.err("owner field", format!("grid cell {i} has owner {} but its province's owner differs", of[i]), seen);
         }
     }
 }

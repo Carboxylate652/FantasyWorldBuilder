@@ -61,8 +61,8 @@ jobs:
         working-directory: app
         run: npm ci
 
-      - name: Test the simulation core and the updater
-        run: cargo test --release -p worldcore -p fwm-update
+      - name: Test the simulation core, the updater and the guide
+        run: cargo test --release -p worldcore -p fwm-update -p fwm-guide
 
       - name: Build the installer and publish the release
         uses: tauri-apps/tauri-action@v0

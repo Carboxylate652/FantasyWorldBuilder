@@ -41,6 +41,16 @@ USAGE:
                 [--strength S] [--hardness H] [--name NAME] [--run]
                                              add one override stroke (tools as in the app:
                                              province_merge, fertility_paint, band_pin, ...)
+  worldgen directive <project-dir> --stage cultures|nations --at N --action NAME [--args JSON] [--note TEXT] [--run]
+                                             add a directive by hand (applies before generation N or
+                                             year N); `worldgen directive --list` shows the actions
+  worldgen guide <project-dir> --goal TEXT [--stage nations|cultures] [--years 50] [--max-turns 60]
+                [--max-actions 4]          AI-guided history: an LLM steers the live simulation
+                                             toward the goal turn by turn, then the run is committed
+  worldgen guide-setup [--provider anthropic|openai] [--base-url URL] [--model ID] [--key KEY]
+                [--effort low|medium|high] guide provider settings (saved outside projects; keys
+                                             can also come from ANTHROPIC_API_KEY, OPENAI_API_KEY,
+                                             AI_GATEWAY_API_KEY or OPENROUTER_API_KEY)
   worldgen version
   worldgen check-update [--betas | --stable] [--download DIR]
                                              compare with the newest GitHub release; --download
@@ -51,7 +61,7 @@ LAYERS: sketch, plates, elevation, biomes, barriers, sites, fertility, states,
         provinces, bands, attraction
 
 STEPS: planet, sketch, plates, relief, climate, hydrology, biomes (Stage 1),
-       habitability, states, provinces (Stage 2), cultures (Stage 3; default: cultures)
+       habitability, states, provinces (Stage 2), cultures (Stage 3), nations (Stage 4; default: nations)
 ";
 
 struct Args {
@@ -181,6 +191,12 @@ fn summary(w: &World) {
                 "{} cultures in {} groups ({} ever: {} splits, {} merged, {} extinct), {} bands, {:.1} M people over {} years",
                 m["cultures"], m["groups"], m["cultures_ever"], m["splits"], m["merged"], m["extinct"], m["bands"],
                 m["population"].as_f64().unwrap_or(0.0) / 1e6, m["years"]
+            ),
+            "nations" => format!(
+                "{} nations in {} ({} ever), {:.0}% of land ruled, {} conquests, {} independences, {} colonies, {} railway lines, {} airports; {} leads ({})",
+                m["nations"], m["start_date"], m["nations_ever"], m["ruled_share"].as_f64().unwrap_or(0.0) * 100.0,
+                m["conquests"], m["independences"], m["colonies"], m["railways"], m["transport"]["airports"],
+                m["leader"]["name"].as_str().unwrap_or("no one"), m["era"].as_str().unwrap_or("")
             ),
             _ => String::new(),
         };
@@ -366,6 +382,49 @@ fn main() {
         "overrides" => overrides(&args),
         "edit" => edit(&args),
         "version" => println!("worldgen {}", fwm_update::current_version()),
+        "guide" => guide(&args),
+        "directive" => {
+            if args.flag("list") {
+                for a in worldcore::directives::actions() {
+                    println!("{:<9} {:<14} {}\n{:<24} args: {}", a.stage, a.name, a.description, "", a.schema["properties"]);
+                }
+                return;
+            }
+            let dir = PathBuf::from(args.pos.get(1).unwrap_or_else(|| die("missing project dir")));
+            let mut w = World::load(&dir).unwrap_or_else(|e| die(&e));
+            let d = worldcore::directives::Directive {
+                stage: args.get("stage").unwrap_or_else(|| die("missing --stage")).to_string(),
+                at: args.num("at", i64::MIN).max(i64::MIN + 1),
+                action: args.get("action").unwrap_or_else(|| die("missing --action")).to_string(),
+                args: serde_json::from_str(args.get("args").unwrap_or("{}")).unwrap_or_else(|e| die(&format!("--args: {e}"))),
+                note: args.get("note").unwrap_or("").to_string(),
+                by: "user".into(),
+            };
+            if args.get("at").is_none() {
+                die("missing --at (generation for cultures, year for nations)");
+            }
+            worldcore::directives::validate(&d).unwrap_or_else(|e| die(&e));
+            w.edits.overrides.directives.push(d);
+            println!("{} directives", w.edits.overrides.directives.len());
+            if args.flag("run") {
+                run_world(&mut w, LAST);
+                summary(&w);
+            }
+            w.save(&dir).unwrap_or_else(|e| die(&e.to_string()));
+        }
+        "guide-setup" => {
+            let session = Mutex::new(Session::default());
+            let progress = Arc::new(Mutex::new(ProgressState::default()));
+            let mut set = serde_json::Map::new();
+            for (flag, key) in [("provider", "provider"), ("base-url", "base_url"), ("model", "model"), ("key", "api_key"), ("effort", "effort")] {
+                if let Some(v) = args.get(flag) {
+                    set.insert(key.into(), serde_json::json!(v));
+                }
+            }
+            let cmd = if set.is_empty() { "guide_config_get" } else { "guide_config_set" };
+            let r = fwm_guide::handle(&session, &progress, cmd, &serde_json::Value::Object(set)).unwrap().unwrap_or_else(|e| die(&e));
+            println!("{}", serde_json::to_string_pretty(&r).unwrap());
+        }
         "check-update" => check_update(&args),
         "serve" => serve(&args),
         "stats" => {
@@ -607,6 +666,48 @@ fn edit(args: &Args) {
     w.save(&dir).unwrap_or_else(|e| die(&e.to_string()));
 }
 
+/// `worldgen guide`: AI-guided history on a project, saved when done.
+fn guide(args: &Args) {
+    let dir = args.pos.get(1).unwrap_or_else(|| die("missing project dir"));
+    let goal = args.get("goal").unwrap_or_else(|| die("missing --goal \"the history you want\""));
+    let stage = args.get("stage").unwrap_or("nations");
+    let session = Mutex::new(Session::default());
+    let progress = Arc::new(Mutex::new(ProgressState::default()));
+    let call = |cmd: &str, a: serde_json::Value| match api::handle(&session, &progress, cmd, a) {
+        Ok(Reply::Json(v)) => v,
+        Ok(_) => serde_json::Value::Null,
+        Err(e) => die(&format!("{cmd}: {e}")),
+    };
+    call("open", serde_json::json!({ "path": dir }));
+    eprintln!("bringing earlier steps up to date and starting the {stage} simulation…");
+    call("sim_start", serde_json::json!({ "stage": stage }));
+    let mut years = args.num("years", 50.0);
+    let max_turns: usize = args.num("max-turns", 60);
+    let max_actions: u64 = args.num("max-actions", 4);
+    let (mut tin, mut tout) = (0u64, 0u64);
+    for k in 0..max_turns {
+        // The first turn looks at the start; later turns advance first.
+        let r = fwm_guide::handle(&session, &progress, "guide_turn", &serde_json::json!({ "goal": goal, "years": if k == 0 { 0.0 } else { years }, "max_actions": max_actions }))
+            .unwrap()
+            .unwrap_or_else(|e| die(&e));
+        tin += r["input_tokens"].as_u64().unwrap_or(0);
+        tout += r["output_tokens"].as_u64().unwrap_or(0);
+        if r["done"] == true {
+            break;
+        }
+        println!("[{}] {}", r["position"], r["narration"].as_str().unwrap_or(""));
+        for a in r["actions"].as_array().into_iter().flatten() {
+            println!("    {} {} {}", if a["ok"] == true { "+" } else { "x" }, a["action"].as_str().unwrap_or(""), if a["ok"] == true { a["args"].to_string() } else { a["error"].as_str().unwrap_or("").to_string() });
+        }
+        if let Some(y) = r["next_years"].as_f64() {
+            years = y.clamp(5.0, 1000.0);
+        }
+    }
+    let st = call("sim_commit", serde_json::json!({}));
+    call("save", serde_json::json!({ "path": dir }));
+    eprintln!("committed {} ({} tokens in, {} out); saved {dir}", st["committed"].as_str().unwrap_or(stage), tin, tout);
+}
+
 /// `worldgen check-update`: compare with the newest GitHub release.
 fn check_update(args: &Args) {
     let pre = if args.flag("betas") { Some(true) } else if args.flag("stable") { Some(false) } else { None };
@@ -741,6 +842,13 @@ fn serve(args: &Args) {
                 let a: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
                 if cmd == "update_install" {
                     respond(req, 400, "text/plain; charset=utf-8", b"Installing updates works in the desktop app; download the new release from GitHub instead".to_vec(), &cors);
+                    return;
+                }
+                if cmd.starts_with("guide_") {
+                    match fwm_guide::handle(&session, &progress, &cmd, &a).unwrap_or_else(|| Err(format!("unknown command `{cmd}`"))) {
+                        Ok(v) => respond(req, 200, "application/json", serde_json::to_vec(&v).unwrap(), &cors),
+                        Err(e) => respond(req, 400, "text/plain; charset=utf-8", e.into_bytes(), &cors),
+                    }
                     return;
                 }
                 if let Some(r) = fwm_update::handle(&cmd, &a) {

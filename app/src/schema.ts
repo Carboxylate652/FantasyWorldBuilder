@@ -1,5 +1,5 @@
 // UI description of the pipeline steps (seven for Stage 1, three for Stage 2,
-// one for Stage 3):
+// one each for Stages 3 and 4):
 // parameters, default layer and tools.
 
 import type { LayerId } from './layers';
@@ -21,7 +21,8 @@ export type ToolId =
   | 'barrier_paint' | 'barrier_erase' | 'site_pin' | 'state_paint' | 'province_paint'
   | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase'
   | 'attraction' | 'attraction_erase'
-  | 'goods_paint' | 'province_merge' | 'state_merge' | 'province_to_state' | 'rename_province' | 'rename_state';
+  | 'goods_paint' | 'province_merge' | 'state_merge' | 'province_to_state' | 'rename_province' | 'rename_state'
+  | 'city_pin' | 'city_unpin';
 
 export type ToolDef = {
   id: ToolId;
@@ -66,6 +67,8 @@ export const TOOLS: ToolDef[] = [
   { id: 'band_erase', label: 'Remove founder', step: 'cultures', gesture: 'point', hint: 'Click near a founding-band pin to remove it.' },
   { id: 'attraction', label: 'Attraction', key: 'h', step: 'cultures', value: 'attraction', defaultValue: 0.8, hint: 'Paint where people are drawn (+, up to 5× as many: a metropolis) or driven away (−, down to none: a ghost town) during the culture simulation. States and provinces stay as they are.' },
   { id: 'attraction_erase', label: 'Erase attraction', step: 'cultures', hint: 'Remove attraction paint under the brush.' },
+  { id: 'city_pin', label: 'City pin', key: 'y', step: 'nations', gesture: 'link', value: 'attraction', defaultValue: 0.8, hint: 'In a live Stage 4 run: click a province to make it draw people (+, a boom town or metropolis) or lose them (−, an abandoned city) from now on. Drag from a pin to move it.' },
+  { id: 'city_unpin', label: 'Remove city pin', step: 'nations', gesture: 'point', hint: 'In a live Stage 4 run: click near a city pin to remove it.' },
   { id: 'goods_paint', label: 'Paint goods', key: 'q', step: 'provinces', value: 'goods', defaultValue: 1, hint: 'Provinces under the brush get this trade good, or gain or lose a deposit.' },
   { id: 'province_merge', label: 'Merge provinces', key: 'u', step: 'provinces', gesture: 'link', hint: 'Drag from a province (an island, a sliver) onto the province that should absorb it.' },
   { id: 'state_merge', label: 'Merge states', step: 'states', gesture: 'link', hint: 'Drag from a state onto the state that should absorb it.' },
@@ -80,12 +83,16 @@ export const TOOLS: ToolDef[] = [
 export const EDITOR_TOOLS: ToolId[] = ['province_merge', 'state_merge', 'province_to_state', 'province_paint', 'state_paint', 'rename_province', 'rename_state', 'goods_paint'];
 
 /** Last step of each stage (the stage buttons run up to it). */
-export const STAGE_ENDS = [{ stage: 1, step: 'biomes' }, { stage: 2, step: 'provinces' }, { stage: 3, step: 'cultures' }];
+export const STAGE_ENDS = [{ stage: 1, step: 'biomes' }, { stage: 2, step: 'provinces' }, { stage: 3, step: 'cultures' }, { stage: 4, step: 'nations' }];
 
 /** Index of the first Stage 2 step. */
 export const STAGE2_START = 7;
 /** Index of the first Stage 3 step. */
 export const STAGE3_START = 10;
+/** Index of the first Stage 4 step. */
+export const STAGE4_START = 11;
+/** Steps that can run step by step (live simulation, directives, AI guide). */
+export const LIVE_STEPS = ['cultures', 'nations'];
 
 export type StepUI = {
   key: string;
@@ -275,6 +282,47 @@ export const STEPS: StepUI[] = [
       p('cultures', 'caravan_people', 'Caravan stop size (people)', 0, 500000, 1000, 'From era 2: people a watered stop on the busiest route across dry land can hold.'),
       p('cultures', 'mining_people', 'Mining town size (people)', 0, 200000, 500, 'From era 3: people each metal deposit draws.'),
       p('cultures', 'irrigation_share', 'Irrigated share of dry river land', 0, 1, 0.05, 'From era 4: share of a dry province with a river that becomes farmland.'),
+    ],
+  },
+  {
+    key: 'nations', title: 'Nations & history', layer: 'nations', tools: ['city_pin', 'city_unpin'],
+    blurb: 'Polities form where people are many, then grow over the culture map: they settle empty land, fight over borders, colonise overseas and break apart along culture lines. Borders can cut through states, and colonies and exclaves are allowed. Each nation\'s technology, and so its era, follows its wealth and size: gunpowder, ocean shipping, industry, synthetic fertilizer, the motor age and the air age. Nations tax their people to pay for armies, roads (track, paved, highway), railway lines with junctions, and airports, which bind their land together. Run it in one go, step by step with your own directives, or let an AI guide steer it toward the history you describe.',
+    params: [
+      p('nations', 'start_year', 'First polities (year)', -5000, 1800, 10),
+      p('nations', 'start_date', 'Start date (year)', 1800, 2000, 1, 'The year the map shows: 1949 (default) for late in the second great war\'s era, 1910–1920 for an early-20th-century start.'),
+      p('nations', 'years_per_step', 'Years per step', 1, 25, 1),
+      p('nations', 'found_population', 'People to found a polity', 1000, 1000000, 1000),
+      p('nations', 'found_rate', 'Founding chance per step', 0, 0.05, 0.0005),
+      p('nations', 'expansion_rate', 'Expansion', 0, 5, 0.05, 'Expansion attempts per nation and step.'),
+      p('nations', 'culture_weight', 'Culture border weight', 0, 10, 0.1, 'Extra cost of taking land of another culture (half within the culture group): higher values make borders follow cultures.'),
+      p('nations', 'barrier_weight', 'Barrier weight', 0, 5, 0.05),
+      p('nations', 'reach_km', 'Reach from the capital (km)', 100, 5000, 50, 'Expansion costs twice as much this far from the capital.'),
+      p('nations', 'collapse_rate', 'Breakups', 0, 0.2, 0.002, 'Chance of a breakup at instability 1 (mixed cultures, size, spread).'),
+      p('nations', 'assimilation', 'Assimilation per year', 0, 0.02, 0.0005, 'Share of a province\'s other cultures that takes its ruler\'s culture each year.'),
+      p('nations', 'gunpowder_year', 'Gunpowder (technology year)', 0, 2000, 10, 'Eras begin for each nation when its own technology reaches the year: rich, large nations first.'),
+      p('nations', 'shipping_year', 'Ocean shipping (technology year)', 0, 2000, 10, 'Colonies across the sea.'),
+      p('nations', 'industrial_year', 'Industry (technology year)', 0, 2000, 10, 'Railways and faster growth.'),
+      p('nations', 'fertilizer_year', 'Synthetic fertilizer (technology year)', 0, 2100, 1, 'Farmland holds more people, phased in over 20 years (1909 in our world).'),
+      p('nations', 'motor_year', 'Motor age (technology year)', 0, 2100, 1, 'Cars and highways.'),
+      p('nations', 'air_year', 'Air age (technology year)', 0, 2100, 1, 'Airports and air routes.'),
+      p('nations', 'fertilizer_boost', 'Fertilizer boost', 1, 4, 0.05, 'How many times more people farmland holds with synthetic fertilizer.'),
+      p('nations', 'tech_lead_years', 'Technology lead (years)', 0, 100, 1, 'How far ahead of the calendar the most advanced nation can get.'),
+      p('nations', 'tech_spread', 'Technology catch-up', 0, 0.2, 0.005, 'Extra progress per year of gap to the level a nation\'s wealth, size and neighbours allow.'),
+      p('nations', 'tax', 'Tax share', 0, 0.5, 0.01, 'Share of output taxed: pays the army (30% of taxes), roads, railways and airports.'),
+      p('nations', 'road_cost', 'Road cost', 0, 10, 0.1, 'Multiplier on building and keeping roads.'),
+      p('nations', 'rail_cost', 'Railway and airport cost', 0, 10, 0.1, 'Multiplier on building and keeping railways and airports.'),
+      p('nations', 'road_every_years', 'Years between road projects', 1, 100, 1),
+      p('nations', 'railway_every_years', 'Years between railway projects', 1, 100, 1),
+      p('nations', 'transfer_km', 'Line change penalty (km)', 0, 2000, 10, 'Time lost changing trains at a junction, as km of travel on foot (a train covers about 8 km for each km on foot).'),
+      p('nations', 'overseas_km', 'Colony range (km)', 500, 20000, 100),
+      p('nations', 'railway_cities', 'Cities linked by rail per nation', 2, 40, 1),
+      p('nations', 'station_people', 'People per railway station', 0, 200000, 1000, 'Railway towns, also in the desert.'),
+      p('nations', 'capital_pull', 'Capital pull', 0, 1, 0.05, 'Attraction a capital grows into: people move there and it holds more (up to 5× at 1).'),
+      p('nations', 'capital_years', 'Years to grow a capital', 1, 300, 1),
+      p('nations', 'war_sack', 'Sack (share of people lost)', 0, 0.5, 0.01, 'When a province is conquered; four times as much for a capital.'),
+      p('nations', 'war_devastation', 'War devastation', 0, 1, 0.05, 'Conquest stops growth and drives people away until it heals: cities fought over again and again empty.'),
+      p('nations', 'recovery', 'Recovery per year', 0, 0.2, 0.005),
+      p('nations', 'migration', 'Migration to cities per year', 0, 0.05, 0.0005, 'Share of a nation\'s people that moves each year toward its capitals, stations and city pins.'),
     ],
   },
 ];

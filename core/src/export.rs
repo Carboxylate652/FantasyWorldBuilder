@@ -307,6 +307,12 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
                 write_cultures_png(dir, &r, &cm["table"], &prov_info, wpx, hpx)?;
                 files.push("cultures.png".into());
             }
+            if let Some(nm) = w.meta(Step::Nations).filter(|_| fresh(Step::Nations) && fresh(Step::Cultures)) {
+                progress(0.34, "Writing nations.png, railways.png and transport.png");
+                let centers: std::collections::HashMap<u32, (f64, f64)> = w.meta(Step::Provinces).map(|m| m["table"]["provinces"].as_array().into_iter().flatten().filter_map(|p| Some((p["id"].as_u64()? as u32, (p["center"][0].as_f64()?, p["center"][1].as_f64()?)))).collect()).unwrap_or_default();
+                write_nations_png(dir, &r, &nm["table"], &centers, &prov_info, wpx, hpx, opts)?;
+                files.extend(["nations.png".to_string(), "railways.png".to_string(), "transport.png".to_string()]);
+            }
             Some(r)
         }
         _ => None,
@@ -437,6 +443,9 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         files.extend(write_tables(dir, &table, wpx, hpx, opts)?);
         if let Some(cm) = cultures {
             files.extend(write_culture_tables(dir, &cm["table"])?);
+            if let Some(nm) = w.meta(Step::Nations).filter(|_| fresh(Step::Nations)) {
+                files.extend(write_nation_tables(dir, &nm["table"])?);
+            }
         }
     }
 
@@ -470,6 +479,18 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
             "culture_groups.csv": "id;name;color;population;cultures",
             "culture_events.csv": "year;event (emerged, split, merged, extinct);culture;other (parent of a split, culture a merge went into)",
             "province_cultures.csv": "province;population;culture (majority);shares (culture:share, shares ≥ 5%)",
+            "nations.png": "reference map at the start date: provinces coloured by owner, borders between nations dark, unruled land grey; railways dark with white stations",
+            "railways.png": "reference map: land grey, railways black, stations red, junctions (where lines meet and travellers change) blue",
+            "transport.png": "reference map: land grey with nation borders, roads (track light brown, paved road dark brown, highway orange), railways black with stations red and junctions blue, airports purple",
+            "nations.csv": "id;name;government (city-state, kingdom, empire);color;capital_province;capital_name;primary_culture;culture_name;provinces;population;overseas_provinces;founded;ended;fate;fate_other;parent;era (early, gunpowder, ocean shipping, industry, fertilizer, motor age, air age);tech (technology year);treasury;income (per year);integration (0–1, people-weighted);track_km;paved_km;highway_km;rail_km;stations;airports — every nation that ever existed (infrastructure at the start date, or when it ended)",
+            "nation_events.csv": "year;event (founded, independence, conquest of a capital, war summary, colony, union, renamed, era, railway, highway, airport, bankruptcy, metropolis, ruined, capital, ended);nation;other;province;text",
+            "railways.csv": "id;name;owner (nation that built it);opened;closed (empty while open);km;stations (province ids);provinces (province ids along the line, in order)",
+            "stations.csv": "province;name;owner;junction (two or more open lines stop here: travellers can change lines, at a time cost);lines (line ids)",
+            "roads.csv": "from;to (neighbouring province ids);quality (1 track, 2 paved road, 3 highway);kind;built (year of the last upgrade);km",
+            "airports.csv": "province;name;owner;opened",
+            "cities.csv": "rank;province;name;owner;population;capital;station;attraction (−1 to +1 at the start date);peak_population;peak_year — the 100 largest cities",
+            "ruins.csv": "province;name;population;peak_population;peak_year — cities that lost three quarters of their people (war, devastation, abandonment) and never recovered",
+            "province_nations.csv": "province;owner (nation, 0 = none);culture (majority at the start date, after assimilation);shares;population;railway (0 none, 1 track, 2 station, 3 junction);road (best road touching it: 0 none, 1 track, 2 paved, 3 highway);airport;integration (0–1: how well its owner's capital reaches it)",
             "trade_goods.csv": "good;kind (trade good, deposit, sea zone);category (staple, cash crop, livestock, forest, mineral, energy, sea);provinces;area_km2 — how much of the world has each good",
             "province_adjacency.csv": "from;to;type;border_km;barrier;crossing_km — every border between two provinces; type: land, river (along a border river), impassable (wasteland), coast (land–sea), lake, sea, strait (crossing_km = width); barrier = mean crossing cost of the border (0 = open)",
         },
@@ -882,6 +903,232 @@ fn write_cultures_png(dir: &Path, r: &clean::ProvRaster, t: &serde_json::Value, 
         prev = row;
     }
     wr.finish().map_err(|e| e.to_string())
+}
+
+/// nations.png (owners, borders, railways), railways.png and transport.png
+/// (roads by quality, railways with junctions, airports).
+#[allow(clippy::too_many_arguments)]
+fn write_nations_png(
+    dir: &Path,
+    r: &clean::ProvRaster,
+    t: &serde_json::Value,
+    centers: &std::collections::HashMap<u32, (f64, f64)>,
+    info: &std::collections::HashMap<u32, (u8, u16)>,
+    wpx: usize,
+    hpx: usize,
+    o: &ExportOptions,
+) -> Result<(), String> {
+    let mut owner_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for p in t["provinces"].as_array().into_iter().flatten() {
+        owner_of.insert(p["id"].as_u64().unwrap_or(0) as u32, p["owner"].as_u64().unwrap_or(0) as u32);
+    }
+    let mut color: std::collections::HashMap<u32, [u8; 3]> = std::collections::HashMap::new();
+    for n in t["nations"].as_array().into_iter().flatten() {
+        let c = &n["color"];
+        color.insert(n["id"].as_u64().unwrap_or(0) as u32, [c[0].as_u64().unwrap_or(0) as u8, c[1].as_u64().unwrap_or(0) as u8, c[2].as_u64().unwrap_or(0) as u8]);
+    }
+    // Railways as a pixel mask (1 track, 2 station, 3 junction), roads (1
+    // track, 2 paved, 3 highway) and airports.
+    let mut mask = vec![0u8; wpx * hpx];
+    let mut roads = vec![0u8; wpx * hpx];
+    let to_px = |id: u64| -> Option<(i64, i64)> {
+        let &(lat, lon) = centers.get(&(id as u32))?;
+        if lat < o.lat_min || lat > o.lat_max {
+            return None;
+        }
+        Some((((lon + 180.0) / 360.0 * wpx as f64).floor() as i64, ((o.lat_max - lat) / (o.lat_max - o.lat_min) * hpx as f64).floor() as i64))
+    };
+    let plot = |m: &mut [u8], x: i64, y: i64, v: u8, rad: i64| {
+        for dy in -rad..=rad {
+            for dx in -rad..=rad {
+                let (xx, yy) = ((x + dx).rem_euclid(wpx as i64), y + dy);
+                if yy >= 0 && (yy as usize) < hpx {
+                    let k = yy as usize * wpx + xx as usize;
+                    m[k] = m[k].max(v);
+                }
+            }
+        }
+    };
+    let seg = |m: &mut [u8], a: u64, b: u64, v: u8, rad: i64| {
+        let (Some(a), Some(mut b)) = (to_px(a), to_px(b)) else { return };
+        // Take the short way across the date line.
+        if (b.0 - a.0).abs() > wpx as i64 / 2 {
+            b.0 += if b.0 > a.0 { -(wpx as i64) } else { wpx as i64 };
+        }
+        let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+        for k in 0..=steps {
+            plot(m, a.0 + (b.0 - a.0) * k / steps, a.1 + (b.1 - a.1) * k / steps, v, rad);
+        }
+    };
+    let thick = ((wpx as f64 / 4096.0).round() as i64).max(0);
+    let junctions: std::collections::HashSet<u64> =
+        t["stations"].as_array().into_iter().flatten().filter(|s| s["junction"].as_bool() == Some(true)).filter_map(|s| s["province"].as_u64()).collect();
+    for line in t["railways"].as_array().into_iter().flatten().filter(|l| l["closed"].is_null()) {
+        let path: Vec<u64> = line["provinces"].as_array().into_iter().flatten().filter_map(|v| v.as_u64()).collect();
+        for w in path.windows(2) {
+            seg(&mut mask, w[0], w[1], 1, thick);
+        }
+        for s in line["stations"].as_array().into_iter().flatten().filter_map(|v| v.as_u64()) {
+            if let Some((x, y)) = to_px(s) {
+                plot(&mut mask, x, y, if junctions.contains(&s) { 3 } else { 2 }, thick + 1);
+            }
+        }
+    }
+    for r in t["roads"].as_array().into_iter().flatten() {
+        let q = r["quality"].as_u64().unwrap_or(1).clamp(1, 3) as u8;
+        seg(&mut roads, r["from"].as_u64().unwrap_or(0), r["to"].as_u64().unwrap_or(0), q, if q == 3 { thick + 1 } else { thick });
+    }
+    let mut air_mask = vec![0u8; wpx * hpx];
+    for a in t["airports"].as_array().into_iter().flatten() {
+        if let Some((x, y)) = to_px(a["province"].as_u64().unwrap_or(0)) {
+            plot(&mut air_mask, x, y, 1, thick + 3);
+        }
+    }
+    let enc = |name: &str| -> Result<png::StreamWriter<'static, BufWriter<File>>, String> {
+        let file = File::create(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
+        let mut e = png::Encoder::new(BufWriter::new(file), wpx as u32, hpx as u32);
+        e.set_color(png::ColorType::Rgb);
+        e.set_depth(png::BitDepth::Eight);
+        e.set_compression(png::Compression::Fast);
+        e.write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())
+    };
+    let mut nw = enc("nations.png")?;
+    let mut rw = enc("railways.png")?;
+    let mut tw = enc("transport.png")?;
+    // (owner, class) per province id: class 0 land, 2 lake, 3 sea.
+    let key = |id: u32| -> (u32, u8) {
+        let k = info.get(&id).map_or(3, |x| x.0);
+        if k >= 2 {
+            (0, k)
+        } else {
+            (owner_of.get(&id).copied().unwrap_or(0), 0)
+        }
+    };
+    let mut nl = vec![0u8; wpx * 3];
+    let mut rl = vec![0u8; wpx * 3];
+    let mut tl = vec![0u8; wpx * 3];
+    let mut prev: Vec<(u32, u8)> = Vec::new();
+    for y in 0..hpx {
+        let row: Vec<(u32, u8)> = r.ids[y * wpx..(y + 1) * wpx].iter().map(|&id| key(id)).collect();
+        for x in 0..wpx {
+            let (n, k) = row[x];
+            let water = match k {
+                2 => Some([110, 160, 215]),
+                3 => Some([40, 70, 120]),
+                _ => None,
+            };
+            let mut rgb = water.unwrap_or_else(|| if n > 0 { color.get(&n).copied().unwrap_or([150, 146, 138]) } else { [150, 146, 138] });
+            let mut border = false;
+            if k == 0 {
+                let nbs = [if x > 0 { Some(row[x - 1]) } else { None }, prev.get(x).copied()];
+                if nbs.into_iter().flatten().any(|nb| nb.1 == 0 && nb.0 != n) {
+                    rgb = rgb.map(|v| (v as f64 * 0.45) as u8);
+                    border = true;
+                }
+            }
+            let i = y * wpx + x;
+            let m = mask[i];
+            let rail_rgb = match m {
+                3 => Some(([255, 255, 255], [30, 90, 220])),
+                2 => Some(([255, 255, 255], [200, 30, 30])),
+                1 => Some(([25, 25, 25], [0, 0, 0])),
+                _ => None,
+            };
+            let base_r = water.map(|w| w.map(|v| ((v as u32 + 255) / 2) as u8)).unwrap_or([205, 200, 190]);
+            let (a, b) = match rail_rgb {
+                Some((a, b)) => (a, b),
+                None => (rgb, base_r),
+            };
+            // transport.png: roads by quality under the railways, airports on top.
+            let base_t = if border && water.is_none() { [165, 160, 150] } else { base_r };
+            let tc = if air_mask[i] > 0 {
+                [140, 40, 170]
+            } else if let Some((_, b)) = rail_rgb {
+                b
+            } else {
+                match roads[i] {
+                    3 => [235, 130, 20],
+                    2 => [125, 85, 50],
+                    1 => [175, 150, 115],
+                    _ => base_t,
+                }
+            };
+            nl[x * 3..x * 3 + 3].copy_from_slice(&a);
+            rl[x * 3..x * 3 + 3].copy_from_slice(&b);
+            tl[x * 3..x * 3 + 3].copy_from_slice(&tc);
+        }
+        nw.write_all(&nl).map_err(|e| e.to_string())?;
+        rw.write_all(&rl).map_err(|e| e.to_string())?;
+        tw.write_all(&tl).map_err(|e| e.to_string())?;
+        prev = row;
+    }
+    tw.finish().map_err(|e| e.to_string())?;
+    nw.finish().map_err(|e| e.to_string())?;
+    rw.finish().map_err(|e| e.to_string())
+}
+
+/// nations.csv, nation_events.csv, railways.csv, stations.csv, roads.csv,
+/// airports.csv, province_nations.csv, cities.csv, ruins.csv.
+fn write_nation_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>, String> {
+    let empty = vec![];
+    let arr = |k: &str| t[k].as_array().unwrap_or(&empty);
+    let write = |name: &str, text: String| std::fs::write(dir.join(name), text).map_err(|e| format!("{name}: {e}"));
+    let hexc = |c: &serde_json::Value| format!("x{:02X}{:02X}{:02X}", c[0].as_u64().unwrap_or(0), c[1].as_u64().unwrap_or(0), c[2].as_u64().unwrap_or(0));
+    let opt = |v: &serde_json::Value| if v.is_null() { String::new() } else { csv_text(v) };
+    let ids = |v: &serde_json::Value| v.as_array().map(|a| a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    let mut na = String::from("id;name;government;color;capital_province;capital_name;primary_culture;culture_name;provinces;population;overseas_provinces;founded;ended;fate;fate_other;parent;era;tech;treasury;income;integration;track_km;paved_km;highway_km;rail_km;stations;airports\n");
+    for n in arr("nations") {
+        let rk = &n["road_km"];
+        na += &format!(
+            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
+            n["id"], csv_text(&n["name"]), csv_text(&n["government"]), hexc(&n["color"]), n["capital"], csv_text(&n["capital_name"]), n["primary_culture"], csv_text(&n["culture_name"]),
+            n["provinces"], n["population"], n["overseas_provinces"], n["founded"], opt(&n["ended"]), opt(&n["fate"]), n["fate_other"], n["parent"],
+            csv_text(&n["era"]), n["tech"], n["treasury"], n["income"], n["integration"], rk["track"], rk["paved"], rk["highway"], n["rail_km"], n["stations"], n["airports"],
+        );
+    }
+    write("nations.csv", na)?;
+    let mut ev = String::from("year;event;nation;other;province;text\n");
+    for e in arr("events") {
+        ev += &format!("{};{};{};{};{};{}\n", e["year"], csv_text(&e["event"]), e["nation"], e["other"], opt(&e["province"]), csv_text(&e["text"]));
+    }
+    write("nation_events.csv", ev)?;
+    let mut rw = String::from("id;name;owner;opened;closed;km;stations;provinces\n");
+    for r in arr("railways") {
+        rw += &format!("{};{};{};{};{};{};{};{}\n", r["id"], csv_text(&r["name"]), r["owner"], r["opened"], opt(&r["closed"]), r["km"], ids(&r["stations"]), ids(&r["provinces"]));
+    }
+    write("railways.csv", rw)?;
+    let mut st = String::from("province;name;owner;junction;lines\n");
+    for s in arr("stations") {
+        st += &format!("{};{};{};{};{}\n", s["province"], csv_text(&s["name"]), s["owner"], s["junction"], ids(&s["lines"]));
+    }
+    write("stations.csv", st)?;
+    let mut ro = String::from("from;to;quality;kind;built;km\n");
+    for r in arr("roads") {
+        ro += &format!("{};{};{};{};{};{}\n", r["from"], r["to"], r["quality"], csv_text(&r["kind"]), r["built"], r["km"]);
+    }
+    write("roads.csv", ro)?;
+    let mut ai = String::from("province;name;owner;opened\n");
+    for a in arr("airports") {
+        ai += &format!("{};{};{};{}\n", a["province"], csv_text(&a["name"]), a["owner"], a["opened"]);
+    }
+    write("airports.csv", ai)?;
+    let mut pn = String::from("province;owner;culture;shares;population;railway;road;airport;integration\n");
+    for p in arr("provinces") {
+        let sh = p["shares"].as_array().map(|a| a.iter().map(|s| format!("{}:{}", s[0], s[1])).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        pn += &format!("{};{};{};{};{};{};{};{};{}\n", p["id"], p["owner"], p["culture"], sh, p["population"], p["railway"], p["road"], p["airport"], p["integration"]);
+    }
+    write("province_nations.csv", pn)?;
+    let mut ci = String::from("rank;province;name;owner;population;capital;station;attraction;peak_population;peak_year\n");
+    for (k, c) in arr("cities").iter().enumerate() {
+        ci += &format!("{};{};{};{};{};{};{};{};{};{}\n", k + 1, c["province"], csv_text(&c["name"]), c["owner"], c["population"], c["capital"], c["station"], c["attraction"], c["peak"], c["peak_year"]);
+    }
+    write("cities.csv", ci)?;
+    let mut ru = String::from("province;name;population;peak_population;peak_year\n");
+    for r in arr("ruins") {
+        ru += &format!("{};{};{};{};{}\n", r["province"], csv_text(&r["name"]), r["population"], r["peak"], r["peak_year"]);
+    }
+    write("ruins.csv", ru)?;
+    Ok(["nations.csv", "nation_events.csv", "railways.csv", "stations.csv", "roads.csv", "airports.csv", "province_nations.csv", "cities.csv", "ruins.csv"].map(String::from).to_vec())
 }
 
 /// cultures.csv, culture_groups.csv, culture_events.csv, province_cultures.csv.
