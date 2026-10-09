@@ -186,3 +186,20 @@ code { background: #0d1015; padding: 1px 5px; border-radius: 4px; }
 .list .item .muted { text-align: right; font-size: 11px; }
 .summary .warn { font-size: 11px; margin-top: 4px; color: #e6c27a; }
 .summary .error { padding: 6px 8px; font-size: 12px; margin-top: 6px; }
+
+/* Override layers and updates */
+.modal.wide { width: min(720px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow: auto; }
+.modal .actions .spacer { flex: 1; }
+table.ovr { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 12.5px; }
+table.ovr th { text-align: left; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--line); padding: 4px 6px; }
+table.ovr td { padding: 3px 6px; border-bottom: 1px solid rgba(255,255,255,.04); }
+table.ovr .num { text-align: right; font-variant-numeric: tabular-nums; }
+table.ovr tr.muted td { color: var(--muted); }
+.unapplied { border: 1px solid rgba(217,164,65,.4); background: rgba(217,164,65,.08); border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+.unapplied ul { margin: 6px 0; padding-left: 18px; font-size: 12px; }
+#update-banner { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 12px; background: rgba(95,179,124,.14); border-bottom: 1px solid rgba(95,179,124,.4); }
+#update-banner > span { flex: 1; min-width: 200px; }
+#topbar button.update { border-color: var(--ok); color: var(--ok); }
+#topbar button.ghost, #update-banner button.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.modal pre.notes { max-height: 180px; overflow: auto; white-space: pre-wrap; font-size: 11.5px; background: rgba(0,0,0,.2); border-radius: 6px; padding: 6px 8px; margin: 6px 0; }
+.modal .result .row { display: flex; gap: 8px; margin: 6px 0; }

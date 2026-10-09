@@ -46,7 +46,7 @@ pub enum Tool {
     RenameState,
     // Goods editor: the provinces under the brush get a trade good (value
     // 1–14, as in resources::TRADE_GOODS), gain a deposit (101–106) or lose
-    // one (201–206, as in resources::DEPOSITS).
+    // one (201–207, as in resources::DEPOSITS).
     GoodsPaint,
     // Founding-band pins for the culture simulation: value = bands. A drag
     // that starts on a pin moves it; erase removes the nearest pin.
@@ -95,6 +95,79 @@ pub enum EditLayer {
     Bands,
     Attraction,
 }
+
+impl EditLayer {
+    pub const ALL: [EditLayer; 11] = [
+        EditLayer::Sketch,
+        EditLayer::Plates,
+        EditLayer::Elevation,
+        EditLayer::Biomes,
+        EditLayer::Barriers,
+        EditLayer::Sites,
+        EditLayer::Fertility,
+        EditLayer::States,
+        EditLayer::Provinces,
+        EditLayer::Bands,
+        EditLayer::Attraction,
+    ];
+
+    /// Name used in files, the API and the CLI (same as the serde name).
+    pub fn key(self) -> &'static str {
+        match self {
+            EditLayer::Sketch => "sketch",
+            EditLayer::Plates => "plates",
+            EditLayer::Elevation => "elevation",
+            EditLayer::Biomes => "biomes",
+            EditLayer::Barriers => "barriers",
+            EditLayer::States => "states",
+            EditLayer::Provinces => "provinces",
+            EditLayer::Sites => "sites",
+            EditLayer::Fertility => "fertility",
+            EditLayer::Bands => "bands",
+            EditLayer::Attraction => "attraction",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<EditLayer> {
+        EditLayer::ALL.into_iter().find(|l| l.key() == k)
+    }
+
+    /// The first step that reads this layer: editing it makes that step and
+    /// everything after it stale.
+    pub fn step(self) -> crate::stages::Step {
+        use crate::stages::Step;
+        match self {
+            EditLayer::Sketch => Step::Sketch,
+            EditLayer::Plates => Step::Plates,
+            EditLayer::Elevation => Step::Relief,
+            EditLayer::Biomes => Step::Biomes,
+            EditLayer::Barriers | EditLayer::Sites | EditLayer::Fertility => Step::Habitability,
+            EditLayer::States => Step::States,
+            EditLayer::Provinces => Step::Provinces,
+            EditLayer::Bands | EditLayer::Attraction => Step::Cultures,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            EditLayer::Sketch => "Continent sketch",
+            EditLayer::Plates => "Plate paint",
+            EditLayer::Elevation => "Relief brushes",
+            EditLayer::Biomes => "Biome paint",
+            EditLayer::Barriers => "Barriers",
+            EditLayer::States => "States (paint, merge, rename)",
+            EditLayer::Provinces => "Provinces (paint, merge, move, rename, goods)",
+            EditLayer::Sites => "Site pins",
+            EditLayer::Fertility => "Fertility",
+            EditLayer::Bands => "Founding bands",
+            EditLayer::Attraction => "Attraction",
+        }
+    }
+}
+
+/// Format tag of an override bundle file (`*.fwm-overrides.json`).
+pub const BUNDLE_FORMAT: &str = "fwm-overrides";
+pub const BUNDLE_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -275,6 +348,131 @@ impl Edits {
             },
         }
     }
+    /// Strokes of an override layer (the sketch layer: its strokes only).
+    pub fn strokes(&self, layer: EditLayer) -> &Vec<Stroke> {
+        let o = &self.overrides;
+        match layer {
+            EditLayer::Sketch => &self.sketch.strokes,
+            EditLayer::Plates => &o.plates,
+            EditLayer::Elevation => &o.elevation,
+            EditLayer::Biomes => &o.biomes,
+            EditLayer::Barriers => &o.barriers,
+            EditLayer::States => &o.states,
+            EditLayer::Provinces => &o.provinces,
+            EditLayer::Sites => &o.sites,
+            EditLayer::Fertility => &o.fertility,
+            EditLayer::Bands => &o.bands,
+            EditLayer::Attraction => &o.attraction,
+        }
+    }
+
+    fn strokes_mut(&mut self, layer: EditLayer) -> &mut Vec<Stroke> {
+        let o = &mut self.overrides;
+        match layer {
+            EditLayer::Sketch => &mut self.sketch.strokes,
+            EditLayer::Plates => &mut o.plates,
+            EditLayer::Elevation => &mut o.elevation,
+            EditLayer::Biomes => &mut o.biomes,
+            EditLayer::Barriers => &mut o.barriers,
+            EditLayer::States => &mut o.states,
+            EditLayer::Provinces => &mut o.provinces,
+            EditLayer::Sites => &mut o.sites,
+            EditLayer::Fertility => &mut o.fertility,
+            EditLayer::Bands => &mut o.bands,
+            EditLayer::Attraction => &mut o.attraction,
+        }
+    }
+
+    /// Number of edits in a layer (the sketch layer counts its plate pins and
+    /// motion arrows too).
+    pub fn count(&self, layer: EditLayer) -> usize {
+        self.strokes(layer).len() + if layer == EditLayer::Sketch { self.sketch.pins.len() + self.sketch.arrows.len() } else { 0 }
+    }
+
+    /// Remove strokes by index (indices out of range are ignored).
+    pub fn remove_strokes(&mut self, layer: EditLayer, indices: &[usize]) -> usize {
+        let mut idx: Vec<usize> = indices.to_vec();
+        idx.sort_unstable();
+        idx.dedup();
+        let v = self.strokes_mut(layer);
+        let mut removed = 0;
+        for &i in idx.iter().rev() {
+            if i < v.len() {
+                v.remove(i);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// An override bundle with the given layers: a JSON file that carries
+    /// edits to another project or seed. File imports (heightmap, provinces
+    /// image) are not included, since they point at files on this machine.
+    pub fn bundle(&self, layers: &[EditLayer], seed: u64) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        for &l in layers {
+            let v = if l == EditLayer::Sketch { serde_json::to_value(&self.sketch) } else { serde_json::to_value(self.strokes(l)) };
+            m.insert(l.key().into(), v.unwrap());
+        }
+        serde_json::json!({ "format": BUNDLE_FORMAT, "version": BUNDLE_VERSION, "source_seed": seed, "layers": m })
+    }
+
+    /// Add (or with `replace`, swap in) the layers of a bundle. Only the
+    /// layers in `only` are taken when it is given. Returns (layer, edits) per
+    /// layer taken.
+    pub fn apply_bundle(&mut self, bundle: &serde_json::Value, only: Option<&[EditLayer]>, replace: bool) -> Result<Vec<(EditLayer, usize)>, String> {
+        if bundle["format"].as_str() != Some(BUNDLE_FORMAT) {
+            return Err("not an override bundle (format should be \"fwm-overrides\")".into());
+        }
+        let version = bundle["version"].as_u64().unwrap_or(0);
+        if version == 0 || version > BUNDLE_VERSION as u64 {
+            return Err(format!("override bundle version {version} is not supported (this build reads up to {BUNDLE_VERSION})"));
+        }
+        let layers = bundle["layers"].as_object().ok_or("override bundle has no layers")?;
+        // Parse everything first, so a bad layer changes nothing.
+        let mut parsed: Vec<(EditLayer, Option<Sketch>, Vec<Stroke>)> = Vec::new();
+        for (k, v) in layers {
+            let l = EditLayer::from_key(k).ok_or_else(|| format!("unknown override layer `{k}`"))?;
+            if only.is_some_and(|o| !o.contains(&l)) {
+                continue;
+            }
+            if l == EditLayer::Sketch {
+                let sk: Sketch = serde_json::from_value(v.clone()).map_err(|e| format!("layer sketch: {e}"))?;
+                parsed.push((l, Some(sk), vec![]));
+            } else {
+                let st: Vec<Stroke> = serde_json::from_value(v.clone()).map_err(|e| format!("layer {k}: {e}"))?;
+                if let Some(bad) = st.iter().find(|s| s.tool.layer() != l) {
+                    return Err(format!("layer {k}: a {:?} stroke does not belong to it", bad.tool));
+                }
+                parsed.push((l, None, st));
+            }
+        }
+        let mut out = Vec::new();
+        for (l, sk, st) in parsed {
+            if replace {
+                self.clear_layer(l);
+            }
+            match sk {
+                Some(sk) => {
+                    let n = sk.strokes.len() + sk.pins.len() + sk.arrows.len();
+                    if replace {
+                        self.sketch = sk;
+                    } else {
+                        self.sketch.strokes.extend(sk.strokes);
+                        self.sketch.pins.extend(sk.pins);
+                        self.sketch.arrows.extend(sk.arrows);
+                    }
+                    out.push((l, n));
+                }
+                None => {
+                    out.push((l, st.len()));
+                    self.strokes_mut(l).extend(st);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn clear_layer(&mut self, layer: EditLayer) {
         match layer {
             EditLayer::Sketch => {

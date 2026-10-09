@@ -474,3 +474,118 @@ fn attraction_makes_metropolis_and_ghost_town() {
     assert!(after[&ia] > 1.5 * before[&ia], "metropolis: {} -> {}", before[&ia], after[&ia]);
     assert!(after[&ib] < 0.2 * before[&ib], "ghost town: {} -> {}", before[&ib], after[&ib]);
 }
+
+#[test]
+fn override_bundles_carry_edits_to_another_seed() {
+    use worldcore::edits::{EditLayer, Stroke, Tool};
+    let mut a = World::new(small_params(21));
+    let st = |tool: Tool, points: Vec<[f64; 2]>, value: f64| Stroke { tool, points, value, radius_km: 300.0, ..Default::default() };
+    a.edits.add_stroke(st(Tool::FertilityPaint, vec![[10.0, 20.0]], 0.8));
+    a.edits.add_stroke(st(Tool::Attraction, vec![[-5.0, 40.0]], 1.0));
+    a.edits.add_stroke(st(Tool::BandPin, vec![[30.0, 0.0]], 4.0));
+    a.edits.add_stroke(st(Tool::BiomePaint, vec![[0.0, 0.0], [1.0, 1.0]], 3.0));
+    let all = [EditLayer::Fertility, EditLayer::Attraction, EditLayer::Bands, EditLayer::Biomes];
+    let bundle: serde_json::Value = serde_json::from_str(&serde_json::to_string(&a.edits.bundle(&all, 21)).unwrap()).unwrap();
+
+    // Another seed takes the edits as they are (they are stored in lat/lon).
+    let mut b = World::new(small_params(22));
+    b.edits.add_stroke(st(Tool::FertilityPaint, vec![[50.0, 50.0]], -1.0));
+    let taken = b.edits.apply_bundle(&bundle, None, false).unwrap();
+    assert_eq!(taken.len(), 4);
+    assert_eq!(b.edits.overrides.fertility.len(), 2, "added to the existing edits");
+    assert_eq!(b.edits.overrides.attraction, a.edits.overrides.attraction);
+    // Replace swaps a layer; a filter takes only the named layers.
+    let mut c = b.edits.clone();
+    c.apply_bundle(&bundle, Some(&[EditLayer::Fertility]), true).unwrap();
+    assert_eq!(c.overrides.fertility, a.edits.overrides.fertility);
+    assert_eq!(c.overrides.attraction.len(), 1, "filtered out layers are untouched");
+    // Bad bundles change nothing.
+    let mut bad = bundle.clone();
+    bad["layers"]["biomes"] = serde_json::json!([{ "tool": "band_pin", "points": [[0.0, 0.0]] }]);
+    let before = b.edits.clone();
+    assert!(b.edits.apply_bundle(&bad, None, false).is_err(), "a stroke in the wrong layer is refused");
+    assert!(b.edits.apply_bundle(&serde_json::json!({ "format": "x" }), None, false).is_err());
+    assert!(b.edits.apply_bundle(&serde_json::json!({ "format": "fwm-overrides", "version": 99, "layers": {} }), None, false).is_err());
+    assert_eq!(b.edits, before);
+    // Removing by index.
+    assert_eq!(b.edits.remove_strokes(EditLayer::Fertility, &[0, 0, 9]), 1);
+    assert_eq!(b.edits.count(EditLayer::Fertility), 1);
+}
+
+#[test]
+fn validation_and_unapplied_edits() {
+    use worldcore::edits::{Stroke, Tool};
+    let mut w = World::new(small_params(8));
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let rep = worldcore::validate::validate(&mut w);
+    assert!(rep.ok, "a generated world passes: {:?}", rep.errors);
+    assert!(rep.checks.len() >= 6, "checks ran: {:?}", rep.checks);
+    assert!(rep.warnings.is_empty(), "{:?}", rep.warnings);
+
+    // A merge drawn in the open ocean, and a rename of nothing: both are
+    // reported as no longer applying, with their index in the layer.
+    let sea = {
+        let t = &w.meta(Step::Provinces).unwrap()["table"];
+        let p = t["provinces"].as_array().unwrap().iter().find(|p| p["kind"] == "sea" && p["band"] == "open").unwrap().clone();
+        [p["center"][0].as_f64().unwrap(), p["center"][1].as_f64().unwrap()]
+    };
+    let st = |tool: Tool, points: Vec<[f64; 2]>| Stroke { tool, points, name: "Nowhere".into(), ..Default::default() };
+    w.edits.add_stroke(st(Tool::StateMerge, vec![sea, sea]));
+    w.edits.add_stroke(st(Tool::RenameState, vec![sea]));
+    w.edits.add_stroke(st(Tool::ProvinceToState, vec![sea, sea]));
+    assert!(worldcore::validate::validate(&mut w).warnings.iter().any(|m| m.contains("stale")));
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let r = worldcore::api::overrides_report(&w);
+    let un = r["unapplied"].as_array().unwrap();
+    assert_eq!(un.len(), 3, "{un:?}");
+    assert_eq!((un[0]["layer"].as_str(), un[0]["index"].as_u64()), (Some("states"), Some(0)));
+    assert_eq!((un[2]["layer"].as_str(), un[2]["index"].as_u64()), (Some("provinces"), Some(0)));
+    assert_eq!(r["total"], 3);
+    let rep = worldcore::validate::validate(&mut w);
+    assert!(rep.ok && rep.warnings.len() == 3, "{:?}", rep.warnings);
+}
+
+#[test]
+fn cash_crops_oil_and_goods_editor() {
+    use worldcore::edits::{Stroke, Tool};
+    use worldcore::stages::resources::{category, good_index, DEPOSITS, TRADE_GOODS};
+    // Editor numbers stay where they were: old goods and deposits keep their values.
+    assert_eq!(good_index("grain"), 1);
+    assert_eq!(good_index("camels"), 14);
+    assert_eq!(good_index("none"), 0);
+    assert_eq!(good_index("coffee"), 18);
+    assert_eq!(DEPOSITS[5], "salt");
+    assert_eq!(DEPOSITS[6], "oil");
+    assert_eq!(category("rubber", "trade good"), "cash crop");
+    assert_eq!(category("oil", "deposit"), "energy");
+
+    let mut w = World::new(small_params(12));
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let t = w.meta(Step::Provinces).unwrap()["table"].clone();
+    let land: Vec<&serde_json::Value> = t["provinces"].as_array().unwrap().iter().filter(|p| p["kind"] == "land").collect();
+    let crops = land.iter().filter(|p| category(p["trade_good"].as_str().unwrap(), "trade good") == "cash crop" && p["trade_good"] != "wine" && p["trade_good"] != "spices" && p["trade_good"] != "dates").count();
+    let oil = land.iter().filter(|p| p["resources"].as_array().unwrap().iter().any(|r| r == "oil")).count();
+    assert!(crops > 0 && crops < land.len() / 2, "plantation crops: {crops} of {}", land.len());
+    assert!(oil > 0 && oil < land.len() / 5, "oil: {oil} of {}", land.len());
+    assert!(land.iter().all(|p| TRADE_GOODS.contains(&p["trade_good"].as_str().unwrap())));
+
+    // Paint coffee and add oil to one province, remove oil from another.
+    let ll = |p: &serde_json::Value| [p["center"][0].as_f64().unwrap(), p["center"][1].as_f64().unwrap()];
+    let a = land.iter().find(|p| p["area_km2"].as_f64().unwrap() > 20000.0).unwrap();
+    let with_oil = land.iter().find(|p| p["id"] != a["id"] && p["resources"].as_array().unwrap().iter().any(|r| r == "oil")).unwrap();
+    let st = |p: [f64; 2], v: f64| Stroke { tool: Tool::GoodsPaint, points: vec![p], value: v, radius_km: 10.0, ..Default::default() };
+    w.edits.add_stroke(st(ll(a), 18.0));
+    w.edits.add_stroke(st(ll(a), 107.0));
+    w.edits.add_stroke(st(ll(with_oil), 207.0));
+    w.edits.add_stroke(st(ll(with_oil), 15.0)); // "none" is not paintable: ignored
+    let good_before = with_oil["trade_good"].clone();
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let t = &w.meta(Step::Provinces).unwrap()["table"];
+    let find = |id: &serde_json::Value| t["provinces"].as_array().unwrap().iter().find(|p| p["id"] == *id).unwrap().clone();
+    let a2 = find(&a["id"]);
+    assert_eq!(a2["trade_good"], "coffee");
+    assert!(a2["resources"].as_array().unwrap().iter().any(|r| r == "oil"));
+    let o2 = find(&with_oil["id"]);
+    assert!(!o2["resources"].as_array().unwrap().iter().any(|r| r == "oil"));
+    assert_eq!(o2["trade_good"], good_before);
+}

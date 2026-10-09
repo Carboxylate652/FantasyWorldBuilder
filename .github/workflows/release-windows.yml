@@ -43,6 +43,8 @@ jobs:
           elif [[ "$MESSAGE" =~ \[release\ (v[0-9A-Za-z.+-]+)\] ]]; then tag="${BASH_REMATCH[1]}"
           else echo "No release tag found" >&2; exit 1; fi
           echo "TAG=$tag" >> "$GITHUB_ENV"
+          # Built into the app and the CLI: the version the update check compares.
+          echo "FWM_RELEASE_TAG=$tag" >> "$GITHUB_ENV"
           echo "Releasing $tag"
 
       - uses: actions/setup-node@v4
@@ -59,8 +61,8 @@ jobs:
         working-directory: app
         run: npm ci
 
-      - name: Test the simulation core
-        run: cargo test --release -p worldcore
+      - name: Test the simulation core and the updater
+        run: cargo test --release -p worldcore -p fwm-update
 
       - name: Build the installer and publish the release
         uses: tauri-apps/tauri-action@v0
@@ -76,6 +78,8 @@ jobs:
 
             - **`…_x64-setup.exe`**: installer (recommended).
             - **`FantasyWorldMaker-${{ env.TAG }}-windows-x64-portable.zip`**: no install; unzip and run `worldbuilder-app.exe`. Also contains the `worldgen.exe` command-line tool.
+
+            Updating: from 0.1.0-beta.3 on, the app checks GitHub at startup and offers *Install and restart* when a newer release is out (it can be turned off under the version button in the top bar). Earlier versions need this download once.
 
             Requirements: 64-bit Windows 10 or 11 with Microsoft Edge WebView2 (preinstalled on Windows 11 and up-to-date Windows 10; the installer fetches it if missing).
 

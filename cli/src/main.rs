@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use worldcore::api::{self, ProgressState, Reply, Session};
+use worldcore::edits::{EditLayer, Stroke, Tool};
 use worldcore::export::{export, ExportOptions};
 use worldcore::params::WorldParams;
 use worldcore::stages::{Step, LAST, STEPS};
@@ -18,15 +19,36 @@ USAGE:
   worldgen run <project-dir> [--to STEP]
   worldgen export <project-dir> [--out DIR] [--width W] [--height H] [--lat-min A] [--lat-max B]
   worldgen generate --out <project-dir> [--seed N] [--level L] [--to STEP] [--export] [--width W] [--height H]
-  worldgen sweep --out <dir> --seeds A..B [--level L] [--width W] [--height H]
+  worldgen sweep --out <dir> --seeds A..B [--level L] [--to STEP] [--no-export] [--width W] [--height H]
+                                             also writes <dir>/sweep.csv (one row of key numbers per seed)
   worldgen import-heightmap <project-dir> <png> [--encoding heightmap16|paradox8|linear] [--min M --max M] [--blend B]
   worldgen import-provinces <project-dir> <provinces.png> [--csv definition.csv] [--lat-min A --lat-max B]
   worldgen validate-provinces <provinces.png> [--csv definition.csv]
   worldgen import-provinces <project-dir> --remove
   worldgen check [--seed N] [--level L]      determinism + save/load round-trip check
   worldgen stats <project-dir>               zonal climate, wind and rain-seasonality means
-  worldgen info <project-dir>
+  worldgen info <project-dir> [--json]
+  worldgen validate <project-dir> [--run] [--json]
+                                             consistency checks (tables, fields, goods, cultures,
+                                             override edits); exit code 1 on errors
+  worldgen overrides <project-dir> [list]    override layers: edits per layer, edits that no longer apply
+  worldgen overrides <project-dir> clear <layer>
+  worldgen overrides <project-dir> remove <layer> <index,index,...>
+  worldgen overrides <project-dir> prune     remove every edit that no longer applies
+  worldgen overrides <project-dir> export <file> [--layers a,b]
+  worldgen overrides <project-dir> import <file> [--layers a,b] [--replace]
+  worldgen edit <project-dir> --tool TOOL --at LAT,LON[;LAT,LON...] [--value V] [--radius KM]
+                [--strength S] [--hardness H] [--name NAME] [--run]
+                                             add one override stroke (tools as in the app:
+                                             province_merge, fertility_paint, band_pin, ...)
+  worldgen version
+  worldgen check-update [--betas | --stable] [--download DIR]
+                                             compare with the newest GitHub release; --download
+                                             fetches its portable zip (size and SHA-256 checked)
   worldgen serve [--port 8765] [--static DIR] [--project DIR] [--debug]
+
+LAYERS: sketch, plates, elevation, biomes, barriers, sites, fertility, states,
+        provinces, bands, attraction
 
 STEPS: planet, sketch, plates, relief, climate, hydrology, biomes (Stage 1),
        habitability, states, provinces (Stage 2), cultures (Stage 3; default: cultures)
@@ -124,6 +146,10 @@ fn run_world(w: &mut World, to: Step) {
 fn summary(w: &World) {
     for st in w.status() {
         let m = &st.meta;
+        if m.is_null() {
+            println!("  {:<22} {:<6}", st.title, st.state);
+            continue;
+        }
         let extra = match st.key {
             "planet" => format!("{} cells, {:.0} km spacing", m["cells"], m["spacing_km"].as_f64().unwrap_or(0.0)),
             "sketch" => format!("land {:.1}%", m["land_fraction"].as_f64().unwrap_or(0.0) * 100.0),
@@ -207,21 +233,46 @@ fn main() {
             let seeds = args.get("seeds").unwrap_or("1..4");
             let (a, b) = seeds.split_once("..").unwrap_or_else(|| die("--seeds A..B"));
             let (a, b): (u64, u64) = (a.parse().unwrap_or(1), b.parse().unwrap_or(4));
+            let to = step_arg(&args);
+            let mut csv = String::from("seed;level;land_pct;states;provinces;land_provinces;cultures;culture_groups;population_m;cash_crop_provinces;oil_provinces;unapplied_edits;validation;seconds\n");
             for seed in a..=b {
                 let mut p = params_from(&args);
                 p.planet.seed = seed;
                 p.planet.grid_level = args.num("level", 7);
+                let level = p.planet.grid_level;
                 let mut w = World::new(p);
                 eprintln!("seed {seed}");
-                run_world(&mut w, LAST);
-                let mut o = export_opts(&args);
-                o.width = args.num("width", 2048);
-                o.height = args.num("height", 1024);
+                let t0 = Instant::now();
+                run_world(&mut w, to);
+                let secs = t0.elapsed().as_secs_f64();
                 let dir = out.join(format!("seed-{seed}"));
                 w.save(&dir).unwrap_or_else(|e| die(&e.to_string()));
-                export(&mut w, &dir.join("export"), &o, &|_, _| {}).unwrap_or_else(|e| die(&e));
+                if !args.flag("no-export") {
+                    let mut o = export_opts(&args);
+                    o.width = args.num("width", 2048);
+                    o.height = args.num("height", 1024);
+                    export(&mut w, &dir.join("export"), &o, &|_, _| {}).unwrap_or_else(|e| die(&e));
+                }
                 summary(&w);
+                let rep = worldcore::validate::validate(&mut w);
+                let m = |st: Step, k: &str| w.meta(st).map(|m| m[k].clone()).unwrap_or(serde_json::Value::Null);
+                let num = |v: serde_json::Value| v.as_f64().map_or(String::new(), |x| format!("{x}"));
+                let provs = w.meta(Step::Provinces).and_then(|m| m["table"]["provinces"].as_array().cloned()).unwrap_or_default();
+                let crops = provs.iter().filter(|p| p["trade_good"].as_str().is_some_and(|g| worldcore::stages::resources::category(g, "trade good") == "cash crop")).count();
+                let oil = provs.iter().filter(|p| p["resources"].as_array().is_some_and(|r| r.iter().any(|x| x == "oil"))).count();
+                let unapplied = worldcore::api::overrides_report(&w)["unapplied"].as_array().map_or(0, |a| a.len());
+                csv += &format!(
+                    "{seed};{level};{:.1};{};{};{};{};{};{};{crops};{oil};{unapplied};{};{secs:.1}\n",
+                    m(Step::Sketch, "land_fraction").as_f64().unwrap_or(0.0) * 100.0,
+                    num(m(Step::States, "states")), num(m(Step::Provinces, "provinces")), num(m(Step::Provinces, "land")),
+                    num(m(Step::Cultures, "cultures")), num(m(Step::Cultures, "groups")),
+                    m(Step::Cultures, "population").as_f64().map_or(String::new(), |x| format!("{:.2}", x / 1e6)),
+                    if rep.ok { "ok" } else { "errors" },
+                );
+                std::fs::create_dir_all(&out).ok();
+                std::fs::write(out.join("sweep.csv"), &csv).unwrap_or_else(|e| die(&e.to_string()));
             }
+            println!("wrote {}", out.join("sweep.csv").display());
         }
         "import-heightmap" => {
             use worldcore::edits::HeightEncoding;
@@ -273,9 +324,49 @@ fn main() {
         "info" => {
             let dir = PathBuf::from(args.pos.get(1).unwrap_or_else(|| die("missing project dir")));
             let w = World::load(&dir).unwrap_or_else(|e| die(&e));
-            println!("seed {} level {}", w.params.planet.seed, w.params.planet.grid_level);
-            summary(&w);
+            if args.flag("json") {
+                let steps: Vec<serde_json::Value> = w.status().iter().map(|st| serde_json::json!({ "step": st.key, "state": st.state, "millis": st.millis })).collect();
+                let out = serde_json::json!({ "seed": w.params.planet.seed, "level": w.params.planet.grid_level, "steps": steps, "overrides": worldcore::api::overrides_report(&w) });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                println!("seed {} level {}", w.params.planet.seed, w.params.planet.grid_level);
+                summary(&w);
+                let total = worldcore::api::overrides_report(&w)["total"].as_u64().unwrap_or(0);
+                if total > 0 {
+                    println!("  {total} override edits (worldgen overrides {} for details)", dir.display());
+                }
+            }
         }
+        "validate" => {
+            let dir = PathBuf::from(args.pos.get(1).unwrap_or_else(|| die("missing project dir")));
+            let mut w = World::load(&dir).unwrap_or_else(|e| die(&e));
+            if args.flag("run") {
+                run_world(&mut w, LAST);
+                w.save(&dir).unwrap_or_else(|e| die(&e.to_string()));
+            }
+            let rep = worldcore::validate::validate(&mut w);
+            if args.flag("json") {
+                println!("{}", serde_json::to_string_pretty(&rep).unwrap());
+            } else {
+                for c in &rep.checks {
+                    println!("  check    {c}");
+                }
+                for e in &rep.errors {
+                    println!("  error    {e}");
+                }
+                for wn in &rep.warnings {
+                    println!("  warning  {wn}");
+                }
+                println!("{}: {} checks, {} errors, {} warnings", if rep.ok { "PASS" } else { "FAIL" }, rep.checks.len(), rep.errors.len(), rep.warnings.len());
+            }
+            if !rep.ok {
+                std::process::exit(1);
+            }
+        }
+        "overrides" => overrides(&args),
+        "edit" => edit(&args),
+        "version" => println!("worldgen {}", fwm_update::current_version()),
+        "check-update" => check_update(&args),
         "serve" => serve(&args),
         "stats" => {
             let dir = PathBuf::from(args.pos.get(1).unwrap_or_else(|| die("missing project dir")));
@@ -394,6 +485,155 @@ fn print_report(r: &worldcore::province_import::Report) {
     }
 }
 
+fn layer_arg(k: &str) -> EditLayer {
+    EditLayer::from_key(k).unwrap_or_else(|| die(&format!("unknown layer `{k}` (see LAYERS in worldgen help)")))
+}
+
+fn layers_opt(args: &Args) -> Option<Vec<EditLayer>> {
+    args.get("layers").map(|v| v.split(',').map(|k| layer_arg(k.trim())).collect())
+}
+
+/// `worldgen overrides`: inspect and manage the override layers of a project.
+fn overrides(args: &Args) {
+    let dir = PathBuf::from(args.pos.get(1).unwrap_or_else(|| die("missing project dir")));
+    let mut w = World::load(&dir).unwrap_or_else(|e| die(&e));
+    let sub = args.pos.get(2).map(String::as_str).unwrap_or("list");
+    let save = |w: &World| w.save(&dir).unwrap_or_else(|e| die(&e.to_string()));
+    match sub {
+        "list" => {
+            let r = api::overrides_report(&w);
+            println!("  {:<12} {:>6}  {:<13} layer", "key", "edits", "first step");
+            for l in r["layers"].as_array().into_iter().flatten() {
+                println!("  {:<12} {:>6}  {:<13} {}", l["layer"].as_str().unwrap_or(""), l["edits"].as_u64().unwrap_or(0), l["step"].as_str().unwrap_or(""), l["title"].as_str().unwrap_or(""));
+            }
+            let un = r["unapplied"].as_array().cloned().unwrap_or_default();
+            if un.is_empty() {
+                println!("all edits apply (as of the last up-to-date run of states and provinces)");
+            } else {
+                println!("{} edits no longer apply:", un.len());
+                for u in &un {
+                    println!("  {} #{} {} at {}: {}", u["layer"].as_str().unwrap_or(""), u["index"], u["tool"].as_str().unwrap_or(""), u["at"], u["reason"].as_str().unwrap_or(""));
+                }
+            }
+        }
+        "clear" => {
+            let l = layer_arg(args.pos.get(3).unwrap_or_else(|| die("missing layer")));
+            let n = w.edits.count(l);
+            w.edits.clear_layer(l);
+            save(&w);
+            println!("cleared {n} edits from {}", l.key());
+        }
+        "remove" => {
+            let l = layer_arg(args.pos.get(3).unwrap_or_else(|| die("missing layer")));
+            let idx: Vec<usize> = args.pos.get(4).unwrap_or_else(|| die("missing indices")).split(',').map(|x| x.trim().parse().unwrap_or_else(|_| die("indices are numbers"))).collect();
+            let n = w.edits.remove_strokes(l, &idx);
+            save(&w);
+            println!("removed {n} edits from {}", l.key());
+        }
+        "prune" => {
+            run_world(&mut w, Step::Provinces);
+            let r = api::overrides_report(&w);
+            let mut by_layer: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+            for u in r["unapplied"].as_array().into_iter().flatten() {
+                by_layer.entry(u["layer"].as_str().unwrap_or("").into()).or_default().push(u["index"].as_u64().unwrap_or(0) as usize);
+            }
+            let mut n = 0;
+            for (k, idx) in &by_layer {
+                n += w.edits.remove_strokes(layer_arg(k), idx);
+            }
+            save(&w);
+            println!("removed {n} edits that no longer apply");
+        }
+        "export" => {
+            let file = args.pos.get(3).unwrap_or_else(|| die("missing file"));
+            let layers = layers_opt(args).unwrap_or_else(|| EditLayer::ALL.into_iter().filter(|&l| w.edits.count(l) > 0).collect());
+            let b = w.edits.bundle(&layers, w.params.planet.seed);
+            std::fs::write(file, serde_json::to_string_pretty(&b).unwrap()).unwrap_or_else(|e| die(&format!("{file}: {e}")));
+            println!("wrote {} layers to {file}: {}", layers.len(), layers.iter().map(|l| format!("{} ({})", l.key(), w.edits.count(*l))).collect::<Vec<_>>().join(", "));
+        }
+        "import" => {
+            let file = args.pos.get(3).unwrap_or_else(|| die("missing file"));
+            let text = std::fs::read_to_string(file).unwrap_or_else(|e| die(&format!("{file}: {e}")));
+            let b: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("{file}: {e}")));
+            let only = layers_opt(args);
+            let taken = w.edits.apply_bundle(&b, only.as_deref(), args.flag("replace")).unwrap_or_else(|e| die(&e));
+            save(&w);
+            println!(
+                "{} {}",
+                if args.flag("replace") { "replaced" } else { "added" },
+                taken.iter().map(|(l, n)| format!("{} ({n})", l.key())).collect::<Vec<_>>().join(", ")
+            );
+        }
+        _ => die(&format!("unknown overrides command `{sub}` (list, clear, remove, prune, export, import)")),
+    }
+}
+
+/// `worldgen edit`: add one override stroke, as a click or drag in the app would.
+fn edit(args: &Args) {
+    let dir = PathBuf::from(args.pos.get(1).unwrap_or_else(|| die("missing project dir")));
+    let mut w = World::load(&dir).unwrap_or_else(|e| die(&e));
+    let tool: Tool = serde_json::from_value(serde_json::json!(args.get("tool").unwrap_or_else(|| die("missing --tool")))).unwrap_or_else(|_| die("unknown --tool (snake_case names as in the app, e.g. province_merge)"));
+    let points: Vec<[f64; 2]> = args
+        .get("at")
+        .unwrap_or_else(|| die("missing --at LAT,LON[;LAT,LON...]"))
+        .split(';')
+        .map(|p| {
+            let (a, b) = p.split_once(',').unwrap_or_else(|| die("--at points are LAT,LON"));
+            let (la, lo): (f64, f64) = (a.trim().parse().unwrap_or_else(|_| die("bad latitude")), b.trim().parse().unwrap_or_else(|_| die("bad longitude")));
+            if !(-90.0..=90.0).contains(&la) || !(-180.0..=360.0).contains(&lo) {
+                die("--at is out of range");
+            }
+            [la, lo]
+        })
+        .collect();
+    let d = Stroke::default();
+    let st = Stroke {
+        tool,
+        points,
+        value: args.num("value", d.value),
+        radius_km: args.num("radius", d.radius_km),
+        strength: args.num("strength", d.strength),
+        hardness: args.num("hardness", d.hardness),
+        name: args.get("name").unwrap_or("").to_string(),
+        ..d
+    };
+    let layer = tool.layer();
+    w.edits.add_stroke(st);
+    println!("added a {} edit to layer {} ({} edits)", args.get("tool").unwrap_or(""), layer.key(), w.edits.count(layer));
+    if args.flag("run") {
+        run_world(&mut w, LAST);
+        summary(&w);
+    }
+    w.save(&dir).unwrap_or_else(|e| die(&e.to_string()));
+}
+
+/// `worldgen check-update`: compare with the newest GitHub release.
+fn check_update(args: &Args) {
+    let pre = if args.flag("betas") { Some(true) } else if args.flag("stable") { Some(false) } else { None };
+    let c = fwm_update::check(pre).unwrap_or_else(|e| die(&e));
+    println!("this build: {}", c.current);
+    match &c.latest {
+        None => println!("no {}release on GitHub yet", if c.include_prereleases { "" } else { "stable " }),
+        Some(l) => {
+            println!("newest {}release: {} ({}) {}", if c.include_prereleases { "" } else { "stable " }, l.version, l.published_at, l.url);
+            println!("{}", if c.update_available { "an update is available" } else { "up to date" });
+        }
+    }
+    if let (Some(dir), Some(l)) = (args.get("download"), &c.latest) {
+        let a = l.portable.as_ref().unwrap_or_else(|| die("that release has no portable zip"));
+        let shown = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let path = fwm_update::download(a, std::path::Path::new(dir), &|d, t| {
+            // One line per 10%.
+            let step = if t > 0 { d * 10 / t } else { d >> 20 };
+            if shown.swap(step, std::sync::atomic::Ordering::Relaxed) != step {
+                eprintln!("  {:>5.1} / {:.1} MB", d as f64 / 1e6, t as f64 / 1e6);
+            }
+        })
+        .unwrap_or_else(|e| die(&e));
+        println!("downloaded {}{}", path.display(), if a.sha256.is_some() { " (SHA-256 verified)" } else { "" });
+    }
+}
+
 /// M0 check: the same seed gives the same world, and save/load is lossless.
 fn check(args: &Args) {
     let mut p = params_from(args);
@@ -499,6 +739,17 @@ fn serve(args: &Args) {
                 let mut body = String::new();
                 let _ = req.as_reader().read_to_string(&mut body);
                 let a: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                if cmd == "update_install" {
+                    respond(req, 400, "text/plain; charset=utf-8", b"Installing updates works in the desktop app; download the new release from GitHub instead".to_vec(), &cors);
+                    return;
+                }
+                if let Some(r) = fwm_update::handle(&cmd, &a) {
+                    match r {
+                        Ok(v) => respond(req, 200, "application/json", serde_json::to_vec(&v).unwrap(), &cors),
+                        Err(e) => respond(req, 400, "text/plain; charset=utf-8", e.into_bytes(), &cors),
+                    }
+                    return;
+                }
                 match api::handle(&session, &progress, &cmd, a) {
                     Ok(Reply::Json(v)) => respond(req, 200, "application/json", serde_json::to_vec(&v).unwrap(), &cors),
                     Ok(Reply::Bytes(b)) => respond(req, 200, "application/octet-stream", b, &cors),

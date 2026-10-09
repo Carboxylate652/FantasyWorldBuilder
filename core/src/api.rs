@@ -79,11 +79,41 @@ impl Session {
                 "province_import": e.imports.provinces,
             },
             "grid": { "level": grid.level, "cells": grid.len(), "triangles": grid.tris.len(), "spacing_km": grid.spacing * self.world.params.planet.radius_km },
+            "override_edits": EditLayer::ALL.iter().map(|&l| e.count(l)).sum::<usize>(),
             "path": self.path.as_ref().map(|p| p.display().to_string()),
             "can_undo": !self.undo.is_empty(),
             "can_redo": !self.redo.is_empty(),
             "dirty": self.dirty,
         })
+    }
+}
+
+/// Every override layer with its edit count and the step it feeds, plus the
+/// edits the latest run could not apply (their target is gone after a seed,
+/// sketch or upstream change).
+pub fn overrides_report(w: &World) -> Value {
+    let layers: Vec<Value> = EditLayer::ALL
+        .iter()
+        .map(|&l| json!({ "layer": l.key(), "title": l.title(), "step": l.step().key(), "edits": w.edits.count(l) }))
+        .collect();
+    let mut unapplied = Vec::new();
+    for st in [Step::States, Step::Provinces] {
+        if let Some(m) = w.meta(st) {
+            if let Some(a) = m["unapplied_edits"].as_array() {
+                // Indices refer to the run's edits: drop entries the layer no longer has.
+                let fresh = w.is_fresh(st);
+                unapplied.extend(a.iter().filter(|_| fresh).cloned());
+            }
+        }
+    }
+    json!({ "layers": layers, "unapplied": unapplied, "total": EditLayer::ALL.iter().map(|&l| w.edits.count(l)).sum::<usize>() })
+}
+
+/// Layers named in a request, or by default every layer that has edits.
+fn layer_list(w: &World, names: Option<Vec<String>>) -> Result<Vec<EditLayer>, String> {
+    match names {
+        Some(v) => v.iter().map(|k| EditLayer::from_key(k).ok_or(format!("unknown layer `{k}`"))).collect(),
+        None => Ok(EditLayer::ALL.into_iter().filter(|&l| w.edits.count(l) > 0).collect()),
     }
 }
 
@@ -299,6 +329,41 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             s.snapshot();
             s.world.edits.clear_layer(layer);
             Ok(Reply::Json(s.status()))
+        }
+        "overrides" => Ok(Reply::Json(overrides_report(&s.world))),
+        "remove_edits" => {
+            // { layer, indices }: drop strokes, e.g. the unapplied ones.
+            let layer: EditLayer = arg(&args, "layer")?;
+            let idx: Vec<usize> = arg(&args, "indices")?;
+            s.snapshot();
+            let removed = s.world.edits.remove_strokes(layer, &idx);
+            let mut st = s.status();
+            st["removed"] = json!(removed);
+            Ok(Reply::Json(st))
+        }
+        "export_overrides" => {
+            // { path, layers? }: write an override bundle (all layers with edits by default).
+            let path: String = arg(&args, "path")?;
+            let layers = layer_list(&s.world, arg(&args, "layers")?)?;
+            let b = s.world.edits.bundle(&layers, s.world.params.planet.seed);
+            std::fs::write(&path, serde_json::to_string_pretty(&b).unwrap()).map_err(|e| format!("{path}: {e}"))?;
+            Ok(Reply::Json(json!({ "path": path, "layers": layers.iter().map(|l| json!({ "layer": l.key(), "edits": s.world.edits.count(*l) })).collect::<Vec<_>>() })))
+        }
+        "import_overrides" => {
+            // { path, layers?, replace? }: add (or replace) layers from a bundle.
+            let path: String = arg(&args, "path")?;
+            let only: Option<Vec<String>> = arg(&args, "layers")?;
+            let only = only.map(|v| v.iter().map(|k| EditLayer::from_key(k).ok_or(format!("unknown layer `{k}`"))).collect::<Result<Vec<_>, _>>()).transpose()?;
+            let replace = arg::<Option<bool>>(&args, "replace")?.unwrap_or(false);
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+            let b: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+            let mut edits = s.world.edits.clone();
+            let taken = edits.apply_bundle(&b, only.as_deref(), replace)?;
+            s.snapshot();
+            s.world.edits = edits;
+            let mut st = s.status();
+            st["imported"] = json!(taken.iter().map(|(l, n)| json!({ "layer": l.key(), "edits": n })).collect::<Vec<_>>());
+            Ok(Reply::Json(st))
         }
         "set_auto_base" => {
             let v: bool = arg(&args, "value")?;

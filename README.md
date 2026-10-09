@@ -22,6 +22,8 @@ Stack, as the proposal recommends: a **Rust simulation core** (`core/`), a **Tau
 
 Windows builds are on the [Releases page](https://github.com/Carboxylate652/FantasyWorldBuilder/releases): an installer (`…_x64-setup.exe`) and a portable zip with the app and the `worldgen` CLI. They need 64-bit Windows 10 or 11 with Microsoft Edge WebView2 (the installer fetches it if it is missing). The builds are not code-signed, so SmartScreen may warn on first launch (*More info → Run anyway*).
 
+**Updates:** from 0.1.0-beta.3 on, the app asks GitHub for the newest release at startup. When one is out, a bar under the top bar offers *Install and restart* (the installed app: it downloads the installer, checks its size and SHA-256 against GitHub's digest, starts it and closes; worlds and settings are kept), *What's new* and *Skip this version*. The portable copy and the browser UI offer the download page instead. The version button at the right of the top bar shows the version, checks on demand and holds the settings (check at startup, include betas; betas are on while you run a beta). `worldgen check-update` does the same from the command line, and `--download DIR` fetches the portable zip.
+
 Releases are built by `.github/workflows/release-windows.yml` on a Windows runner when a `v*` tag is pushed, or a commit whose message contains `[release v0.1.0-beta.1]` (the workflow then creates the tag on that commit). Tags with a hyphen (`v0.1.0-beta.1`) become pre-releases.
 
 ## Run it
@@ -73,9 +75,10 @@ Then open http://127.0.0.1:8765/. The server only accepts same-origin JSON POSTs
   - *Province → state*: drag from a province into the state it should join.
   - *Grow province*, *Grow state*: brush the land you cover into the province or state under the stroke's start.
   - *Rename province*, *Rename state*: click and type a name. Culture names never replace it.
-  - *Paint goods*: provinces under the brush get a trade good, or gain or lose a deposit (copper, gold, silver, iron, coal, salt), before the culture simulation runs.
+  - *Paint goods*: provinces under the brush get a trade good or cash crop, or gain or lose a deposit (copper, gold, silver, iron, coal, salt, oil), before the culture simulation runs.
 - **Auto-update** re-runs the edited step after each stroke.
 - **User edits win.** Strokes are saved as resolution-independent override layers in lat/lon and are reapplied whenever a step regenerates, including after a seed or grid-level change. Undo and redo cover every edit.
+- **Overrides** (top bar, with the number of edits): every override layer with its edit count and the step it feeds, and *Clear* per layer. After Stage 2 it lists the state and province edits that no longer apply (a merge whose end is now sea after a seed change, a rename of a province that is gone) and removes them on request. *Export…* writes the ticked layers to an override bundle (`*.fwm-overrides.json`); *Import…* adds a bundle's layers to this world, or replaces them with *Replace on import*. Bundles carry edits to another seed or project: draw the sketch and fertility once, then try seeds.
 - **Political layers:** *Habitability*, *Barriers* (border rivers red, backbone rivers green), *States*, *Regions & continents* and *Provinces*. State borders are drawn as lines, and the *Borders* overlay shows them over any other layer. Hovering shows the province, state, region and continent.
 - **Navigation:** drag with *Navigate* or right-drag with any tool; scroll to zoom. Top bar: globe/flat toggle, map layers, month selector, overlays (rivers, winds, plate motion, pins) and globe relief exaggeration.
 - **Shortcuts:** `Ctrl+Z`/`Ctrl+Y` undo/redo, `Ctrl+S` save, `[` `]` brush size, `G`/`F` globe/flat. Each tool's shortcut letter is shown in its tooltip.
@@ -92,11 +95,25 @@ worldgen import-heightmap <project-dir> <png> [--encoding heightmap16|paradox8|l
 worldgen import-provinces <project-dir> <provinces.png> [--csv definition.csv] [--lat-min A --lat-max B]
 worldgen import-provinces <project-dir> --remove
 worldgen validate-provinces <provinces.png> [--csv definition.csv]   # checks only
-worldgen sweep --out <dir> --seeds 1..20 [--level 7]     # seed sweeps
+worldgen sweep --out <dir> --seeds 1..20 [--level 7] [--to STEP] [--no-export]
+                                                         # seed sweeps; writes <dir>/sweep.csv
 worldgen check [--seed N] [--level L]                    # determinism + save/load round trip
+worldgen validate <project-dir> [--run] [--json]         # consistency checks; exit code 1 on errors
+worldgen info <project-dir> [--json]
 worldgen stats <project-dir>                             # zonal climate, winds, rain seasonality
+worldgen overrides <project-dir> [list]                  # edits per layer, edits that no longer apply
+worldgen overrides <project-dir> clear <layer> | remove <layer> <i,j,...> | prune
+worldgen overrides <project-dir> export <file> [--layers a,b]
+worldgen overrides <project-dir> import <file> [--layers a,b] [--replace]
+worldgen edit <project-dir> --tool TOOL --at LAT,LON[;LAT,LON...] [--value V] [--radius KM] [--name NAME] [--run]
+worldgen version
+worldgen check-update [--betas | --stable] [--download DIR]
 worldgen serve [--port 8765] [--static app/dist] [--project DIR]
 ```
+
+Layers are sketch, plates, elevation, biomes, barriers, sites, fertility, states, provinces, bands and attraction. Tools for `worldgen edit` use the app's names in snake case (`province_merge`, `fertility_paint`, `band_pin`, `goods_paint`, ...); a drag is two or more `--at` points.
+
+For automated tests: `worldgen validate` checks that province ids and colours are unique, every land province is in an existing state and every state's members and capital agree, the adjacency table has no self-loops, duplicates or missing provinces, the grid's province field and the table match, trade goods and deposits are known names, and cultures point at living cultures in existing groups. Stale steps and edits that no longer apply are warnings. `worldgen sweep` adds a `sweep.csv` row per seed (land share, states, provinces, cultures, groups, population, cash-crop and oil provinces, unapplied edits, validation result, time). The CI workflow (`.github/workflows/ci.yml`) runs the tests, builds the UI and the desktop shell, and runs a CLI smoke test on every push.
 
 Steps are planet, sketch, plates, relief, climate, hydrology, biomes, habitability, states, provinces and cultures; `--to` defaults to cultures.
 
@@ -107,7 +124,8 @@ A full level-8 world (655,362 cells) generates in about 7 s, of which Stage 2 ta
 ```
 world.json            seed, parameters, per-step cache keys and summaries
 sketch.json           sketch strokes, plate pins, motion arrows
-overrides/*.json      user edit layers: plates, elevation, biomes, barriers, states, provinces
+overrides/*.json      user edit layers: plates, elevation, biomes, barriers, sites, fertility,
+                      states, provinces, bands, attraction
 imports.json          files that replace a stage result (an edited heightmap or provinces.png)
 fields/<step>/*.bin   one little-endian binary file per field
 export/               the map package
@@ -137,7 +155,8 @@ Each step is cached under a hash of exactly the inputs it reads, plus a per-step
 | `cultures.png` | Reference map: provinces coloured by majority culture (hue = culture group), culture borders dark, group borders black, unsettled land grey (with cultures up to date) |
 | `cultures.csv` | Every culture that ever existed: name, group, colour, parent, alive, population, provinces, founding year, end year and fate (merged into another, or died out) — the family tree |
 | `culture_groups.csv`, `culture_events.csv` | Groups with their cultures; the dated log of emergences, splits, merges and extinctions |
-| `provinces.csv` (Stage 2 columns added) | `trade_good`, `resources` (copper, gold, silver, iron, coal, salt; fish for sea zones), `rain_mm`, `river`, `spring` (0–1) |
+| `provinces.csv` (Stage 2 columns added) | `trade_good`, `resources` (copper, gold, silver, iron, coal, salt, oil; fish for sea zones), `rain_mm`, `river`, `spring` (0–1) |
+| `trade_goods.csv` | Every trade good, deposit and sea resource with its category (staple, cash crop, livestock, forest, mineral, energy, sea), the number of provinces that have it and their area |
 | `province_cultures.csv` | Population, majority culture and culture shares (≥ 5%) per province, for Victoria-style pops |
 | `package.json` | Palettes, encodings, file formats, parameters |
 
@@ -213,7 +232,7 @@ Each cell then takes its province by majority pixel vote. A province joins the s
   - Ice, mountains above *Wasteland above* and land below *Wasteland below habitability* become wasteland provinces when the patch is large enough. They stay inside their state.
   - The sea is split into coastal (within *Coastal sea band* of land), shelf (shallower than *Shelf depth*) and open-ocean zones of band-specific size. Lakes over *Lake province from* become lake provinces; smaller lakes join the land province around them.
   - Each state's capital province (the land province with the state's capital cell) takes the state's name; other land provinces are named in their region's dialect, seas and lakes in the nearest continent's language. No name is used twice.
-  - Resources (`core/src/stages/resources.rs`): copper, gold and silver in mountain belts (tectonic stress), iron and some gold in old shields (continental crust with no stress), coal in humid lowland basins, salt in dry basins, fish on coastal and shelf seas (richest in cool water), each drawn per province with a chance that grows with its signal. Every land province also gets a trade good from its dominant terrain (grain, wine, horses, wool, cattle, wood, furs, spices, fish, stone, metals, dates at desert springs, salt, camels). The *Trade goods* layer shows them; hovering shows the deposits.
+  - Resources (`core/src/stages/resources.rs`): copper, gold and silver in mountain belts (tectonic stress), iron and some gold in old shields (continental crust with no stress), coal in humid lowland basins, salt in dry basins, oil in sedimentary basins (lowlands on old continental crust, and the salt basins where domes trap it), fish on coastal and shelf seas (richest in cool water), each drawn per province with a chance that grows with its signal. Every land province also gets a trade good: a plantation-era cash crop when its climate fits one and a draw allows (rubber in hot wet jungle; coffee in tropical uplands, 16–25 °C, 350–2,400 m; sugar on hot wet lowlands; tea on humid subtropical hills; cotton on warm lowland plains with 450–1,300 mm of rain; silk and tobacco in warm temperate country), otherwise the staple of its dominant terrain (grain, wine, horses, wool, cattle, wood, furs, spices, fish, stone, metals, dates at desert springs, salt, camels). On the default world about a fifth of land provinces grow a cash crop and about 4% have oil. The *Trade goods* layer shows them; hovering shows the deposits.
   - The step also finds strait crossings and types every border between two provinces (land, river, impassable, coast, lake, sea, strait) with its length and crossing cost.
 
 - **Cultures** (`core/src/stages/cultures.rs`), an agent simulation on the province graph:
@@ -229,14 +248,14 @@ Each cell then takes its province by majority pixel vote. A province joins the s
 ## Tests
 
 ```bash
-cargo test --release -p worldcore
+cargo test --release -p worldcore -p fwm-update
 ```
 
-This covers grid topology, barycentric location, Köppen against real stations (London, Cairo, Singapore, Moscow, Athens), Earth insolation, determinism and the save/load round trip (through Stage 2), stale-step invalidation, plausible climate, the heightmap export/import round trip, and Stage 2 completeness: every land cell in a state and a province, unique ids and colours, state tables consistent with the cells, a capital inside every state, unique province names, a typed border for every pair of neighbours, the provinces.png export/import round trip, and the export clean-up (no provinces without pixels, no X-crossings, under 1% of provinces in pieces; unit tests on small rasters in `export_clean.rs`). For Stage 3: cultures emerge and settle most of the land, the family tree is consistent (parents before daughters, every ended culture merged or died out), province cultures match the cell field, and the culture files are exported; Louvain is unit-tested on small graphs (`community.rs`).
+This covers grid topology, barycentric location, Köppen against real stations (London, Cairo, Singapore, Moscow, Athens), Earth insolation, determinism and the save/load round trip (through Stage 2), stale-step invalidation, plausible climate, the heightmap export/import round trip, and Stage 2 completeness: every land cell in a state and a province, unique ids and colours, state tables consistent with the cells, a capital inside every state, unique province names, a typed border for every pair of neighbours, the provinces.png export/import round trip, and the export clean-up (no provinces without pixels, no X-crossings, under 1% of provinces in pieces; unit tests on small rasters in `export_clean.rs`). For Stage 3: cultures emerge and settle most of the land, the family tree is consistent (parents before daughters, every ended culture merged or died out), province cultures match the cell field, and the culture files are exported; Louvain is unit-tested on small graphs (`community.rs`). Also: override bundles carry edits to another seed (add, replace, layer filter, bad bundles refused without changes), edits that no longer apply are reported with their layer and index, a generated world passes `validate`, cash crops and oil appear in sensible shares, and the goods editor's numbers for old goods are unchanged. The updater (`update/`) is tested on semver ordering (beta.2 < beta.10 < rc.1 < release), parsing GitHub's release list (drafts and non-version tags dropped, digests read) and refusing downloads or pages outside the project.
 
 ## Status against the roadmap
 
-- **M0, done:** sphere grid, globe and flat viewer, project file, headless CLI, seeds. Level 8 renders through texture-driven WebGL2 with no vertex buffers. `worldgen check` passes both determinism and save/load identity.
+- **M0, done:** sphere grid, globe and flat viewer, project file, headless CLI (with `validate`, `overrides`, `edit` and sweep tables for automated tests), override layers (with the Overrides panel, unapplied-edit report and bundles), seeds, and update checks against GitHub releases. Level 8 renders through texture-driven WebGL2 with no vertex buffers. `worldgen check` passes both determinism and save/load identity.
 - **M1, done:** sketch tools, plates, boundary relief, hotspots and pins/arrows, with plausible trench, arc and mountain placement.
 - **M3, implemented:** habitability and barrier maps with barrier paint, states, regions and continents, provinces with wasteland, lakes and sea zones, state and province paint, the neutral CK3/Vic3-style package (provinces.png, definition.csv, states.csv, regions.csv, adjacencies.csv), and re-import with validation. The proposal's check "an edit made in GIMP passes validation on re-import" is covered by the round-trip test and `validate-provinces`.
 - **M4, started:** the culture simulation, cultures and culture groups with a family tree, population per province, culture names, the Cultures card and the Cultures, Culture groups and Population density layers, and the culture files in the export. On seeds 1–3 it settles nearly all land and ends with 44–50 cultures in 17–22 groups (seed 1: 49 cultures in 18 groups after 60 splits, 27 merges and 4 extinctions). The proposal's speed check (5,000 bands, 400 generations in about a minute) is met at about 10 s. Groundwater, springs and site pins, resources and trade goods, and era-gated caravan, mining and irrigation growth are in. The proposal's check, "on an Earth-like test map at least one desert spring or route waypoint far from any river grows a settlement", holds on seeds 1–3: 22, 14 and 17 desert towns (under 250 mm of rain, no river, at least 10,000 people), among them spring towns on every seed; on seed 1 one spring town sits on a caravan route and has a mine (20,500 people at 228 mm of rain). Not yet done: saving the band state so the simulation can continue in Stage 4.

@@ -18,6 +18,7 @@ pub mod noise;
 pub mod params;
 pub mod rng;
 pub mod stages;
+pub mod validate;
 pub mod vec3;
 pub mod world;
 
