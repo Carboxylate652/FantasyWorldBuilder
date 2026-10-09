@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0-beta.2
+
+Core performance and project reliability improvements.
+
+- **Safer saves and loading:** project files are replaced atomically one file at a time; corrupt edit JSON is reported rather than silently discarded. Cached field paths and lengths are validated.
+- **Lower generation overhead:** reuse graph edge geometry, climate grids and culture-search scratch storage; avoid copying large political tables for status updates and allocating per-cell climate transport weights.
+- **Lighter undo/redo:** history stores the affected edit component rather than copying every layer for each action.
+- **Build compatibility:** replace the approximate polar constant that caused current Clippy to fail.
+- **Regression coverage:** add reproducible CLI tests for generation, determinism, save/load, editing, imports, exports and seed sweeps, plus a climate-cache regression test.
+- **Windows release packaging:** the installer uses this release's version; releases remain drafts until both the installer and portable ZIP have been uploaded. Release notes include the matching changelog entry.
+
 ## 0.2.0-beta.1
 
 Stage 4: nations and history, and history you can steer.

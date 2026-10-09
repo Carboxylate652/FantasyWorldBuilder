@@ -178,17 +178,36 @@ pub fn group_color(group: u32) -> [u8; 3] {
     hsl((group as f64 * 137.508) % 360.0, 0.55, 0.5)
 }
 
-/// Bounded Dijkstra over the province graph. Returns (province, cost) for
-/// every land or wasteland province within `range`, the source included.
-fn reach(provs: &[Prov], adj: &[Vec<Border>], src: usize, range: f64, cost: &dyn Fn(usize, &Border) -> Option<f64>) -> Vec<(u32, f32)> {
-    let mut dist: HashMap<u32, f64> = HashMap::new();
-    let mut heap = BinaryHeap::new();
-    dist.insert(src as u32, 0.0);
-    heap.push(Reverse((0u64, src as u32)));
+struct ReachScratch {
+    dist: Vec<f64>,
+    heap: BinaryHeap<Reverse<(u64, u32)>>,
+    touched: Vec<u32>,
+}
+
+impl ReachScratch {
+    fn new(n: usize) -> ReachScratch {
+        ReachScratch { dist: vec![f64::INFINITY; n], heap: BinaryHeap::new(), touched: Vec::new() }
+    }
+    fn reset(&mut self) {
+        for &p in &self.touched {
+            self.dist[p as usize] = f64::INFINITY;
+        }
+        self.touched.clear();
+        self.heap.clear();
+    }
+}
+
+/// Bounded Dijkstra over the province graph. Dense scratch storage is reused
+/// across sources because province indices are already compact.
+fn reach(provs: &[Prov], adj: &[Vec<Border>], src: usize, range: f64, cost: &dyn Fn(usize, &Border) -> Option<f64>, scratch: &mut ReachScratch) -> Vec<(u32, f32)> {
+    scratch.reset();
+    scratch.dist[src] = 0.0;
+    scratch.touched.push(src as u32);
+    scratch.heap.push(Reverse((0u64, src as u32)));
     let mut out = Vec::new();
-    while let Some(Reverse((bits, p))) = heap.pop() {
+    while let Some(Reverse((bits, p))) = scratch.heap.pop() {
         let d = f64::from_bits(bits);
-        if d > dist[&p] {
+        if d > scratch.dist[p as usize] {
             continue;
         }
         let pu = p as usize;
@@ -198,9 +217,13 @@ fn reach(provs: &[Prov], adj: &[Vec<Border>], src: usize, range: f64, cost: &dyn
         for e in &adj[pu] {
             let Some(c) = cost(pu, e) else { continue };
             let nd = d + c;
-            if nd <= range && dist.get(&e.to).map_or(true, |&x| nd < x) {
-                dist.insert(e.to, nd);
-                heap.push(Reverse((nd.to_bits(), e.to)));
+            let to = e.to as usize;
+            if nd <= range && nd < scratch.dist[to] {
+                if !scratch.dist[to].is_finite() {
+                    scratch.touched.push(e.to);
+                }
+                scratch.dist[to] = nd;
+                scratch.heap.push(Reverse((nd.to_bits(), e.to)));
             }
         }
     }
@@ -550,7 +573,8 @@ impl CultureSim {
         let (provs, cp) = (&self.provs, &self.cp);
         let cost = |a: usize, e: &Border| Self::edge_cost(provs, cp, era, a, e);
         let range = cp.travel_range_km[era.min(3)].max(1.0);
-        (0..provs.len()).map(|p| if provs[p].kind <= kind::WASTELAND { reach(provs, &self.adj, p, range, &cost) } else { Vec::new() }).collect()
+        let mut scratch = ReachScratch::new(provs.len());
+        (0..provs.len()).map(|p| if provs[p].kind <= kind::WASTELAND { reach(provs, &self.adj, p, range, &cost, &mut scratch) } else { Vec::new() }).collect()
     }
 
     /// Provinces named by a directive (provinces, states and regions), as indices.

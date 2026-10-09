@@ -23,6 +23,7 @@ use crate::params::WorldParams;
 use crate::vec3::Vec3;
 use rayon::prelude::*;
 use std::f64::consts::{PI, TAU};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const NB: usize = 90; // EBM bands, uniform in x = sin(lat)
 const A_OLR: f64 = 203.3;
@@ -32,6 +33,34 @@ const C_LAND: f64 = 2.5e7; // land + the atmosphere column mixing over it
 const DAY_S: f64 = 86400.0;
 /// Fraction of the year at which the northern spring equinox falls (Earth: ~20 March).
 const EQUINOX_FRAC: f64 = 79.5 / 365.25;
+
+struct ClimateGrid {
+    grid: Grid,
+    transfer: GridTransfer,
+}
+
+/// Climate is solved again for lake feedback. These structures depend only on
+/// the two grid levels, so retain the most recently used pair.
+fn cached_climate_grid(fine: &Grid, level: u32) -> Option<Arc<ClimateGrid>> {
+    if fine.level == level {
+        return None;
+    }
+    type Entry = Option<((u32, u32), Arc<ClimateGrid>)>;
+    static CACHE: OnceLock<Mutex<Entry>> = OnceLock::new();
+    let key = (fine.level, level);
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached_key, value)) = &*guard {
+        if *cached_key == key {
+            return Some(value.clone());
+        }
+    }
+    let grid = Grid::new(level);
+    let transfer = GridTransfer::new(fine, &grid);
+    let value = Arc::new(ClimateGrid { grid, transfer });
+    *guard = Some((key, value.clone()));
+    Some(value)
+}
 
 #[inline]
 fn gauss(d: f64, c: f64, w: f64) -> f64 {
@@ -260,22 +289,17 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     // ---- coarse grid
     ctx.progress(0.02, "Preparing climate grid");
     let cl = p.climate_level();
-    let coarse_owned;
-    let coarse: &Grid = if cl == fine.level {
-        fine
-    } else {
-        coarse_owned = Grid::new(cl);
-        &coarse_owned
-    };
-    let transfer = if cl == fine.level { None } else { Some(GridTransfer::new(fine, coarse)) };
+    let cached = cached_climate_grid(fine, cl);
+    let coarse: &Grid = cached.as_ref().map_or(fine, |c| &c.grid);
+    let transfer: Option<&GridTransfer> = cached.as_ref().map(|c| &c.transfer);
     let nc = coarse.len();
-    let elev_c: Vec<f32> = match &transfer {
+    let elev_c: Vec<f32> = match transfer {
         Some(t) => t.down(fine, nc, elev_f),
         None => elev_f.to_vec(),
     };
     let frac = |pred: &dyn Fn(u8) -> bool| -> Vec<f64> {
         let v: Vec<f32> = water_f.iter().map(|&w| pred(w) as u8 as f32).collect();
-        let c = match &transfer {
+        let c = match transfer {
             Some(t) => t.down(fine, nc, &v),
             None => v,
         };
@@ -458,6 +482,8 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     ctx.progress(0.45, "Carrying moisture");
     let belts = wind_belts(p);
     let passes = cp.moisture_passes.max(10) as usize;
+    let (nbr_off, nbr_idx) = coarse.neighbor_csr();
+    let (_, nbr_rev) = coarse.neighbor_geometry();
     let precip_raw: Vec<Vec<f64>> = (0..12)
         .into_par_iter()
         .map(|m| {
@@ -466,53 +492,37 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
             // Low-level convergence (1/s) lifts air and makes rain; divergence suppresses it.
             let conv: Vec<f64> = (0..nc).map(|i| -grad.divergence(coarse, i, &wind_ms[m])).collect();
             let temp: Vec<f64> = (0..nc).map(|i| t_sl_c[m][i] as f64 - lapse * h_c[i]).collect();
-            // Outgoing transport fractions for each cell, aligned with its neighbour list.
-            let mut out_w: Vec<Vec<f64>> = Vec::with_capacity(nc);
+            // Flat CSR weights avoid two tiny heap allocations per cell per
+            // month (millions of allocations at the default climate level).
+            let mut out_w = vec![0.0f64; nbr_idx.len()];
             let mut stay = vec![0.0; nc];
             const DIFF: f64 = 0.06;
             for j in 0..nc {
-                let nbs = coarse.neighbors(j);
+                let range = nbr_off[j] as usize..nbr_off[j + 1] as usize;
                 let wj = wind[j];
                 let speed = wj.len();
-                let mut a: Vec<f64> = nbs
-                    .iter()
-                    .map(|&nb| wj.dot((coarse.pos[nb as usize] - coarse.pos[j]).normalized()).max(0.0))
-                    .collect();
-                let s: f64 = a.iter().sum();
+                let s: f64 = range.clone().map(|e| wj.dot((coarse.pos[nbr_idx[e] as usize] - coarse.pos[j]).normalized()).max(0.0)).sum();
                 let mu = (0.2 + 0.7 * speed).min(0.85);
-                let deg = nbs.len() as f64;
-                for x in a.iter_mut() {
-                    *x = if s > 0.0 { mu * *x / s } else { 0.0 } + DIFF / deg;
+                let deg = range.len() as f64;
+                let mut sent = 0.0;
+                for e in range {
+                    let a = wj.dot((coarse.pos[nbr_idx[e] as usize] - coarse.pos[j]).normalized()).max(0.0);
+                    out_w[e] = if s > 0.0 { mu * a / s } else { 0.0 } + DIFF / deg;
+                    sent += out_w[e];
                 }
-                stay[j] = 1.0 - a.iter().sum::<f64>();
-                out_w.push(a);
+                stay[j] = 1.0 - sent;
             }
-            // Incoming weights for each cell, aligned with its own neighbour list.
-            let in_w: Vec<Vec<f64>> = (0..nc)
-                .map(|i| {
-                    coarse
-                        .neighbors(i)
-                        .iter()
-                        .map(|&nb| {
-                            let j = nb as usize;
-                            let k = coarse.neighbors(j).iter().position(|&x| x as usize == i).unwrap();
-                            out_w[j][k]
-                        })
-                        .collect()
-                })
-                .collect();
             // Per-cell rain fraction and evaporation.
             let mut rain_frac = vec![0.0; nc];
             let mut evap = vec![0.0; nc];
             let mut cap = vec![0.0; nc];
             for i in 0..nc {
-                let nbs = coarse.neighbors(i);
                 let mut up = 0.0;
                 let mut down = 0.0;
                 let mut wsum = 0.0;
-                for (k, &nb) in nbs.iter().enumerate() {
-                    let j = nb as usize;
-                    let w = in_w[i][k];
+                for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
+                    let j = nbr_idx[e] as usize;
+                    let w = out_w[nbr_rev[e] as usize];
                     up += w * (h_c[i] - h_c[j]).max(0.0);
                     down += w * (h_c[j] - h_c[i]).max(0.0);
                     wsum += w;
@@ -556,8 +566,8 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                         // Land re-evaporates part of what fell on it last pass (recycling).
                         let recycled = RECYCLE * (1.0 - water_frac[i]) * last_rain[i];
                         let mut v = w[i] * stay[i] + evap[i] + recycled;
-                        for (k, &nb) in coarse.neighbors(i).iter().enumerate() {
-                            v += w[nb as usize] * in_w[i][k];
+                        for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
+                            v += w[nbr_idx[e] as usize] * out_w[nbr_rev[e] as usize];
                         }
                         let mut r = v * rain_frac[i];
                         if v - r > cap[i] {
@@ -601,7 +611,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     ctx.progress(0.88, "Interpolating to world grid");
     let n = fine.len();
     let up = |v: &[f32]| -> Vec<f32> {
-        match &transfer {
+        match transfer {
             Some(t) => t.up(v),
             None => v.to_vec(),
         }
@@ -668,7 +678,10 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     let zonal: Vec<serde_json::Value> = (0..37)
         .map(|k| {
             let lat_deg = -90.0 + k as f64 * 5.0;
-            let lat = lat_deg.to_radians().clamp(-1.5707, 1.5707);
+            // Stay just inside the poles: formulas using tan(latitude) become
+            // singular at exactly ±π/2.
+            let polar_limit = std::f64::consts::FRAC_PI_2 - 1e-4;
+            let lat = lat_deg.to_radians().clamp(-polar_limit, polar_limit);
             let ins: f64 = (0..48).map(|d| insolation(p, lat, (d as f64 + 0.5) / 48.0)).sum::<f64>() / 48.0;
             serde_json::json!({
                 "lat": lat_deg,

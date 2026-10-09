@@ -119,9 +119,9 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         })
         .collect();
     let sources: Vec<(u32, f64, u32)> = seeds.iter().enumerate().map(|(k, s)| (s.cell as u32, 0.0, k as u32)).collect();
-    let res = graph::multi_source(g, &sources, f64::INFINITY, |a, b, l| {
+    let res = graph::multi_source(g, &sources, f64::INFINITY, |_a, b, l, edge_len| {
         let s = &seeds[l as usize];
-        let len = g.pos[a].angle_to(g.pos[b]) / g.spacing;
+        let len = edge_len / g.spacing;
         let terrain = len * match (s.continental, land[b] == 1) {
             (true, true) => 0.55,
             (true, false) => s.ocean_reach,
@@ -155,8 +155,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     // along it rather than round.
     let is_b: Vec<bool> = { let mut v = vec![false; n]; for &c in &boundary { v[c as usize] = true; } v };
     let d_bound = graph::distance_km(g, r_km, 3000.0, |i| is_b[i], |_| true);
-    let minor = graph::multi_source(g, &minor_src, 1.0, |a, b, l| {
-        let len = g.pos[a].angle_to(g.pos[b]) / g.spacing;
+    let minor = graph::multi_source(g, &minor_src, 1.0, |_a, b, l, edge_len| {
+        let len = edge_len / g.spacing;
         let away = (d_bound[b] / 250.0).min(12.0);
         Some(len * cell_cost[b] * (1.0 + away * away) / budgets[l as usize])
     });
@@ -185,8 +185,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     // Shelves belong to the plate that carries the land, so a coast that is also
     // a plate boundary keeps oceanic crust on the far side (Andes-type margins).
     let land_src: Vec<(u32, f64, u32)> = (0..n).filter(|&i| land[i] == 1).map(|i| (i as u32, 0.0, 0)).collect();
-    let shelf = graph::multi_source(g, &land_src, tp.shelf_width_km.max(0.0), |a, b, _| {
-        (plate[a] == plate[b]).then(|| g.pos[a].angle_to(g.pos[b]) * r_km)
+    let shelf = graph::multi_source(g, &land_src, tp.shelf_width_km.max(0.0), |a, b, _, edge_len| {
+        (plate[a] == plate[b]).then_some(edge_len * r_km)
     })
     .cost;
     let crust: Vec<u8> = (0..n).map(|i| (shelf[i].is_finite()) as u8).collect();
