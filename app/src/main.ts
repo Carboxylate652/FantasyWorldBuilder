@@ -1,7 +1,7 @@
 import './style.css';
 import * as api from './api';
 import { Grid, angle, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
-import { BOUNDARY, DEPOSITS, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, stateColor, type LayerId, type Legend } from './layers';
+import { BOUNDARY, DEPOSITS, ERA_NAMES, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
 import { EDITOR_TOOLS, LIVE_STEPS, STAGE2_START, STAGE3_START, STAGE4_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
@@ -220,7 +220,7 @@ function stepOfLayer(id: LayerId): string {
     habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
     resources: 'Provinces',
     cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures', attraction: 'Cultures',
-    nations: 'Nations & history', railways: 'Nations & history', city_growth: 'Nations & history',
+    nations: 'Nations & history', railways: 'Nations & history', transport: 'Nations & history', eras: 'Nations & history', city_growth: 'Nations & history',
   };
   return m[id];
 }
@@ -334,7 +334,7 @@ async function refreshOverlays() {
   const lay = S.layer;
   const political = lay === 'states' || lay === 'provinces' || lay === 'regions';
   const cultural = lay === 'cultures' || lay === 'culture_groups';
-  const national = lay === 'nations' || lay === 'railways';
+  const national = lay === 'nations' || lay === 'railways' || lay === 'transport' || lay === 'eras';
   const stf = national ? await getField('owner') : cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
   if (stf && !stf.stale) {
     const L = new Lines();
@@ -1271,18 +1271,21 @@ function renderSim() {
       const ev = (st.events ?? []).slice(-8).reverse();
       if (ev.length) body.append(h('h4', {}, 'Recent events'), ...ev.map((e: any) => h('div', { class: 'muted small' }, `${Math.round(e.year)}: ${e.event} ${SIM.cultures.get(e.culture)?.name ?? '#' + e.culture}${e.other ? ' / ' + (SIM.cultures.get(e.other)?.name ?? '#' + e.other) : ''}`)));
     } else {
-      body.append(h('div', { class: 'muted' }, `${st.nations.length} nations · ${st.ruled_provinces} of ${st.land_provinces} provinces ruled · ${fmtM(st.population)} people · ${st.railways} railways`));
+      body.append(h('div', { class: 'muted' }, `${st.nations.length} nations · ${st.ruled_provinces} of ${st.land_provinces} provinces ruled · ${fmtM(st.population)} people · ${st.railways} railway lines`));
+      if (st.leader) body.append(h('div', { class: 'muted small' }, `Most advanced: ${st.leader.name} (${st.leader.era}, technology ${Math.round(st.leader.tech)}) · ${Object.entries(st.eras ?? {}).map(([k, v]) => `${v} ${k}`).join(', ')}`));
+      const tr = st.transport;
+      if (tr) body.append(h('div', { class: 'muted small' }, `Roads ${Math.round(tr.road_km.track).toLocaleString()} km track, ${Math.round(tr.road_km.paved).toLocaleString()} km paved, ${Math.round(tr.road_km.highway).toLocaleString()} km highway · rail ${Math.round(tr.rail_km).toLocaleString()} km, ${tr.junctions} junctions · ${tr.airports} airports`));
       for (const n of st.nations.slice(0, 12)) {
         const nc = nationColor(n.id).map(Math.round);
         body.append(h('div', { class: 'item link', onclick: () => {
           const p = S.political?.byProv.get(n.capital);
           if (p?.center) R.lookAt(fromLatLon((p.center[0] * Math.PI) / 180, (p.center[1] * Math.PI) / 180));
         } }, h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${nc.join(',')})` }), `${n.name} `, h('span', { class: 'muted' }, `#${n.id}`)),
-          h('span', { class: 'muted' }, `${n.government} · ${n.provinces} prov. · ${fmtM(n.population)}${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
+          h('span', { class: 'muted' }, `${n.era} · ${n.provinces} prov. · ${fmtM(n.population)} · treasury ${fmtM(n.treasury)}${n.bankrupt ? ' (bankrupt)' : ''}${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
       }
       if (st.cities?.length) {
         body.append(h('h4', {}, 'Largest cities'), ...st.cities.slice(0, 8).map((c: any) => h('div', { class: 'item' },
-          h('span', {}, `${c.name}${c.capital ? ' ★' : ''}${c.station ? ' 🚉' : ''}`),
+          h('span', {}, `${c.name}${c.capital ? ' ★' : ''}${c.station ? ' 🚉' : ''}${c.airport ? ' ✈' : ''}`),
           h('span', { class: 'muted' }, `${fmtM(c.population)}${c.attraction ? ' · pull ' + (c.attraction > 0 ? '+' : '') + c.attraction : ''}${SIM.nations.get(c.owner) ? ' · ' + SIM.nations.get(c.owner).name : ''}`))));
       }
       if (st.pins?.length) {
@@ -1698,7 +1701,10 @@ function summary(key: string, m: any): HTMLElement {
       box.append(stat('Nations', `${fmt(m.nations)} in ${m.start_date} (${fmt(m.nations_ever)} ever since ${m.start_year})`),
         stat('Land ruled', `${fmt((m.ruled_share ?? 0) * 100)}%`), stat('Population', `${fmt((m.population ?? 0) / 1e6, 1)} M`),
         stat('History', `${fmt(m.conquests)} capitals taken, ${fmt(m.independences)} independences, ${fmt(m.colonies)} colonies`),
-        stat('Railways', `${fmt(m.railways)} lines over ${fmt(m.railway_provinces)} provinces`),
+        stat('Eras', `${m.leader ? m.leader.name + ' leads (' + m.leader.era + ')' : '—'}${m.eras ? ' · ' + Object.entries(m.eras).map(([k, v]) => `${v} ${k}`).join(', ') : ''}`),
+        stat('Railways', `${fmt(m.railways)} lines over ${fmt(m.railway_provinces)} provinces${m.transport ? ', ' + fmt(m.transport.rail_km) + ' km, ' + m.transport.junctions + ' junctions' : ''}`),
+        ...(m.transport ? [stat('Roads & air', `${fmt(m.transport.road_km.track)} km track, ${fmt(m.transport.road_km.paved)} km paved, ${fmt(m.transport.road_km.highway)} km highway · ${m.transport.airports} airports`)] : []),
+        ...(m.bankruptcies ? [stat('Bankruptcies', fmt(m.bankruptcies))] : []),
         stat('Cities', `${fmt(m.metropolises ?? 0)} passed a million · ${fmt(m.ruins ?? 0)} lie in ruins`));
       if (m.directives?.length) box.append(stat('Directives', `${m.directives.filter((d: any) => d.action !== 'note').length} applied, ${m.directives.filter((d: any) => d.by === 'guide').length} by the guide`));
       const list = h('div', { class: 'list' });
@@ -1711,7 +1717,7 @@ function summary(key: string, m: any): HTMLElement {
           const cap = P.byProv.get(n.capital);
           list.append(h('div', { class: 'item link', onclick: () => cap?.center && R.lookAt(fromLatLon((cap.center[0] * Math.PI) / 180, (cap.center[1] * Math.PI) / 180)) },
             h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${nc.join(',')})` }), n.name),
-            h('span', { class: 'muted' }, `${n.government} · ${n.culture_name} · ${n.provinces} prov. · ${fmt(n.population / 1e6, 1)} M${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
+            h('span', { class: 'muted' }, `${n.government} · ${n.culture_name} · ${n.era ?? ''} · ${n.provinces} prov. · ${fmt(n.population / 1e6, 1)} M${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
         }
         const ev = P.nationEvents.filter((e) => e.event !== 'railway').slice(-12).reverse();
         if (ev.length) list.append(h('h4', {}, 'Chronicle (latest)'), ...ev.map((e) => h('div', { class: 'muted small' }, `${e.year}: ${e.text}`)));
@@ -2191,7 +2197,10 @@ function describe(d: any): string {
     const n = SIM.nations.get(d.owner) ?? P?.byNation.get(d.owner);
     parts.push(n ? `${n.name} (nation #${n.id}, ${n.government})` : `nation #${d.owner}`);
   } else if (d.owner === 0 && d.water === 0) parts.push('no ruler');
-  if (d.railway) parts.push(d.railway === 2 ? 'railway station' : 'railway');
+  if (d.railway) parts.push(d.railway === 3 ? 'railway junction' : d.railway === 2 ? 'railway station' : 'railway');
+  if (d.road) parts.push(['', 'track', 'paved road', 'highway'][d.road] ?? 'road');
+  if (d.airport) parts.push('airport');
+  if (d.nation_era) parts.push(`${ERA_NAMES[d.nation_era - 1]} era`);
   if (d.culture) {
     const c = SIM.cultures.get(d.culture) ?? P?.byCulture.get(d.culture), g = c && P ? P.byGroup.get(c.group) : null;
     if (c) parts.push(`${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}`);

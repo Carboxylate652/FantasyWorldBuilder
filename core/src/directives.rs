@@ -185,8 +185,32 @@ pub fn actions() -> Vec<ActionSpec> {
         ActionSpec {
             stage: "nations",
             name: "railway",
-            description: "A nation builds a railway between two of its provinces now (on its own land, cheapest route). Railways exist from the industrial era.",
+            description: "A nation builds a railway line between two of its provinces now (on its own land, cheapest route), paying for track and stations from its treasury (it may go into debt). Railways need the industrial era (the nation's own technology). Where the new line meets another, a junction station lets travellers change lines, at a time cost.",
             schema: object(json!({ "nation": { "type": "integer" }, "from": { "type": "integer", "description": "Province id" }, "to": { "type": "integer", "description": "Province id" } })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "build_road",
+            description: "A nation builds or upgrades a road between two of its provinces now (cheapest route over its own land), paying from its treasury (it may go into debt). Quality 1 track, 2 paved road, 3 highway (motor age only). Roads speed up trade, travel, armies and the spread of the ruler's culture, and cost upkeep every year, more the better they are.",
+            schema: object(json!({ "nation": { "type": "integer" }, "from": { "type": "integer", "description": "Province id" }, "to": { "type": "integer", "description": "Province id" }, "quality": num("1 track, 2 paved road, 3 highway", 1.0, 3.0) })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "airport",
+            description: "A nation builds an airport in one of its provinces now (air age only), paying from its treasury. Airports link a nation's cities by air and cost upkeep.",
+            schema: object(json!({ "nation": { "type": "integer" }, "province": { "type": "integer" } })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "subsidy",
+            description: "A windfall fills a nation's treasury now (silver mines, tribute, foreign loans, war reparations): the given number of years of its income.",
+            schema: object(json!({ "nation": { "type": "integer" }, "years": num("Years of income", 0.1, 100.0) })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "tech",
+            description: "A nation's technology jumps ahead (a scientific revolution, foreign experts, a reform) by the given years now; a negative value sets it back (a dark age). Eras (gunpowder, shipping, industry, fertilizer, motor age, air age) follow each nation's own technology.",
+            schema: object(json!({ "nation": { "type": "integer" }, "years": num("Technology years gained (negative: lost)", -500.0, 500.0) })),
         },
         ActionSpec {
             stage: "nations",

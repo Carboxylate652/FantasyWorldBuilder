@@ -1,7 +1,8 @@
 //! Step 12 — nations and history (Stage 4).
 //!
 //! Nations grow on the finished culture map, on a clock in years from
-//! `start_year` (first polities) to `start_date` (the map's start, 1910–1920).
+//! `start_year` (first polities) to `start_date` (the map's start, by default
+//! 1949: late in the second great war's era, early in the cold war's).
 //!
 //! - **Ownership is per province.** A nation's border can cut through a
 //!   Stage 2 state, and its land need not be connected: colonies, exclaves
@@ -14,8 +15,29 @@
 //!   culture group). Empty land is settled; land held by another nation is
 //!   fought over, won with the odds of the two nations' strength near it
 //!   (people, reach from the capital, defending its own culture).
-//! - **Eras:** gunpowder states (cheaper expansion, steadier states), ocean
-//!   shipping (colonies across the sea), industry (faster growth, railways).
+//! - **Technology and eras, per nation:** each nation's technology (in
+//!   years) advances faster when it is rich per head and large, and spreads
+//!   from more advanced neighbours; the leader can run a few years ahead of
+//!   the calendar. A nation enters an era when its own technology reaches it:
+//!   gunpowder (cheaper expansion, steadier states), ocean shipping (colonies
+//!   across the sea), industry (faster growth, railways), synthetic
+//!   fertilizer (farmland holds more people, phased in over 20 years), the
+//!   motor age (highways) and the air age (airports).
+//! - **Economy:** output is people × integration × productivity (by
+//!   technology and era); a share is taxed into the treasury, which pays the
+//!   army and the building and upkeep of roads, railways and airports. A
+//!   nation deep in debt goes bankrupt: it closes its newest line, lets a
+//!   road decay, writes off half its debt and is less stable for a while.
+//! - **Access:** the cheapest travel cost from the capital to each province
+//!   over the nation's roads, railways (with the time lost changing lines at
+//!   junctions), sea lanes and air routes. Well-connected provinces are
+//!   integrated: they pay more taxes, take the ruler's culture sooner, draw
+//!   migrants, and the nation projects power over them (reach in expansion
+//!   and war, and less spread-out instability).
+//! - **Roads** (as in the classical empires): track, paved road and highway
+//!   (motor age). Each nation links its cities to its capital as it can
+//!   afford; better roads cost more to build and to keep, and roads no one
+//!   keeps decay.
 //! - **Breakups:** large, culturally mixed or spread-out nations may break
 //!   apart: the provinces of their largest foreign culture secede, or else
 //!   the part farthest from the capital.
@@ -23,8 +45,12 @@
 //!   cultures takes the ruler's culture each year, so cultures slowly
 //!   converge within borders. Settlers bring the ruler's culture to empty land.
 //! - **Railways:** in the industrial era each nation links its largest cities
-//!   along the cheapest route over its own land, with stations at the ends,
-//!   every few provinces and in dry land (water stops). Stations draw people,
+//!   along the cheapest route over its own land, as lines with stations at
+//!   the ends, at cities, every few provinces and in dry land (water stops).
+//!   A line that reaches the end of another extends it; one that meets
+//!   another elsewhere makes a junction station there, where passengers and
+//!   freight change lines (a time penalty). Track and stations cost money to
+//!   build and keep (paid by the provinces' owners). Stations draw people,
 //!   which grows railway towns, also in the desert.
 //! - **Cities rise and fall:** each province has an attraction (−1 to +1)
 //!   that changes with history. A capital grows into its pull over a few
@@ -49,6 +75,44 @@ use crate::vec3::Vec3;
 use serde_json::{json, Value};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+
+mod transport;
+use transport::{
+    travel_costs, Line, AIRPORT_BUILD, AIRPORT_UPKEEP, AIR_FACTOR, AIR_PENALTY, RAIL_BUILD_KM, RAIL_UPKEEP_KM, ROAD_BUILD, ROAD_NAMES, ROAD_SPEED, ROAD_UPKEEP, SEA_FACTOR, SEA_PENALTY,
+    STATION_BUILD, STATION_UPKEEP,
+};
+
+/// Eras, in order; a nation's era is the last whose technology year it has reached.
+pub const ERA_NAMES: [&str; 7] = ["early", "gunpowder", "ocean shipping", "industry", "fertilizer", "motor age", "air age"];
+
+mod era {
+    pub const GUN: u8 = 1;
+    pub const SHIP: u8 = 2;
+    pub const IND: u8 = 3;
+    pub const FERT: u8 = 4;
+    pub const MOTOR: u8 = 5;
+    pub const AIR: u8 = 6;
+}
+
+/// Travel cost (km on foot) at which a province counts as half integrated.
+const INTEGRATION_KM: f64 = 1500.0;
+/// Integration of a province the capital cannot reach (an exclave before shipping).
+const UNREACHED: f64 = 0.2;
+/// Expansion and war reach use access scaled to straight-line km (a roadless
+/// route costs more than the crow flies).
+const ACCESS_SCALE: f64 = 0.75;
+/// Share of income spent on the army.
+const ARMY: f64 = 0.3;
+/// Most a nation's technology lags the calendar (the poorest and smallest).
+const TECH_LAG: f64 = 220.0;
+/// Most infrastructure upkeep a nation takes on by itself, as a share of income.
+const INFRA_SHARE: f64 = 0.4;
+/// Years of income a nation keeps in its treasury; half of anything more is spent each year.
+const RESERVE_YEARS: f64 = 2.0;
+/// People a city needs for a paved road to the capital before industry.
+const PAVED_CITY: f64 = 150_000.0;
+/// People a city needs for a highway or an airport.
+const BIG_CITY: f64 = 300_000.0;
 
 mod edge {
     pub const LAND: u8 = 0;
@@ -91,6 +155,17 @@ struct Nation {
     aggression: f64,
     /// Year the current capital became the capital.
     capital_since: i32,
+    /// Technology, in years (the era follows it).
+    tech: f64,
+    era: u8,
+    treasury: f64,
+    /// Income and spending per year at the last step.
+    income: f64,
+    upkeep: f64,
+    /// Upkeep of roads, railways and airports per year.
+    infra: f64,
+    /// Bankrupt until this year (less stable; no new cuts).
+    debt_until: i32,
 }
 
 /// A city pin: attraction placed by a directive.
@@ -133,9 +208,23 @@ pub struct NationSim {
     owner: Vec<u32>,
     nations: Vec<Nation>,
     members: Vec<BTreeSet<usize>>,
+    /// Railway per province from the open lines: 0 none, 1 track, 2 station, 3 junction.
     rail: Vec<u8>,
-    rail_net: Vec<BTreeSet<usize>>,
-    railways: Vec<Value>,
+    lines: Vec<Line>,
+    /// People the railway draws to a province (track, stations, junctions).
+    cap_extra: Vec<f64>,
+    /// Roads over borders (lower index first): quality and year built.
+    roads: BTreeMap<(usize, usize), (u8, i32)>,
+    /// Airports: province and year opened.
+    airports: BTreeMap<usize, i32>,
+    /// Per nation (by id): travel cost from the capital to its provinces and
+    /// their neighbours; recomputed when `stale`.
+    access: Vec<HashMap<usize, f64>>,
+    stale: Vec<bool>,
+    /// Integration of each province with its owner (0–1).
+    integ: Vec<f64>,
+    /// How many nations have reached each era (events for the first three).
+    era_firsts: [u32; 7],
     events: Vec<Value>,
     /// Provinces taken from one nation by another since the last war summary.
     tally: BTreeMap<(u32, u32), u32>,
@@ -299,8 +388,14 @@ impl NationSim {
             nations: Vec::new(),
             members: vec![BTreeSet::new()],
             rail: vec![0; n],
-            rail_net: vec![BTreeSet::new()],
-            railways: Vec::new(),
+            lines: Vec::new(),
+            cap_extra: vec![0.0; n],
+            roads: BTreeMap::new(),
+            airports: BTreeMap::new(),
+            access: vec![HashMap::new()],
+            stale: vec![false],
+            integ: vec![0.0; n],
+            era_firsts: [0; 7],
             events: Vec::new(),
             tally: BTreeMap::new(),
             rng: Rng::new(seed, stream::NATIONS),
@@ -341,17 +436,42 @@ impl NationSim {
         self.np.years_per_step.max(1) as i32
     }
 
-    /// The era a year falls in.
-    pub fn era_of(&self, y: i32) -> &'static str {
-        if y >= self.np.industrial_year {
-            "industry"
-        } else if y >= self.np.shipping_year {
-            "ocean shipping"
-        } else if y >= self.np.gunpowder_year {
-            "gunpowder"
-        } else {
-            "early"
+    /// The era a technology year falls in.
+    fn era_from(&self, tech: f64) -> u8 {
+        let np = &self.np;
+        [np.gunpowder_year, np.shipping_year, np.industrial_year, np.fertilizer_year, np.motor_year, np.air_year].iter().filter(|&&y| tech >= y as f64).count() as u8
+    }
+
+    /// The most advanced living nation.
+    fn leader(&self) -> Option<u32> {
+        (1..=self.nations.len() as u32).filter(|&m| self.alive(m)).max_by(|&a, &b| self.nation(a).tech.partial_cmp(&self.nation(b).tech).unwrap().then(b.cmp(&a)))
+    }
+
+    /// The world's era: the leading nation's (by the calendar before any nation).
+    pub fn era(&self) -> &'static str {
+        ERA_NAMES[self.leader().map_or_else(|| self.era_from(self.year as f64), |m| self.nation(m).era) as usize]
+    }
+
+    /// Productivity per person: grows with technology, and jumps with
+    /// industry, fertilizer, motors and flight.
+    fn prod(&self, n: u32) -> f64 {
+        let x = self.nation(n);
+        let mut p = 1.0 + ((x.tech - 1000.0) / 250.0).max(0.0);
+        for (e, f) in [(era::IND, 1.8), (era::FERT, 1.15), (era::MOTOR, 1.3), (era::AIR, 1.1)] {
+            if x.era >= e {
+                p *= f;
+            }
         }
+        p
+    }
+
+    /// How much more farmland holds with synthetic fertilizer (phased in over 20 years of technology).
+    fn fert_mult(&self, n: u32) -> f64 {
+        if n == 0 {
+            return 1.0;
+        }
+        let t = self.nation(n).tech - self.np.fertilizer_year as f64;
+        1.0 + (self.np.fertilizer_boost - 1.0).max(0.0) * (t / 20.0).clamp(0.0, 1.0)
     }
 
     /// Directives of this run, in the order they apply.
@@ -421,6 +541,15 @@ impl NationSim {
         let id = self.nations.len() as u32 + 1;
         let primary = if self.major[p] > 0 { self.major[p] } else { parent.checked_sub(1).map(|k| self.nations[k as usize].primary).unwrap_or(0) };
         let aggression = 0.6 + 0.8 * self.rng.f64();
+        // A breakaway keeps its parent's technology; a new polity starts at the world's median.
+        let tech = if parent > 0 {
+            self.nation(parent).tech
+        } else {
+            let mut t: Vec<f64> = self.nations.iter().filter(|x| x.ended.is_none()).map(|x| x.tech).collect();
+            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            t.get(t.len() / 2).copied().unwrap_or(self.year as f64)
+        };
+        let era = self.era_from(tech);
         self.nations.push(Nation {
             name: name.filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string()).unwrap_or_else(|| self.provs[p].name.clone()),
             color: nation_color(id),
@@ -433,9 +562,17 @@ impl NationSim {
             parent,
             aggression,
             capital_since: self.year,
+            tech,
+            era,
+            treasury: 0.0,
+            income: 0.0,
+            upkeep: 0.0,
+            infra: 0.0,
+            debt_until: i32::MIN,
         });
         self.members.push(BTreeSet::new());
-        self.rail_net.push(BTreeSet::new());
+        self.access.push(HashMap::new());
+        self.stale.push(true);
         let prev = self.owner[p];
         self.take(p, id);
         let (nm, cn) = (self.nations[id as usize - 1].name.clone(), self.culture_name(primary));
@@ -456,10 +593,12 @@ impl NationSim {
         }
         if old > 0 {
             self.members[old as usize].remove(&p);
+            self.stale[old as usize] = true;
         }
         self.owner[p] = n;
         if n > 0 {
             self.members[n as usize].insert(p);
+            self.stale[n as usize] = true;
             // Settlers bring the ruler's culture to empty land.
             if self.pop[p] < 1.0 && self.provs[p].land {
                 let prim = self.nation(n).primary;
@@ -495,6 +634,7 @@ impl NationSim {
         }
         self.nations[k].capital = q;
         self.nations[k].capital_since = self.year;
+        self.stale[n as usize] = true;
         let (a, b) = (self.nations[k].name.clone(), self.provs[q].name.clone());
         self.event("capital", n, 0, Some(q), format!("{b} becomes the capital of {a}"));
     }
@@ -505,7 +645,13 @@ impl NationSim {
     fn update_attraction(&mut self) {
         let np = &self.np;
         for p in 0..self.provs.len() {
-            self.attr[p] = self.devastation[p] + if self.rail[p] == 2 { 0.15 } else { 0.0 };
+            self.attr[p] = self.devastation[p]
+                + match self.rail[p] {
+                    2 => 0.15,
+                    3 => 0.2,
+                    _ => 0.0,
+                }
+                + if self.airports.contains_key(&p) { 0.1 } else { 0.0 };
         }
         for (k, x) in self.nations.iter().enumerate() {
             if x.ended.is_some() {
@@ -546,7 +692,8 @@ impl NationSim {
             .take(n)
             .map(|p| {
                 json!({ "province": self.provs[p].id, "name": self.provs[p].name, "population": self.pop[p].round() as u64, "owner": self.owner[p],
-                        "capital": capital_of.contains_key(&p), "attraction": (self.attr[p] * 100.0).round() / 100.0, "station": self.rail[p] == 2,
+                        "capital": capital_of.contains_key(&p), "attraction": (self.attr[p] * 100.0).round() / 100.0, "station": self.rail[p] >= 2,
+                        "junction": self.rail[p] == 3, "airport": self.airports.contains_key(&p), "road": self.road_at(p),
                         "peak": self.peak[p].0.round() as u64, "peak_year": self.peak[p].1 })
             })
             .collect()
@@ -597,6 +744,11 @@ impl NationSim {
                 "union" if self.alive(nat) && self.alive(target) && nat != target => {
                     let list: Vec<usize> = self.members[target as usize].iter().copied().collect();
                     let (an, bn) = (self.nation(nat).name.clone(), self.nation(target).name.clone());
+                    // One treasury, and the more advanced technology.
+                    let (tr, te) = (self.nation(target).treasury, self.nation(target).tech);
+                    let x = &mut self.nations[nat as usize - 1];
+                    x.treasury += tr;
+                    x.tech = x.tech.max(te);
                     for p in list {
                         self.take(p, nat);
                     }
@@ -616,9 +768,29 @@ impl NationSim {
                     }
                 }
                 "railway" if self.alive(nat) => match (p_from, p_to) {
-                    (Some(x), Some(z)) if self.year >= self.np.industrial_year => ok = self.build_line(nat, x, &[z].into_iter().collect()).is_some(),
+                    (Some(x), Some(z)) if self.nation(nat).era >= era::IND && self.owner[z] == nat => ok = self.build_line(nat, x, &[z].into_iter().collect(), false).is_some(),
                     _ => ok = false,
                 },
+                "build_road" if self.alive(nat) => match (p_from, p_to) {
+                    (Some(x), Some(z)) => {
+                        let q = arg_f64(a, "quality", 1.0).round().clamp(1.0, 3.0) as u8;
+                        ok = (q < 3 || self.nation(nat).era >= era::MOTOR) && self.owner[z] == nat && self.build_road(nat, x, z, q, false);
+                    }
+                    _ => ok = false,
+                },
+                "airport" if self.alive(nat) => match p_province {
+                    Some(p) if self.nation(nat).era >= era::AIR && self.owner[p] == nat && !self.airports.contains_key(&p) => self.build_airport(nat, p),
+                    _ => ok = false,
+                },
+                "subsidy" if self.alive(nat) => {
+                    let x = &mut self.nations[nat as usize - 1];
+                    x.treasury += x.income.max(0.0) * arg_f64(a, "years", 0.0).max(0.0);
+                }
+                "tech" if self.alive(nat) => {
+                    let t = self.nation(nat).tech + arg_f64(a, "years", 0.0);
+                    self.nations[nat as usize - 1].tech = t;
+                    self.set_era(nat);
+                }
                 "catastrophe" => {
                     let sev = arg_f64(a, "severity", 0.0).clamp(0.0, 0.95);
                     for p in self.places(a) {
@@ -699,13 +871,13 @@ impl NationSim {
     }
 
     /// One expansion attempt by nation n.
-    fn expand(&mut self, n: u32, gun: bool, ship: bool) {
+    fn expand(&mut self, n: u32) {
         let cap = self.nation(n).capital;
         let members: Vec<usize> = self.members[n as usize].iter().copied().collect();
         if members.is_empty() {
             return;
         }
-        let bw = self.np.barrier_weight;
+        let (gun, ship) = (self.nation(n).era >= era::GUN, self.nation(n).era >= era::SHIP);
         let reach = self.np.reach_km.max(50.0);
         let toward = self.toward(n);
         // Large nations probe a sample of their border.
@@ -719,13 +891,9 @@ impl NationSim {
                 if o == n || !self.provs[q].land || (o > 0 && self.at_peace(n, o)) || (self.cap[q] < 1.0 && self.pop[q] < 1.0) {
                     continue;
                 }
-                let step = match e.ty {
-                    edge::LAND => e.km * (1.0 + bw * e.barrier),
-                    edge::IMPASSABLE => 3.0 * e.km * (1.0 + bw * e.barrier),
-                    _ => 2.0 * e.km + 150.0,
-                };
+                let step = self.edge_cost(p, e);
                 let value = (self.pop[q] + 0.1 * self.cap[q]).max(1.0).sqrt();
-                let mut cost = (1.0 + step / 300.0) * (1.0 + self.km(cap, q) / reach) * (1.0 + self.np.culture_weight * self.cdist(n, q));
+                let mut cost = (1.0 + step / 300.0) * (1.0 + self.reach_cost(n, q) / reach) * (1.0 + self.np.culture_weight * self.cdist(n, q));
                 if o > 0 {
                     cost *= if self.at_war(n, o) { 0.6 } else { 2.0 };
                 }
@@ -786,8 +954,9 @@ impl NationSim {
         // War over q: the two nations' strength near it.
         let strength = |s: &NationSim, m: u32| {
             let total: f64 = s.members[m as usize].iter().map(|&p| s.pop[p]).sum();
-            let near = 1.0 / (1.0 + s.km(s.nation(m).capital, q) / reach);
-            total.max(1.0).powf(0.8) * near
+            let near = 1.0 / (1.0 + s.reach_cost(m, q) / reach);
+            // Better-armed (more productive) nations fight better.
+            total.max(1.0).powf(0.8) * near * s.prod(m).powf(0.4)
         };
         let mut att = strength(self, n);
         let mut def = strength(self, o);
@@ -813,13 +982,100 @@ impl NationSim {
         }
     }
 
-    /// Cheapest route over nation n's land from `from` to any province in
-    /// `to`, then a railway along it. Returns the line's index.
-    fn build_line(&mut self, n: u32, from: usize, to: &BTreeSet<usize>) -> Option<usize> {
-        if to.contains(&from) || self.owner[from] != n {
-            return None;
+    /// The border between two neighbouring provinces.
+    fn border(&self, a: usize, b: usize) -> Option<&Edge> {
+        self.adj[a].iter().find(|e| e.to as usize == b)
+    }
+
+    fn road_q(&self, a: usize, b: usize) -> u8 {
+        self.roads.get(&(a.min(b), a.max(b))).map_or(0, |r| r.0)
+    }
+
+    /// Best road touching a province.
+    fn road_at(&self, p: usize) -> u8 {
+        self.adj[p].iter().map(|e| self.road_q(p, e.to as usize)).max().unwrap_or(0)
+    }
+
+    /// Travel cost over a border (km on foot): longer across barriers and
+    /// impassable land, divided by the road's speed; a strait is a crossing.
+    fn edge_cost(&self, p: usize, e: &Edge) -> f64 {
+        let b = 1.0 + self.np.barrier_weight * e.barrier;
+        match e.ty {
+            edge::LAND => e.km * b / ROAD_SPEED[self.road_q(p, e.to as usize) as usize],
+            edge::IMPASSABLE => 3.0 * e.km * b / ROAD_SPEED[self.road_q(p, e.to as usize) as usize],
+            _ => 2.0 * e.km + 150.0,
         }
-        let bw = self.np.barrier_weight;
+    }
+
+    /// Construction length of a border (km, longer across barriers and twice over impassable land).
+    fn build_km(&self, e: &Edge) -> f64 {
+        e.km * (1.0 + self.np.barrier_weight * e.barrier) * if e.ty == edge::IMPASSABLE { 2.0 } else { 1.0 }
+    }
+
+    /// How far a province is from nation n's capital for expansion and war:
+    /// its access (roads, railways, sea and air shorten it), or the straight
+    /// distance where the capital has no route yet.
+    fn reach_cost(&self, n: u32, q: usize) -> f64 {
+        let km = self.km(self.nation(n).capital, q);
+        self.access[n as usize].get(&q).map_or(km, |&a| a * ACCESS_SCALE)
+    }
+
+    /// Recompute nation n's access: travel cost from its capital over its
+    /// land (with roads), its railway stations, sea lanes between its ports
+    /// (ocean shipping) and flights between its airports (air age).
+    fn compute_access(&mut self, n: u32) {
+        let k = n as usize;
+        let cap = self.nation(n).capital;
+        let era = self.nation(n).era;
+        let owner = &self.owner;
+        let land = |p: usize, emit: &mut dyn FnMut(usize, f64)| {
+            if owner[p] == n {
+                for e in &self.adj[p] {
+                    emit(e.to as usize, self.edge_cost(p, e));
+                }
+            }
+        };
+        let lines: Vec<&Line> = self.lines.iter().filter(|l| l.is_open() && l.stations().any(|p| owner[p] == n)).collect();
+        let mut links = Vec::new();
+        let members = &self.members[k];
+        if era >= era::SHIP {
+            let ports: Vec<usize> = members.iter().copied().filter(|&p| self.provs[p].coastal).collect();
+            let main = if self.provs[cap].coastal { Some(cap) } else { ports.iter().copied().max_by(|&a, &b| self.pop[a].partial_cmp(&self.pop[b]).unwrap().then(b.cmp(&a))) };
+            if let Some(m) = main {
+                for &p in ports.iter().filter(|&&p| p != m) {
+                    links.push((m, p, self.km(m, p) * SEA_FACTOR + SEA_PENALTY));
+                }
+            }
+        }
+        if era >= era::AIR {
+            let air: Vec<usize> = self.airports.keys().copied().filter(|&p| owner[p] == n).collect();
+            for (i, &a) in air.iter().enumerate() {
+                for &b in &air[i + 1..] {
+                    links.push((a, b, self.km(a, b) * AIR_FACTOR + AIR_PENALTY));
+                }
+            }
+        }
+        let map = travel_costs(cap, &land, &lines, &|p| owner[p] == n, &|a, b| self.km(a, b), self.np.transfer_km, &links);
+        self.access[k] = map;
+        self.stale[k] = false;
+    }
+
+    /// Bring every changed nation's access up to date, then each province's integration.
+    fn refresh_access(&mut self) {
+        for m in 1..=self.nations.len() as u32 {
+            if self.alive(m) && self.stale[m as usize] {
+                self.compute_access(m);
+            }
+        }
+        for p in 0..self.provs.len() {
+            let o = self.owner[p];
+            self.integ[p] = if o == 0 { 0.0 } else { self.access[o as usize].get(&p).map_or(UNREACHED, |&a| 1.0 / (1.0 + a / INTEGRATION_KM)) };
+        }
+    }
+
+    /// Cheapest route over nation n's land (no straits) from `from` to a
+    /// province where `goal` holds, with border weights from `w`.
+    fn route(&self, n: u32, from: usize, goal: &dyn Fn(usize) -> bool, w: &dyn Fn(usize, &Edge) -> f64) -> Option<Vec<usize>> {
         let mut dist: HashMap<usize, f64> = HashMap::new();
         let mut prev: HashMap<usize, usize> = HashMap::new();
         let mut heap = BinaryHeap::new();
@@ -831,7 +1087,7 @@ impl NationSim {
             if d > dist[&p] {
                 continue;
             }
-            if to.contains(&p) {
+            if p != from && goal(p) {
                 end = Some(p);
                 break;
             }
@@ -840,7 +1096,7 @@ impl NationSim {
                 if self.owner[q] != n || e.ty == edge::STRAIT {
                     continue;
                 }
-                let nd = d + e.km * (1.0 + bw * e.barrier) * if e.ty == edge::IMPASSABLE { 2.0 } else { 1.0 };
+                let nd = d + w(p, e);
                 if dist.get(&q).map_or(true, |&x| nd < x) {
                     dist.insert(q, nd);
                     prev.insert(q, p);
@@ -854,53 +1110,482 @@ impl NationSim {
             path.push(p);
         }
         path.reverse();
-        let last = path.len() - 1;
-        let mut stations = Vec::new();
-        for (k, &p) in path.iter().enumerate() {
-            let station = k == 0 || k == last || k % 5 == 0 || self.provs[p].arid;
-            if station && self.rail[p] < 2 {
-                self.rail[p] = 2;
-                self.cap[p] += self.np.station_people;
-            } else if self.rail[p] == 0 {
-                self.rail[p] = 1;
-                self.cap[p] += 0.3 * self.np.station_people;
+        Some(path)
+    }
+
+    /// Railway per province and the people it draws, from the open lines.
+    fn rebuild_rail(&mut self) {
+        let n = self.provs.len();
+        let mut track = vec![false; n];
+        let mut stations = vec![0u32; n];
+        for l in self.lines.iter().filter(|l| l.is_open()) {
+            for (k, &p) in l.path.iter().enumerate() {
+                track[p] = true;
+                if l.station[k] {
+                    stations[p] += 1;
+                }
             }
-            if station {
-                stations.push(self.provs[p].id);
-            }
-            self.rail_net[n as usize].insert(p);
         }
-        let id = self.railways.len() + 1;
-        self.railways.push(json!({
-            "id": id, "owner": n, "opened": self.year,
-            "provinces": path.iter().map(|&p| self.provs[p].id).collect::<Vec<_>>(),
-            "stations": stations,
-        }));
-        Some(id - 1)
+        let sp = self.np.station_people;
+        for p in 0..n {
+            (self.rail[p], self.cap_extra[p]) = match (stations[p], track[p]) {
+                (0, false) => (0, 0.0),
+                (0, true) => (1, 0.3 * sp),
+                (1, _) => (2, sp),
+                _ => (3, 1.5 * sp),
+            };
+        }
+    }
+
+    /// Mark the nations owning any of these provinces as needing new access.
+    fn touch(&mut self, ps: &[usize]) {
+        for &p in ps {
+            let o = self.owner[p] as usize;
+            if o > 0 {
+                self.stale[o] = true;
+            }
+        }
+    }
+
+    /// A railway from `from` to the nearest of nation n's provinces in `to`
+    /// over its own land. A line ending where an own line ends extends it;
+    /// otherwise it is a new line, and where it meets a line that province
+    /// becomes a junction station. Paid from the treasury: with `afford`, only
+    /// if the treasury holds the cost. Returns the line's index.
+    fn build_line(&mut self, n: u32, from: usize, to: &BTreeSet<usize>, afford: bool) -> Option<usize> {
+        if to.contains(&from) || self.owner[from] != n {
+            return None;
+        }
+        let path = self.route(n, from, &|p| to.contains(&p), &|_, e| self.build_km(e))?;
+        let last = path.len() - 1;
+        let end = path[last];
+        let mut station: Vec<bool> = path
+            .iter()
+            .enumerate()
+            .map(|(k, &p)| k == 0 || k == last || k % 5 == 0 || self.provs[p].arid || self.pop[p] >= self.np.found_population)
+            .collect();
+        let track_km: f64 = path.windows(2).map(|w| self.border(w[0], w[1]).map_or_else(|| self.km(w[0], w[1]), |e| self.build_km(e))).sum();
+        // The open line already at the end province, preferring one of ours that ends there.
+        let joined = (0..self.lines.len())
+            .filter(|&i| self.lines[i].is_open() && self.lines[i].path.contains(&end))
+            .max_by_key(|&i| (self.lines[i].owner == n && (self.lines[i].path[0] == end || *self.lines[i].path.last().unwrap() == end), Reverse(i)));
+        let extend = joined.filter(|&i| self.lines[i].owner == n && (self.lines[i].path[0] == end || *self.lines[i].path.last().unwrap() == end) && !path[..last].iter().any(|p| self.lines[i].path.contains(p)));
+        let end_has_station = joined.is_some_and(|i| {
+            let l = &self.lines[i];
+            l.path.iter().zip(&l.station).any(|(&p, &s)| p == end && s)
+        });
+        let new_stations = station[..last].iter().filter(|&&s| s).count() + usize::from(!end_has_station);
+        let cost = (track_km * RAIL_BUILD_KM + new_stations as f64 * STATION_BUILD) * self.np.rail_cost.max(0.0) * self.prod(n);
+        let more = (RAIL_UPKEEP_KM * track_km + STATION_UPKEEP * new_stations as f64) * self.np.rail_cost.max(0.0) * self.prod(n);
+        if afford && (self.nation(n).treasury < cost || !self.can_keep(n, more)) {
+            return None;
+        }
+        self.nations[n as usize - 1].treasury -= cost;
+        let seg_km: f64 = path.windows(2).map(|w| self.km(w[0], w[1])).sum();
+        let idx = match extend {
+            Some(i) => {
+                let l = &mut self.lines[i];
+                // Append the new stretch at the end it meets, keeping the line in order.
+                let mut add: Vec<(usize, bool)> = path[..last].iter().copied().zip(station[..last].iter().copied()).collect();
+                if l.path[0] == end {
+                    let (p, s): (Vec<usize>, Vec<bool>) = add.into_iter().unzip();
+                    l.path.splice(0..0, p);
+                    l.station.splice(0..0, s);
+                } else {
+                    add.reverse();
+                    for (p, s) in add {
+                        l.path.push(p);
+                        l.station.push(s);
+                    }
+                }
+                l.km += seg_km;
+                i
+            }
+            None => {
+                if let Some(i) = joined {
+                    // A junction: the line met gets a station here, for changing lines.
+                    let l = &mut self.lines[i];
+                    for (k, &p) in l.path.iter().enumerate() {
+                        if p == end {
+                            l.station[k] = true;
+                        }
+                    }
+                }
+                station[last] = true;
+                let id = self.lines.len() as u32 + 1;
+                self.lines.push(Line { id, owner: n, path: path.clone(), station, opened: self.year, closed: None, km: seg_km });
+                self.lines.len() - 1
+            }
+        };
+        self.rebuild_rail();
+        let all = self.lines[idx].path.clone();
+        self.touch(&all);
+        Some(idx)
     }
 
     /// A nation's railway project: link its largest city not yet on its
-    /// network to the network (the capital starts it).
-    fn railway_project(&mut self, n: u32) {
+    /// railways to them (the capital starts the network), if it can pay.
+    fn railway_project(&mut self, n: u32) -> bool {
         let members: Vec<usize> = self.members[n as usize].iter().copied().collect();
         if members.len() < 4 {
-            return;
+            return false;
         }
         let mut cities: Vec<usize> = members.iter().copied().filter(|&p| self.pop[p] >= self.np.found_population).collect();
         cities.sort_by(|&a, &b| self.pop[b].partial_cmp(&self.pop[a]).unwrap().then(a.cmp(&b)));
         cities.truncate(self.np.railway_cities.max(2) as usize);
         let cap = self.nation(n).capital;
-        let net: BTreeSet<usize> = self.rail_net[n as usize].iter().copied().filter(|&p| self.owner[p] == n).collect();
+        let net: BTreeSet<usize> = members.iter().copied().filter(|&p| self.rail[p] > 0).collect();
         let net = if net.is_empty() { [cap].into_iter().collect() } else { net };
         for &c in &cities {
-            if !net.contains(&c) && self.build_line(n, c, &net).is_some() {
+            if net.contains(&c) {
+                continue;
+            }
+            let before = self.lines.len();
+            if let Some(i) = self.build_line(n, c, &net, true) {
                 let (a, b) = (self.nation(n).name.clone(), self.provs[c].name.clone());
-                if self.railways.len() == 1 || self.rng.f64() < 0.15 {
-                    self.event("railway", n, 0, Some(c), format!("{a} opens a railway to {b}"));
+                let first = before == 0;
+                if first || self.rng.f64() < 0.15 {
+                    let what = if self.lines.len() > before { "opens a railway line" } else { "extends its railway" };
+                    let junction = self.lines[i].path.first().is_some_and(|&p| self.rail[p] == 3) || self.lines[i].path.last().is_some_and(|&p| self.rail[p] == 3);
+                    self.event("railway", n, 0, Some(c), format!("{a} {what} to {b}{}{}", if junction { ", with a junction where lines meet" } else { "" }, if first { " (the world's first railway)" } else { "" }));
                 }
-                return;
+                return true;
             }
         }
+        false
+    }
+
+    /// Whether nation n can take on more upkeep by itself (automatic projects).
+    fn can_keep(&self, n: u32, more: f64) -> bool {
+        let x = self.nation(n);
+        x.infra + more <= INFRA_SHARE * x.income
+    }
+
+    /// Cost to nation n of upgrading a path's roads to quality q.
+    fn road_cost_of(&self, n: u32, path: &[usize], q: u8) -> f64 {
+        path.windows(2)
+            .map(|w| {
+                let have = self.road_q(w[0], w[1]);
+                if have >= q {
+                    0.0
+                } else {
+                    self.border(w[0], w[1]).map_or(0.0, |e| self.build_km(e)) * (ROAD_BUILD[q as usize] - ROAD_BUILD[have as usize])
+                }
+            })
+            .sum::<f64>()
+            * self.np.road_cost.max(0.0)
+            * self.prod(n)
+    }
+
+    /// Route for a road of quality q between two of nation n's provinces:
+    /// cheapest to build, reusing roads already good enough.
+    fn road_route(&self, n: u32, a: usize, b: usize, q: u8) -> Option<Vec<usize>> {
+        if a == b || self.owner[a] != n || self.owner[b] != n {
+            return None;
+        }
+        self.route(n, a, &|p| p == b, &|p, e| {
+            let have = self.road_q(p, e.to as usize);
+            self.build_km(e) * (0.15 + if have >= q { 0.0 } else { 1.0 - ROAD_BUILD[have as usize] / ROAD_BUILD[q as usize] })
+        })
+    }
+
+    /// Build or upgrade a road of quality q from a to b over nation n's land.
+    /// With `afford`, only if the treasury holds the cost.
+    fn build_road(&mut self, n: u32, a: usize, b: usize, q: u8, afford: bool) -> bool {
+        let Some(path) = self.road_route(n, a, b, q) else { return false };
+        let cost = self.road_cost_of(n, &path, q);
+        let more: f64 = path
+            .windows(2)
+            .map(|w| self.km(w[0], w[1]) * (ROAD_UPKEEP[q as usize] - ROAD_UPKEEP[self.road_q(w[0], w[1]) as usize]).max(0.0))
+            .sum::<f64>()
+            * 0.5
+            * self.np.road_cost.max(0.0)
+            * self.prod(n);
+        if afford && (cost <= 0.0 || self.nation(n).treasury < cost || !self.can_keep(n, more)) {
+            return false;
+        }
+        self.nations[n as usize - 1].treasury -= cost;
+        for w in path.windows(2) {
+            let key = (w[0].min(w[1]), w[0].max(w[1]));
+            let e = self.roads.entry(key).or_insert((0, self.year));
+            if e.0 < q {
+                *e = (q, self.year);
+            }
+        }
+        self.touch(&path);
+        true
+    }
+
+    /// A nation's road project: the first of its largest cities whose road to
+    /// the capital is below what it wants (a highway between big cities in
+    /// the motor age, a paved road for a large city or in an industrial
+    /// nation, else a track; a track if that is all it can pay).
+    fn road_project(&mut self, n: u32) -> bool {
+        let members: Vec<usize> = self.members[n as usize].iter().copied().collect();
+        if members.len() < 2 {
+            return false;
+        }
+        let cap = self.nation(n).capital;
+        let mut cities: Vec<usize> = members.iter().copied().filter(|&p| p != cap && self.pop[p] >= 0.5 * self.np.found_population).collect();
+        cities.sort_by(|&a, &b| self.pop[b].partial_cmp(&self.pop[a]).unwrap().then(a.cmp(&b)));
+        cities.truncate(self.np.railway_cities.max(2) as usize + 4);
+        let motor = self.nation(n).era >= era::MOTOR;
+        let industrial = self.nation(n).era >= era::IND;
+        let treasury = self.nation(n).treasury;
+        for c in cities {
+            let want = if motor && self.pop[c] >= BIG_CITY && self.pop[cap] >= BIG_CITY {
+                3
+            } else if industrial || self.pop[c] >= PAVED_CITY {
+                2
+            } else {
+                1
+            };
+            for q in (1..=want).rev() {
+                let Some(path) = self.road_route(n, c, cap, q) else { break };
+                let cost = self.road_cost_of(n, &path, q);
+                if cost <= 0.0 {
+                    // Already as good as wanted.
+                    break;
+                }
+                let first = q == 3 && !self.roads.values().any(|r| r.0 == 3);
+                if cost <= treasury && self.build_road(n, c, cap, q, true) {
+                    if first {
+                        let (a, b) = (self.nation(n).name.clone(), self.provs[c].name.clone());
+                        self.event("highway", n, 0, Some(c), format!("{a} opens the world's first highway, to {b}"));
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn build_airport(&mut self, n: u32, p: usize) {
+        self.nations[n as usize - 1].treasury -= AIRPORT_BUILD * self.np.rail_cost.max(0.0) * self.prod(n);
+        let first = self.airports.is_empty();
+        self.airports.insert(p, self.year);
+        self.stale[n as usize] = true;
+        if self.airports.len() <= 5 && self.airports.keys().filter(|&&q| self.owner[q] == n).count() == 1 {
+            let (a, b) = (self.nation(n).name.clone(), self.provs[p].name.clone());
+            self.event("airport", n, 0, Some(p), format!("{a} opens {}airport at {b}", if first { "the world's first " } else { "its first " }));
+        }
+    }
+
+    /// A nation in the air age opens an airport at its capital, then at its big cities.
+    fn airport_project(&mut self, n: u32) {
+        let cost = AIRPORT_BUILD * self.np.rail_cost.max(0.0) * self.prod(n);
+        if self.nation(n).treasury < 2.0 * cost || !self.can_keep(n, AIRPORT_UPKEEP * self.np.rail_cost.max(0.0) * self.prod(n)) {
+            return;
+        }
+        let members: Vec<usize> = self.members[n as usize].iter().copied().collect();
+        let have = members.iter().filter(|p| self.airports.contains_key(p)).count();
+        if have >= (1 + members.len() / 40).min(8) {
+            return;
+        }
+        let cap = self.nation(n).capital;
+        let mut cities: Vec<usize> = members.iter().copied().filter(|&p| !self.airports.contains_key(&p) && (p == cap || self.pop[p] >= BIG_CITY)).collect();
+        cities.sort_by(|&a, &b| (b == cap).cmp(&(a == cap)).then(self.pop[b].partial_cmp(&self.pop[a]).unwrap()).then(a.cmp(&b)));
+        if let Some(&p) = cities.first() {
+            self.build_airport(n, p);
+        }
+    }
+
+    /// Set a nation's era from its technology, with events for the first nations into each era.
+    fn set_era(&mut self, n: u32) {
+        let k = n as usize - 1;
+        let new = self.era_from(self.nations[k].tech);
+        let old = self.nations[k].era;
+        if new == old {
+            return;
+        }
+        self.nations[k].era = new;
+        self.stale[n as usize] = true;
+        for e in old + 1..=new {
+            let rank = self.era_firsts[e as usize];
+            self.era_firsts[e as usize] += 1;
+            if rank >= 3 {
+                continue;
+            }
+            let name = self.nations[k].name.clone();
+            let text = match (e, rank) {
+                (era::FERT, 0) => format!("{name} is the first to make synthetic fertilizer: its farmland will feed far more people"),
+                (era::IND, 0) => format!("{name} is the first to industrialise"),
+                (era::MOTOR, 0) => format!("{name} enters the motor age first: cars and highways"),
+                (era::AIR, 0) => format!("{name} enters the air age first: airports and air routes"),
+                _ => format!("{name} enters the {} era", ERA_NAMES[e as usize]),
+            };
+            self.event("era", n, 0, None, text);
+        }
+    }
+
+    /// Technology: each nation heads for a level set by its rank in wealth
+    /// per head and in people (the richest and largest up to
+    /// `tech_lead_years` ahead of the calendar, the poorest and smallest up to
+    /// `TECH_LAG` years behind), raised by what its neighbours know. Behind it, a nation catches
+    /// up faster the further behind it is; ahead of it, it creeps on slowly.
+    fn advance_tech(&mut self, dt: f64) {
+        let living: Vec<u32> = (1..=self.nations.len() as u32).filter(|&m| self.alive(m)).collect();
+        if living.is_empty() {
+            return;
+        }
+        let pops: HashMap<u32, f64> = living.iter().map(|&m| (m, self.members[m as usize].iter().map(|&p| self.pop[p]).sum::<f64>())).collect();
+        // Rank of each nation by wealth per head and by people (0 last, 1 first).
+        let rank = |key: &dyn Fn(u32) -> f64| -> HashMap<u32, f64> {
+            let mut v = living.clone();
+            v.sort_by(|&a, &b| key(a).partial_cmp(&key(b)).unwrap().then(a.cmp(&b)));
+            let d = (v.len().max(2) - 1) as f64;
+            v.iter().enumerate().map(|(i, &m)| (m, i as f64 / d)).collect()
+        };
+        let wealth = rank(&|m| self.nation(m).income.max(0.0) / pops[&m].max(1.0));
+        let power = rank(&|m| pops[&m]);
+        let old: Vec<f64> = self.nations.iter().map(|x| x.tech).collect();
+        let ceiling = self.year as f64 + self.np.tech_lead_years;
+        let spread = self.np.tech_spread.max(0.0);
+        for &m in &living {
+            let k = m as usize - 1;
+            let t = old[k];
+            let score = 0.65 * wealth[&m] + 0.35 * power[&m];
+            let neigh = self.members[m as usize]
+                .iter()
+                .flat_map(|&p| self.adj[p].iter().map(|e| self.owner[e.to as usize]))
+                .filter(|&o| o > 0 && o != m)
+                .map(|o| old[o as usize - 1])
+                .fold(t, f64::max);
+            let target = (ceiling - TECH_LAG * (1.0 - score).powf(1.3)).max(neigh - 80.0).min(ceiling);
+            let gap = target - t;
+            let gain = if gap > 0.0 { (dt * (1.0 + spread * gap)).min(gap) } else { 0.2 * dt };
+            if t < ceiling {
+                self.nations[k].tech = (t + gain).min(ceiling);
+            }
+            self.set_era(m);
+        }
+    }
+
+    /// Taxes in, army and infrastructure out; bankruptcy when deep in debt.
+    fn economy(&mut self, dt: f64) {
+        let nn = self.nations.len();
+        let mut spend = vec![0.0; nn + 1];
+        // Building and upkeep cost labour: they scale with the payer's productivity.
+        let wage: Vec<f64> = std::iter::once(0.0).chain((1..=nn as u32).map(|m| if self.alive(m) { self.prod(m) } else { 0.0 })).collect();
+        let rc = self.np.road_cost.max(0.0);
+        let mut decay = Vec::new();
+        for (&(a, b), &(q, _)) in &self.roads {
+            let c = ROAD_UPKEEP[q as usize] * self.km(a, b) * rc;
+            let (oa, ob) = (self.owner[a] as usize, self.owner[b] as usize);
+            spend[oa] += 0.5 * c * wage[oa];
+            spend[ob] += 0.5 * c * wage[ob];
+            if oa == 0 && ob == 0 {
+                decay.push((a, b));
+            }
+        }
+        // Roads no one keeps fall into ruin.
+        for key in decay {
+            if self.rng.f64() < dt / 40.0 {
+                let r = self.roads.get_mut(&key).unwrap();
+                r.0 -= 1;
+                if r.0 == 0 {
+                    self.roads.remove(&key);
+                }
+            }
+        }
+        let lc = self.np.rail_cost.max(0.0);
+        for l in self.lines.iter().filter(|l| l.is_open()) {
+            let share = (RAIL_UPKEEP_KM * l.km + STATION_UPKEEP * l.stations().count() as f64) * lc / l.path.len().max(1) as f64;
+            for &p in &l.path {
+                let o = self.owner[p] as usize;
+                spend[o] += share * wage[o];
+            }
+        }
+        for &p in self.airports.keys() {
+            let o = self.owner[p] as usize;
+            spend[o] += AIRPORT_UPKEEP * lc * wage[o];
+        }
+        let tax = self.np.tax.max(0.0);
+        for m in 1..=nn as u32 {
+            if !self.alive(m) {
+                continue;
+            }
+            let prod = self.prod(m);
+            let income: f64 = self.members[m as usize].iter().map(|&p| self.pop[p] * self.integ[p]).sum::<f64>() * prod * tax;
+            let x = &mut self.nations[m as usize - 1];
+            // A full treasury is spent on the court, the army and the cities.
+            let surplus = 0.5 * (x.treasury - RESERVE_YEARS * income).max(0.0);
+            let upkeep = ARMY * income + spend[m as usize] + surplus;
+            x.income = income;
+            x.upkeep = upkeep;
+            x.infra = spend[m as usize];
+            x.treasury += (income - upkeep) * dt;
+            if x.treasury < -(2.0 * income).max(50_000.0) && self.year >= x.debt_until {
+                self.bankrupt(m);
+            }
+        }
+    }
+
+    /// A nation that can't pay its debts: it closes its newest railway lines
+    /// and lets its costliest roads decay a grade until its upkeep is within
+    /// its means, writes off half its debt and is less stable for ten years.
+    fn bankrupt(&mut self, n: u32) {
+        let k = n as usize - 1;
+        self.nations[k].treasury *= 0.5;
+        self.nations[k].debt_until = self.year + 10;
+        let wage = self.prod(n);
+        let (rc, lc) = (self.np.road_cost.max(0.0) * wage, self.np.rail_cost.max(0.0) * wage);
+        let mut over = self.nations[k].infra - INFRA_SHARE * self.nations[k].income;
+        let (mut lines, mut roads, mut named) = (0, 0, String::new());
+        let mut touched = Vec::new();
+        for _ in 0..40 {
+            if over <= 0.0 {
+                break;
+            }
+            // The newest line through its land, else its costliest road.
+            let line = (0..self.lines.len()).filter(|&i| self.lines[i].is_open() && self.lines[i].path.iter().any(|&p| self.owner[p] == n)).max_by_key(|&i| (self.lines[i].opened, i));
+            let road = self
+                .roads
+                .iter()
+                .filter(|(&(a, b), _)| self.owner[a] == n || self.owner[b] == n)
+                .map(|(&key, &(q, _))| (key, q, (ROAD_UPKEEP[q as usize] - ROAD_UPKEEP[q as usize - 1]) * self.km(key.0, key.1) * 0.5 * (u8::from(self.owner[key.0] == n) + u8::from(self.owner[key.1] == n)) as f64 * rc))
+                .max_by(|x, y| x.2.partial_cmp(&y.2).unwrap().then(y.0.cmp(&x.0)));
+            if let Some(i) = line.filter(|_| lines < 3) {
+                let l = &self.lines[i];
+                let mine = l.path.iter().filter(|&&p| self.owner[p] == n).count() as f64 / l.path.len().max(1) as f64;
+                over -= (RAIL_UPKEEP_KM * l.km + STATION_UPKEEP * l.stations().count() as f64) * lc * mine;
+                if lines == 0 {
+                    named = format!("the railway line from {} to {}", self.provs[l.path[0]].name, self.provs[*l.path.last().unwrap()].name);
+                }
+                self.lines[i].closed = Some(self.year);
+                touched.extend(self.lines[i].path.iter().copied());
+                lines += 1;
+            } else if let Some((key, q, saved)) = road {
+                over -= saved;
+                if q <= 1 {
+                    self.roads.remove(&key);
+                } else {
+                    self.roads.insert(key, (q - 1, self.year));
+                }
+                touched.extend([key.0, key.1]);
+                roads += 1;
+            } else {
+                break;
+            }
+        }
+        if lines > 0 {
+            self.rebuild_rail();
+        }
+        self.touch(&touched);
+        let mut cuts = Vec::new();
+        match lines {
+            0 => {}
+            1 => cuts.push(format!("closes {named}")),
+            _ => cuts.push(format!("closes {lines} railway lines, among them {named}")),
+        }
+        match roads {
+            0 => {}
+            1 => cuts.push("lets a road decay".to_string()),
+            _ => cuts.push(format!("lets {roads} roads decay")),
+        }
+        let name = self.nations[k].name.clone();
+        let what = if cuts.is_empty() { String::new() } else { format!(": it {}", cuts.join(" and ")) };
+        self.event("bankruptcy", n, 0, None, format!("{name} goes bankrupt{what}"));
     }
 
     /// Run one step of `years_per_step` years.
@@ -911,22 +1596,32 @@ impl NationSim {
         self.apply_directives();
         let y = self.year;
         let dt = self.np.years_per_step.max(1) as f64;
-        let (gun, ship, ind) = (y >= self.np.gunpowder_year, y >= self.np.shipping_year, y >= self.np.industrial_year);
+        // Founding slows once the world's seafarers have spread (by the calendar).
+        let ship = y >= self.np.shipping_year;
         let span = (self.np.start_date - self.np.start_year).max(1) as f32;
         if (y - self.np.start_year) % 50 < self.np.years_per_step as i32 {
-            progress(((y - self.np.start_year) as f32 / span).clamp(0.0, 1.0) * 0.95, &format!("Year {y}: {} nations", self.nations.iter().filter(|x| x.ended.is_none()).count()));
+            progress(((y - self.np.start_year) as f32 / span).clamp(0.0, 1.0) * 0.95, &format!("Year {y}: {} nations, {} era", self.nations.iter().filter(|x| x.ended.is_none()).count(), self.era()));
         }
         let n = self.provs.len();
         // City pins that have run their time.
         self.pins.retain(|x| x.until.map_or(true, |u| y < u));
+        // Technology and eras, access and integration, the treasury.
+        self.advance_tech(dt);
+        self.refresh_access();
+        self.economy(dt);
         self.update_attraction();
-        // 1. growth: attraction scales how many people a province holds.
-        let rate = self.np.growth + if ind { self.np.industrial_growth } else { 0.0 };
+        // 1. growth: attraction scales how many people a province holds; an
+        // industrial owner doubles it and grows faster, fertilizer adds more.
+        let owner_era = |s: &NationSim, p: usize| if s.owner[p] > 0 { s.nation(s.owner[p]).era } else { 0 };
+        let kbase: Vec<f64> = (0..n)
+            .map(|p| (self.cap[p] + self.cap_extra[p]) * if owner_era(self, p) >= era::IND { 2.0 } else { 1.0 } * self.fert_mult(self.owner[p]))
+            .collect();
         for p in 0..n {
             if self.pop[p] > 0.0 {
                 // Devastation stops growth (and pushes people out, below) but
                 // leaves the land able to hold them once it heals.
-                let k = self.cap[p] * if ind { 2.0 } else { 1.0 } * pull_of((self.attr[p] - self.devastation[p]).clamp(-1.0, 1.0));
+                let k = kbase[p] * pull_of((self.attr[p] - self.devastation[p]).clamp(-1.0, 1.0));
+                let rate = self.np.growth + if owner_era(self, p) >= era::IND { self.np.industrial_growth } else { 0.0 };
                 let r = rate * (1.0 + 0.5 * self.devastation[p]).max(0.0);
                 if k > 1.0 {
                     self.pop[p] = (self.pop[p] + self.pop[p] * r * dt * (1.0 - self.pop[p] / k).max(if self.pop[p] > k { -1.0 } else { 0.0 })).max(0.0);
@@ -936,19 +1631,24 @@ impl NationSim {
                 }
             }
         }
-        // Migration within each nation toward its attractive provinces, as far
-        // as they have room; devastated or shunned provinces send more.
+        // Migration within each nation toward its attractive, well-connected
+        // provinces, as far as they have room; devastated or shunned
+        // provinces send more.
         if self.np.migration > 0.0 {
             let m = (self.np.migration * dt).clamp(0.0, 0.5);
-            let ind_mult = if ind { 2.0 } else { 1.0 };
             for k in 1..=self.nations.len() {
                 if self.nations[k - 1].ended.is_some() {
                     continue;
                 }
                 let members: Vec<usize> = self.members[k].iter().copied().collect();
-                let room: Vec<f64> = members.iter().map(|&p| if self.attr[p] > 0.0 { (self.cap[p] * ind_mult * pull_of((self.attr[p] - self.devastation[p]).clamp(-1.0, 1.0)) - self.pop[p]).max(0.0) } else { 0.0 }).collect();
+                let room: Vec<f64> = members
+                    .iter()
+                    .map(|&p| if self.attr[p] > 0.0 { (kbase[p] * pull_of((self.attr[p] - self.devastation[p]).clamp(-1.0, 1.0)) - self.pop[p]).max(0.0) } else { 0.0 })
+                    .collect();
+                let weight: Vec<f64> = members.iter().zip(&room).map(|(&p, r)| r * (0.5 + self.integ[p])).collect();
                 let total_room: f64 = room.iter().sum();
-                if total_room <= 0.0 {
+                let total_weight: f64 = weight.iter().sum();
+                if total_room <= 0.0 || total_weight <= 0.0 {
                     continue;
                 }
                 let want: Vec<f64> = members.iter().map(|&p| if self.attr[p] <= 0.0 { self.pop[p] * (m * (1.0 + 4.0 * (-self.attr[p]))).min(0.5) } else { 0.0 }).collect();
@@ -956,10 +1656,12 @@ impl NationSim {
                 if total_want <= 0.0 {
                     continue;
                 }
-                let scale = (total_room / total_want).min(1.0);
-                let moved = total_want * scale;
+                let moved = total_want.min(total_room);
+                let gain: Vec<f64> = weight.iter().zip(&room).map(|(w, r)| (w / total_weight * moved).min(*r)).collect();
+                // Those who find no room stay.
+                let left = gain.iter().sum::<f64>() / total_want;
                 for (i, &p) in members.iter().enumerate() {
-                    self.pop[p] += room[i] / total_room * moved - want[i] * scale;
+                    self.pop[p] += gain[i] - want[i] * left;
                 }
             }
         }
@@ -1006,7 +1708,7 @@ impl NationSim {
             let tries = x.floor() as usize + usize::from(self.rng.f64() < x.fract());
             for _ in 0..tries {
                 if self.alive(m) {
-                    self.expand(m, gun, ship);
+                    self.expand(m);
                 }
             }
         }
@@ -1016,21 +1718,22 @@ impl NationSim {
                 continue;
             }
             let members: Vec<usize> = self.members[m as usize].iter().copied().collect();
-            let cap = self.nation(m).capital;
             let total: f64 = members.iter().map(|&p| self.pop[p]).sum::<f64>().max(1.0);
             let foreign: f64 = members.iter().map(|&p| self.pop[p] * self.cdist(m, p)).sum::<f64>() / total;
             let size = (members.len() as f64 / 60.0).min(3.0);
-            let spread = members.iter().map(|&p| self.km(p, cap)).sum::<f64>() / members.len() as f64 / (2.0 * self.np.reach_km.max(50.0));
+            let spread = members.iter().map(|&p| self.reach_cost(m, p)).sum::<f64>() / members.len() as f64 / (2.0 * self.np.reach_km.max(50.0));
             let instability = 1.2 * foreign + 0.4 * size + 0.4 * spread.min(3.0);
-            let era = if ind { 0.5 } else if gun { 0.7 } else { 1.0 };
-            let chance = self.np.collapse_rate * dt / 2.0 * instability * instability * era / self.stability_mult(m).max(0.05);
+            let e = self.nation(m).era;
+            let era_f = if e >= era::IND { 0.5 } else if e >= era::GUN { 0.7 } else { 1.0 };
+            let debt = if y < self.nation(m).debt_until { 1.6 } else { 1.0 };
+            let chance = self.np.collapse_rate * dt / 2.0 * instability * instability * era_f * debt / self.stability_mult(m).max(0.05);
             if self.rng.f64() < chance {
                 self.split(m, None);
             }
         }
-        // 5. culture feedback
-        let a = (self.np.assimilation * dt).clamp(0.0, 1.0);
-        if a > 0.0 {
+        // 5. culture feedback, faster where the ruler's reach is strong
+        let a0 = (self.np.assimilation * dt).clamp(0.0, 1.0);
+        if a0 > 0.0 {
             for p in 0..n {
                 let o = self.owner[p];
                 if o == 0 || self.pop[p] <= 0.0 {
@@ -1040,6 +1743,7 @@ impl NationSim {
                 if prim == 0 {
                     continue;
                 }
+                let a = (a0 * (0.5 + self.integ[p])).min(1.0);
                 let sh = &mut self.shares[p];
                 let s0 = sh.iter().find(|x| x.0 == prim).map_or(0.0, |x| x.1);
                 if s0 >= 1.0 {
@@ -1057,14 +1761,29 @@ impl NationSim {
                 self.major[p] = sh.iter().max_by(|x, y| x.1.partial_cmp(&y.1).unwrap().then(y.0.cmp(&x.0))).map_or(0, |x| x.0);
             }
         }
-        // 6. railways
-        if ind {
-            let every = (self.np.railway_every_years.max(1) as f64 / dt).round().max(1.0) as i32;
-            let k = ((y - self.np.industrial_year) as f64 / dt).round() as i32;
-            let living: Vec<u32> = (1..=self.nations.len() as u32).filter(|&m| self.alive(m)).collect();
-            for m in living {
-                if (k + m as i32) % every == 0 {
-                    self.railway_project(m);
+        // 6. building: roads, railways (industry) and airports (air age), each
+        // nation on its own schedule.
+        let k = (y as f64 / dt).round() as i32;
+        let rail_every = (self.np.railway_every_years.max(1) as f64 / dt).round().max(1.0) as i32;
+        let road_every = (self.np.road_every_years.max(1) as f64 / dt).round().max(1.0) as i32;
+        let living: Vec<u32> = (1..=self.nations.len() as u32).filter(|&m| self.alive(m)).collect();
+        for m in living {
+            // Up to three projects at a time, as far as the treasury goes.
+            if (k + m as i32) % road_every == 0 {
+                for _ in 0..3 {
+                    if !self.alive(m) || !self.road_project(m) {
+                        break;
+                    }
+                }
+                if self.nation(m).era >= era::AIR {
+                    self.airport_project(m);
+                }
+            }
+            if self.nation(m).era >= era::IND && (k + m as i32) % rail_every == 0 {
+                for _ in 0..3 {
+                    if !self.railway_project(m) {
+                        break;
+                    }
                 }
             }
         }
@@ -1087,6 +1806,23 @@ impl NationSim {
     }
 
     fn nation_rows(&self, living_only: bool) -> Vec<Value> {
+        // Infrastructure per nation: road km by quality (a border counts half
+        // for each owner), railway km over its land, stations and airports.
+        let nn = self.nations.len();
+        let mut road_km = vec![[0.0f64; 3]; nn + 1];
+        for (&(a, b), &(q, _)) in &self.roads {
+            let km = self.km(a, b);
+            road_km[self.owner[a] as usize][q as usize - 1] += 0.5 * km;
+            road_km[self.owner[b] as usize][q as usize - 1] += 0.5 * km;
+        }
+        let mut rail_km = vec![0.0f64; nn + 1];
+        for l in self.lines.iter().filter(|l| l.is_open()) {
+            for w in l.path.windows(2) {
+                let km = self.km(w[0], w[1]);
+                rail_km[self.owner[w[0]] as usize] += 0.5 * km;
+                rail_km[self.owner[w[1]] as usize] += 0.5 * km;
+            }
+        }
         let mut out = Vec::new();
         for (k, x) in self.nations.iter().enumerate() {
             let id = k as u32 + 1;
@@ -1103,13 +1839,22 @@ impl NationSim {
             }
             let mut regs: Vec<(u16, usize)> = regs.into_iter().collect();
             regs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let integ = if pop > 0.0 { m.iter().map(|&p| self.pop[p] * self.integ[p]).sum::<f64>() / pop } else { 0.0 };
+            let rk = road_km[id as usize];
             out.push(json!({
                 "id": id, "name": x.name, "government": if x.ended.is_some() { "" } else { government(m.len()) }, "color": x.color,
                 "capital": self.provs[x.capital].id, "capital_name": self.provs[x.capital].name,
                 "primary_culture": x.primary, "culture_name": self.culture_name(x.primary),
                 "provinces": m.len(), "population": pop.max(0.0).round() as u64, "overseas_provinces": overseas,
                 "founded": x.founded, "ended": x.ended, "fate": x.fate, "fate_other": x.other, "parent": x.parent,
-                "railway_provinces": self.rail_net[id as usize].iter().filter(|&&p| self.owner[p] == id).count(),
+                "tech": (x.tech * 10.0).round() / 10.0, "era": ERA_NAMES[x.era as usize], "era_index": x.era,
+                "treasury": x.treasury.round(), "income": x.income.round(), "upkeep": x.upkeep.round(),
+                "integration": (integ * 1000.0).round() / 1000.0, "bankrupt": self.year < x.debt_until,
+                "road_km": { "track": rk[0].round(), "paved": rk[1].round(), "highway": rk[2].round() },
+                "rail_km": rail_km[id as usize].round(),
+                "railway_provinces": m.iter().filter(|&&p| self.rail[p] > 0).count(),
+                "stations": m.iter().filter(|&&p| self.rail[p] >= 2).count(),
+                "airports": m.iter().filter(|p| self.airports.contains_key(p)).count(),
                 "regions": regs.iter().take(4).map(|(r, c)| json!({ "id": r, "name": self.region_names.get(r).cloned().unwrap_or_default(), "provinces": c })).collect::<Vec<_>>(),
             }));
         }
@@ -1121,6 +1866,9 @@ impl NationSim {
         let mut f_owner = vec![0u16; n];
         let mut f_cult = vec![0u16; n];
         let mut f_rail = vec![0u8; n];
+        let mut f_road = vec![0u8; n];
+        let mut f_air = vec![0u8; n];
+        let mut f_era = vec![0u8; n];
         let mut f_pop = vec![0f32; n];
         // Province area from the cell count is not needed: density uses the cells' share.
         let mut cells = vec![0u32; self.provs.len()];
@@ -1129,11 +1877,16 @@ impl NationSim {
                 cells[p] += 1;
             }
         }
+        let road: Vec<u8> = (0..self.provs.len()).map(|p| self.road_at(p)).collect();
         for i in 0..n {
             let Some(&p) = self.index.get(&self.prov_field[i]) else { continue };
             f_owner[i] = self.owner[p].min(u16::MAX as u32) as u16;
             f_cult[i] = self.major[p].min(u16::MAX as u32) as u16;
             f_rail[i] = self.rail[p];
+            f_road[i] = road[p];
+            f_air[i] = u8::from(self.airports.contains_key(&p));
+            // Era of the owner, plus one (0: no owner).
+            f_era[i] = if self.owner[p] > 0 { self.nation(self.owner[p]).era + 1 } else { 0 };
             if self.provs[p].land {
                 f_pop[i] = (self.pop[p] / cells[p].max(1) as f64) as f32;
             }
@@ -1142,10 +1895,79 @@ impl NationSim {
         f.put("owner", Field::U16(f_owner));
         f.put("nation_culture", Field::U16(f_cult));
         f.put("railway", Field::U8(f_rail));
+        f.put("road", Field::U8(f_road));
+        f.put("airport", Field::U8(f_air));
+        f.put("nation_era", Field::U8(f_era));
         f.put("nation_population", Field::F32(f_pop));
         let f_attr: Vec<f32> = (0..n).map(|i| self.index.get(&self.prov_field[i]).map_or(0.0, |&p| self.attr[p] as f32)).collect();
         f.put("nation_attraction", Field::F32(f_attr));
         f
+    }
+
+    fn line_rows(&self) -> Vec<Value> {
+        self.lines
+            .iter()
+            .map(|l| {
+                let (a, b) = (&self.provs[l.path[0]].name, &self.provs[*l.path.last().unwrap()].name);
+                json!({
+                    "id": l.id, "name": format!("{a}–{b}"), "owner": l.owner, "opened": l.opened, "closed": l.closed, "km": l.km.round(),
+                    "provinces": l.path.iter().map(|&p| self.provs[p].id).collect::<Vec<_>>(),
+                    "stations": l.stations().map(|p| self.provs[p].id).collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    }
+
+    fn road_rows(&self) -> Vec<Value> {
+        self.roads
+            .iter()
+            .map(|(&(a, b), &(q, built))| {
+                json!({ "from": self.provs[a].id, "to": self.provs[b].id, "quality": q, "kind": ROAD_NAMES[q as usize], "built": built, "km": self.km(a, b).round() })
+            })
+            .collect()
+    }
+
+    fn airport_rows(&self) -> Vec<Value> {
+        self.airports.iter().map(|(&p, &y)| json!({ "province": self.provs[p].id, "name": self.provs[p].name, "owner": self.owner[p], "opened": y })).collect()
+    }
+
+    /// Stations, with the open lines serving each (two or more: a junction).
+    fn station_rows(&self) -> Vec<Value> {
+        let mut at: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        for l in self.lines.iter().filter(|l| l.is_open()) {
+            for p in l.stations() {
+                at.entry(p).or_default().push(l.id);
+            }
+        }
+        at.into_iter()
+            .map(|(p, ls)| json!({ "province": self.provs[p].id, "name": self.provs[p].name, "owner": self.owner[p], "junction": ls.len() > 1, "lines": ls }))
+            .collect()
+    }
+
+    /// World totals of the infrastructure: road km by quality, open lines and their km, junctions, airports.
+    fn transport_summary(&self) -> Value {
+        let mut rk = [0.0f64; 3];
+        for (&(a, b), &(q, _)) in &self.roads {
+            rk[q as usize - 1] += self.km(a, b);
+        }
+        let open: Vec<&Line> = self.lines.iter().filter(|l| l.is_open()).collect();
+        json!({
+            "road_km": { "track": rk[0].round(), "paved": rk[1].round(), "highway": rk[2].round() },
+            "railway_lines": open.len(), "railway_lines_closed": self.lines.len() - open.len(),
+            "rail_km": open.iter().map(|l| l.km).sum::<f64>().round(),
+            "stations": self.rail.iter().filter(|&&r| r >= 2).count(),
+            "junctions": self.rail.iter().filter(|&&r| r == 3).count(),
+            "airports": self.airports.len(),
+        })
+    }
+
+    /// Living nations per era.
+    fn era_counts(&self) -> Value {
+        let mut c = [0usize; 7];
+        for x in self.nations.iter().filter(|x| x.ended.is_none()) {
+            c[x.era as usize] += 1;
+        }
+        Value::Object(ERA_NAMES.iter().zip(c).filter(|x| x.1 > 0).map(|(k, v)| (k.to_string(), json!(v))).collect())
     }
 
     /// The world so far, for the live view and the AI guide.
@@ -1188,23 +2010,17 @@ impl NationSim {
                 Effect::Stability(n, f) => json!({ "effect": "stability", "nation": n, "factor": f, "until": until }),
             })
             .collect();
-        let era = if self.year >= self.np.industrial_year {
-            "industry"
-        } else if self.year >= self.np.shipping_year {
-            "ocean shipping"
-        } else if self.year >= self.np.gunpowder_year {
-            "gunpowder"
-        } else {
-            "early"
-        };
+        let leader = self.leader().map(|m| json!({ "nation": m, "name": self.nation(m).name, "tech": (self.nation(m).tech * 10.0).round() / 10.0, "era": ERA_NAMES[self.nation(m).era as usize] }));
         let summary = json!({
             "stage": "nations",
-            "year": self.year, "start_year": self.np.start_year, "end_year": self.np.start_date, "era": era,
+            "year": self.year, "start_year": self.np.start_year, "end_year": self.np.start_date, "era": self.era(),
+            "leader": leader, "eras": self.era_counts(),
             "population": self.pop.iter().sum::<f64>().round(),
             "land_provinces": land, "ruled_provinces": ruled,
             "nations": nations, "nations_ever": self.nations.len(),
             "regions": regions, "effects": effects,
-            "railways": self.railways.len(),
+            "railways": self.lines.iter().filter(|l| l.is_open()).count(),
+            "transport": self.transport_summary(),
             "pins": self.pin_rows(),
             "cities": self.city_rows(20),
             "ruins": self.ruined.iter().filter(|&&r| r).count(),
@@ -1220,7 +2036,8 @@ impl NationSim {
             .filter(|&p| self.provs[p].land)
             .map(|p| {
                 let sh: Vec<Value> = self.shares[p].iter().filter(|x| x.1 >= 0.05).map(|x| json!([x.0, (x.1 * 1000.0).round() / 1000.0])).collect();
-                json!({ "id": self.provs[p].id, "owner": self.owner[p], "culture": self.major[p], "shares": sh, "population": self.pop[p].max(0.0).round() as u64, "railway": self.rail[p] })
+                json!({ "id": self.provs[p].id, "owner": self.owner[p], "culture": self.major[p], "shares": sh, "population": self.pop[p].max(0.0).round() as u64,
+                        "railway": self.rail[p], "road": self.road_at(p), "airport": self.airports.contains_key(&p), "integration": (self.integ[p] * 1000.0).round() / 1000.0 })
             })
             .collect();
         let nations = self.nation_rows(false);
@@ -1228,6 +2045,7 @@ impl NationSim {
         let ruled = (0..self.provs.len()).filter(|&p| self.provs[p].land && self.owner[p] > 0).count();
         let land = (0..self.provs.len()).filter(|&p| self.provs[p].land).count();
         let count = |k: &str| self.events.iter().filter(|e| e["event"] == k).count();
+        let leader = self.leader().map(|m| json!({ "nation": m, "name": self.nation(m).name, "tech": (self.nation(m).tech * 10.0).round() / 10.0, "era": ERA_NAMES[self.nation(m).era as usize] }));
         StepOutput {
             fields: self.fields(),
             meta: json!({
@@ -1235,13 +2053,18 @@ impl NationSim {
                 "nations_ever": self.nations.len(),
                 "start_year": self.np.start_year,
                 "start_date": self.np.start_date,
+                "era": self.era(),
+                "leader": leader,
+                "eras": self.era_counts(),
                 "ruled_share": ruled as f64 / land.max(1) as f64,
                 "population": self.pop.iter().sum::<f64>().round(),
-                "railways": self.railways.len(),
+                "railways": self.lines.iter().filter(|l| l.is_open()).count(),
                 "railway_provinces": self.rail.iter().filter(|&&r| r > 0).count(),
+                "transport": self.transport_summary(),
                 "conquests": count("conquest"),
                 "independences": count("independence"),
                 "colonies": count("colony"),
+                "bankruptcies": count("bankruptcy"),
                 "metropolises": self.metropolis.iter().filter(|&&m| m).count(),
                 "ruins": self.ruined.iter().filter(|&&r| r).count(),
                 "directives": self.applied,
@@ -1249,7 +2072,10 @@ impl NationSim {
                     "nations": nations,
                     "provinces": provinces,
                     "events": self.events,
-                    "railways": self.railways,
+                    "railways": self.line_rows(),
+                    "stations": self.station_rows(),
+                    "roads": self.road_rows(),
+                    "airports": self.airport_rows(),
                     "cities": self.city_rows(100),
                     "pins": self.pin_rows(),
                     "ruins": (0..self.provs.len()).filter(|&p| self.ruined[p]).map(|p| json!({ "province": self.provs[p].id, "name": self.provs[p].name, "population": self.pop[p].round() as u64, "peak": self.peak[p].0.round() as u64, "peak_year": self.peak[p].1 })).collect::<Vec<_>>(),
@@ -1264,7 +2090,13 @@ fn empty_output(n: usize) -> StepOutput {
     f.put("owner", Field::U16(vec![0; n]));
     f.put("nation_culture", Field::U16(vec![0; n]));
     f.put("railway", Field::U8(vec![0; n]));
+    f.put("road", Field::U8(vec![0; n]));
+    f.put("airport", Field::U8(vec![0; n]));
+    f.put("nation_era", Field::U8(vec![0; n]));
     f.put("nation_population", Field::F32(vec![0.0; n]));
     f.put("nation_attraction", Field::F32(vec![0.0; n]));
-    StepOutput { fields: f, meta: json!({ "nations": 0, "nations_ever": 0, "table": { "nations": [], "provinces": [], "events": [], "railways": [] } }) }
+    StepOutput {
+        fields: f,
+        meta: json!({ "nations": 0, "nations_ever": 0, "table": { "nations": [], "provinces": [], "events": [], "railways": [], "stations": [], "roads": [], "airports": [] } }),
+    }
 }

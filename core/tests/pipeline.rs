@@ -707,6 +707,92 @@ fn nations_are_consistent() {
 }
 
 #[test]
+fn transport_economy_and_eras() {
+    use worldcore::directives::Directive;
+    let mut p = small_params(23);
+    p.cultures.ticks = 60;
+    let mut w = World::new(p);
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m = w.meta(Step::Nations).unwrap().clone();
+    let t = &m["table"];
+    assert_eq!(m["start_date"], 1949);
+    let np = worldcore::params::NationParams::default();
+    let eras = [np.gunpowder_year, np.shipping_year, np.industrial_year, np.fertilizer_year, np.motor_year, np.air_year];
+    // Each nation's era follows its own technology.
+    let alive: Vec<&serde_json::Value> = t["nations"].as_array().unwrap().iter().filter(|n| n["ended"].is_null()).collect();
+    for n in &alive {
+        let tech = n["tech"].as_f64().unwrap();
+        // (tech is rounded to a tenth)
+        let (lo, hi) = (eras.iter().filter(|&&y| tech - 0.05 >= y as f64).count(), eras.iter().filter(|&&y| tech + 0.05 >= y as f64).count());
+        let era = n["era_index"].as_u64().unwrap() as usize;
+        assert!(lo <= era && era <= hi, "{}: tech {tech}, era {era}", n["name"]);
+        assert!(tech <= 1949.0 + np.tech_lead_years + 0.1);
+        let i = n["integration"].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&i));
+    }
+    let owner: std::collections::HashMap<u64, u64> = t["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["owner"].as_u64().unwrap())).collect();
+    // Roads join neighbours; highways and airports only in the motor and air ages.
+    let pt = w.meta(Step::Provinces).unwrap()["table"].clone();
+    let adj: std::collections::HashSet<(u64, u64)> = pt["adjacency"].as_array().unwrap().iter().map(|a| (a["from"].as_u64().unwrap(), a["to"].as_u64().unwrap())).collect();
+    let roads = t["roads"].as_array().unwrap();
+    assert!(!roads.is_empty(), "no roads");
+    for r in roads {
+        let (a, b) = (r["from"].as_u64().unwrap(), r["to"].as_u64().unwrap());
+        assert!(adj.contains(&(a, b)) || adj.contains(&(b, a)), "road {a}–{b} is not a border");
+        assert!((1..=3).contains(&r["quality"].as_u64().unwrap()));
+    }
+    let air_age = alive.iter().any(|n| n["era_index"].as_u64().unwrap() >= 6);
+    for a in t["airports"].as_array().unwrap() {
+        assert!(air_age, "airport without the air age");
+        assert!(a["opened"].as_i64().unwrap() >= 1800);
+    }
+    // Lines have stations at both ends; junctions are stations of two or more
+    // open lines, and the province table agrees.
+    let lines = t["railways"].as_array().unwrap();
+    for l in lines {
+        let path = l["provinces"].as_array().unwrap();
+        let st = l["stations"].as_array().unwrap();
+        assert!(path.len() >= 2 && st.first() == path.first() && st.last() == path.last());
+        assert!(l["km"].as_f64().unwrap() > 0.0);
+    }
+    let rail: std::collections::HashMap<u64, u64> = t["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["railway"].as_u64().unwrap())).collect();
+    for s in t["stations"].as_array().unwrap() {
+        let n = s["lines"].as_array().unwrap().len();
+        assert_eq!(s["junction"].as_bool().unwrap(), n > 1);
+        assert_eq!(rail[&s["province"].as_u64().unwrap()], if n > 1 { 3 } else { 2 });
+    }
+    // Steering: in 1948 the largest nation leaps ahead, gets a windfall, and
+    // builds a highway, a railway and an airport to an interior province.
+    let big = alive.iter().max_by_key(|n| n["population"].as_u64().unwrap()).unwrap();
+    let (nid, cap) = (big["id"].as_u64().unwrap(), big["capital"].as_u64().unwrap());
+    let mine: Vec<u64> = owner.iter().filter(|(_, &o)| o == nid).map(|(&p, _)| p).collect();
+    let interior = |p: u64| adj.iter().filter(|(a, b)| *a == p || *b == p).all(|(a, b)| owner.get(if *a == p { b } else { a }).is_some_and(|&o| o == nid));
+    let mut far: Vec<u64> = mine.iter().copied().filter(|&p| p != cap && interior(p)).collect();
+    far.sort();
+    let to = *far.last().or(mine.iter().find(|&&p| p != cap)).expect("a second province");
+    let d = |action: &str, args: serde_json::Value| Directive { stage: "nations".into(), at: 1948, action: action.into(), args, note: String::new(), by: "user".into() };
+    w.edits.overrides.directives = vec![
+        d("tech", serde_json::json!({ "nation": nid, "years": 200 })),
+        d("subsidy", serde_json::json!({ "nation": nid, "years": 5 })),
+        d("build_road", serde_json::json!({ "nation": nid, "from": cap, "to": to, "quality": 3 })),
+        d("railway", serde_json::json!({ "nation": nid, "from": to, "to": cap })),
+        d("airport", serde_json::json!({ "nation": nid, "province": to })),
+    ];
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m2 = w.meta(Step::Nations).unwrap().clone();
+    for a in m2["directives"].as_array().unwrap() {
+        assert_eq!(a["applied"], true, "{a}");
+    }
+    let t2 = &m2["table"];
+    let n2 = t2["nations"].as_array().unwrap().iter().find(|n| n["id"] == nid).unwrap();
+    assert_eq!(n2["era"], "air age");
+    assert!(t2["roads"].as_array().unwrap().iter().any(|r| r["quality"] == 3 && (r["from"] == cap || r["to"] == cap)), "highway from the capital");
+    assert!(t2["airports"].as_array().unwrap().iter().any(|a| a["province"] == to));
+    assert!(t2["railways"].as_array().unwrap().iter().any(|l| l["opened"] == 1948 && l["owner"] == nid), "railway of 1948");
+    assert!(worldcore::validate::validate(&mut w).ok);
+}
+
+#[test]
 fn cities_rise_and_fall() {
     use worldcore::directives::Directive;
     let mut p = small_params(29);

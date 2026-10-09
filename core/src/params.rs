@@ -480,7 +480,9 @@ impl Default for CultureParams {
 pub struct NationParams {
     /// Year the first polities can form.
     pub start_year: i32,
-    /// Year history stops: the map's start date (1910–1920 recommended).
+    /// Year history stops: the map's start date (default 1949: late in the
+    /// second great war's era, early in the cold war's; 1910–1920 for a
+    /// pre-war start).
     pub start_date: i32,
     /// Years per simulation step.
     pub years_per_step: u32,
@@ -504,8 +506,9 @@ pub struct NationParams {
     /// Population growth per year before and during the industrial era.
     pub growth: f64,
     pub industrial_growth: f64,
-    /// Era start years: gunpowder states, ocean shipping (overseas colonies),
-    /// industry (railways, mining).
+    /// Era technology years: gunpowder states, ocean shipping (overseas
+    /// colonies), industry (railways, faster growth). Each nation enters an
+    /// era when its own technology reaches the year, not the calendar.
     pub gunpowder_year: i32,
     pub shipping_year: i32,
     pub industrial_year: i32,
@@ -530,13 +533,37 @@ pub struct NationParams {
     /// Share of a nation's people that move each year toward its attractive
     /// provinces (capitals, stations, city pins), more from devastated land.
     pub migration: f64,
+    /// Technology years at which synthetic fertilizer, the motor age
+    /// (highways) and the air age (airports) begin. Like the other era years,
+    /// a nation reaches them when its own technology does: rich, large and
+    /// well-connected nations first, others as ideas spread to them.
+    pub fertilizer_year: i32,
+    pub motor_year: i32,
+    pub air_year: i32,
+    /// How much faster a nation catches up per year of technology gap to the
+    /// level its wealth, size and neighbours allow (0.02: a century behind,
+    /// three years of progress per year).
+    pub tech_spread: f64,
+    /// How far ahead of the calendar the most advanced nation can get (years).
+    pub tech_lead_years: f64,
+    /// Share of output collected as taxes (pays the army, roads, railways and airports).
+    pub tax: f64,
+    /// Multipliers on the cost of building and keeping roads, and railways and airports.
+    pub road_cost: f64,
+    pub rail_cost: f64,
+    /// Time lost changing trains at a junction (km of travel on foot).
+    pub transfer_km: f64,
+    /// How many more people farmland holds once a nation uses synthetic fertilizer.
+    pub fertilizer_boost: f64,
+    /// Years between a nation's road projects (and airport projects in the air age).
+    pub road_every_years: u32,
 }
 
 impl Default for NationParams {
     fn default() -> Self {
         NationParams {
             start_year: 800,
-            start_date: 1914,
+            start_date: 1949,
             years_per_step: 2,
             found_population: 60_000.0,
             found_rate: 0.0015,
@@ -561,6 +588,17 @@ impl Default for NationParams {
             war_devastation: 0.25,
             recovery: 0.03,
             migration: 0.002,
+            fertilizer_year: 1909,
+            motor_year: 1920,
+            air_year: 1935,
+            tech_spread: 0.02,
+            tech_lead_years: 10.0,
+            tax: 0.08,
+            road_cost: 1.0,
+            rail_cost: 1.0,
+            transfer_km: 150.0,
+            fertilizer_boost: 1.6,
+            road_every_years: 10,
         }
     }
 }

@@ -148,7 +148,7 @@ export type LayerId =
   | 'sketch' | 'plates' | 'crust' | 'boundaries' | 'elevation' | 'temperature' | 'precipitation'
   | 'continentality' | 'currents' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress'
   | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population' | 'attraction'
-  | 'nations' | 'railways' | 'city_growth';
+  | 'nations' | 'railways' | 'transport' | 'eras' | 'city_growth';
 
 export type LayerDef = {
   id: LayerId;
@@ -189,8 +189,14 @@ export const LAYERS: LayerDef[] = [
   { id: 'population', label: 'Population density', fields: ['population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'nations', label: 'Nations', fields: ['owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
   { id: 'railways', label: 'Railways', fields: ['railway', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'transport', label: 'Roads, rail & air', fields: ['road', 'railway', 'airport', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'eras', label: 'Eras', fields: ['nation_era', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
   { id: 'city_growth', label: 'City growth', fields: ['nation_attraction', 'nation_population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
 ];
+
+/** Stage 4 eras (core/src/stages/nations.rs ERA_NAMES), early to late. */
+export const ERA_NAMES = ['Early', 'Gunpowder', 'Ocean shipping', 'Industry', 'Fertilizer', 'Motor age', 'Air age'];
+const ERA_COLORS: RGB[] = [[120, 95, 70], [160, 120, 70], [70, 120, 160], [175, 60, 45], [90, 160, 70], [230, 150, 30], [190, 60, 170]];
 
 /** Same colours as states.png (core/src/export.rs state_color). */
 export function stateColor(id: number): RGB {
@@ -508,14 +514,50 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
         if (rail) {
           c = mix(c, [205, 200, 190], 0.65);
           const r = rw ? rw[i] : 0;
-          if (r === 2) c = [200, 30, 30];
+          if (r === 3) c = [30, 90, 220];
+          else if (r === 2) c = [200, 30, 30];
           else if (r === 1) c = [35, 35, 35];
         }
         put(i, c, 0.88 + 0.12 * sh(i));
       }
       legend = rail
-        ? { title: 'Railways (industrial era)', items: [{ color: [35, 35, 35], label: 'Track' }, { color: [200, 30, 30], label: 'Station' }, { color: [150, 146, 138], label: 'No ruler' }] }
+        ? { title: 'Railways (industrial era)', items: [{ color: [35, 35, 35], label: 'Track' }, { color: [200, 30, 30], label: 'Station' }, { color: [30, 90, 220], label: 'Junction (change lines)' }, { color: [150, 146, 138], label: 'No ruler' }] }
         : { title: 'Nations (hover for the owner)', items: [{ color: [20, 20, 20], label: 'Border' }, { color: [150, 146, 138], label: 'No ruler' }] };
+      break;
+    }
+    case 'transport': {
+      const ow = f['owner'], rd = f['road'], rw = f['railway'], ap = f['airport'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const o = ow ? ow[i] : 0;
+        let c: RGB = mix(o ? nationColor(o) : [150, 146, 138], [205, 200, 190], 0.75);
+        const q = rd ? rd[i] : 0;
+        if (q === 3) c = [235, 130, 20];
+        else if (q === 2) c = mix(c, [125, 85, 50], 0.75);
+        else if (q === 1) c = mix(c, [175, 150, 115], 0.6);
+        const r = rw ? rw[i] : 0;
+        if (r === 3) c = [30, 90, 220];
+        else if (r === 2) c = [200, 30, 30];
+        else if (r === 1) c = mix(c, [35, 35, 35], 0.55);
+        if (ap && ap[i]) c = [140, 40, 170];
+        put(i, c, 0.88 + 0.12 * sh(i));
+      }
+      legend = { title: 'Roads, railways & airports (best in each province)', items: [
+        { color: [175, 150, 115], label: 'Track' }, { color: [125, 85, 50], label: 'Paved road' }, { color: [235, 130, 20], label: 'Highway (motor age)' },
+        { color: [60, 60, 60], label: 'Railway' }, { color: [200, 30, 30], label: 'Station' }, { color: [30, 90, 220], label: 'Junction' }, { color: [140, 40, 170], label: 'Airport (air age)' },
+      ] };
+      break;
+    }
+    case 'eras': {
+      const er = f['nation_era'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const e = er ? er[i] : 0;
+        put(i, e ? ERA_COLORS[e - 1] : [150, 146, 138], 0.88 + 0.12 * sh(i));
+      }
+      legend = { title: 'Era of each nation (its own technology)', items: [...ERA_NAMES.map((name, k) => ({ color: ERA_COLORS[k], label: name })), { color: [150, 146, 138] as RGB, label: 'No ruler' }] };
       break;
     }
     case 'city_growth': {

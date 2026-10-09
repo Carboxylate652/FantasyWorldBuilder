@@ -193,9 +193,10 @@ fn summary(w: &World) {
                 m["population"].as_f64().unwrap_or(0.0) / 1e6, m["years"]
             ),
             "nations" => format!(
-                "{} nations in {} ({} ever), {:.0}% of land ruled, {} conquests, {} independences, {} colonies, {} railways",
+                "{} nations in {} ({} ever), {:.0}% of land ruled, {} conquests, {} independences, {} colonies, {} railway lines, {} airports; {} leads ({})",
                 m["nations"], m["start_date"], m["nations_ever"], m["ruled_share"].as_f64().unwrap_or(0.0) * 100.0,
-                m["conquests"], m["independences"], m["colonies"], m["railways"]
+                m["conquests"], m["independences"], m["colonies"], m["railways"], m["transport"]["airports"],
+                m["leader"]["name"].as_str().unwrap_or("no one"), m["era"].as_str().unwrap_or("")
             ),
             _ => String::new(),
         };

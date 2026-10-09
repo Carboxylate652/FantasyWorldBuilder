@@ -87,7 +87,7 @@ impl Live {
     fn era(&self) -> String {
         match &self.sim {
             LiveSim::Cultures(c) => format!("{}", c.era_of(c.t.min(c.ticks().saturating_sub(1)))),
-            LiveSim::Nations(n) => n.era_of(n.year).to_string(),
+            LiveSim::Nations(n) => n.era().to_string(),
         }
     }
 
