@@ -57,5 +57,5 @@ What was built (details in [nations.md](nations.md)):
 - Tests: the transfer-penalty unit test and `transport_economy_and_eras`.
 - Tuning took three designs for technology (two rate models drifted to all-equal or all-behind before the rank-based target model) and several rounds for costs (productivity-scaled costs, a reserve that spends down, an upkeep cap, selective paved roads).
 
-## 11. Documentation — this folder
-The `doc/` folder: architecture, pipeline, Stage 4, steering and the AI guide, app guide, CLI and API, export, a generated parameter reference, development recipes, status, future plans and this history.
+## 11. Documentation and 0.2.0-beta.1 — `46c76da`, PR #6
+The `doc/` folder: architecture, pipeline, Stage 4, steering and the AI guide, app guide, CLI and API, export, a generated parameter reference, development recipes, status, future plans and this history. Merged into `main` with the Stage 4 work (PR #6) and released as 0.2.0-beta.1.

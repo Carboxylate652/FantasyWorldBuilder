@@ -1,6 +1,6 @@
 # Status: what is implemented and what is not
 
-Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.md`). Last updated with the 1949 / transport work (commit `a63f795`, branch `master-3sczxa`).
+Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.md`). Last updated for 0.2.0-beta.1 (the 1949 / transport work, commit `a63f795`).
 
 ## Roadmap milestones
 
@@ -55,6 +55,6 @@ Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.
 - Releases are Windows-only and not code-signed; macOS and Linux builds from source are not part of CI beyond compiling on Ubuntu.
 - UI flows are checked by hand and with ad-hoc Playwright scripts, not by tests in CI.
 
-## Repository note
+## Releases
 
-PR #5 (opened from the Claude Code UI) merges `main` into `master` and contains the history up to the 0.1.0-beta.3 merge (`9a2340d`). The Stage 4 work (`6a48fc2`, `47d346d`, `a63f795`) is on branch `master-3sczxa` and is not part of PR #5.
+The Stage 4 work (`6a48fc2`, `47d346d`, `a63f795`) and this documentation were merged into `main` by PR #6 and released as 0.2.0-beta.1.

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0-beta.1 (unreleased)
+## 0.2.0-beta.1
 
 Stage 4: nations and history, and history you can steer.
 
