@@ -169,9 +169,9 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 .collect();
             let sources: Vec<(u32, f64, u32)> = src.iter().enumerate().map(|(k, &(c, _))| (c, 0.0, k as u32)).collect();
             let limit = if ch == Ch::ODiv as usize { f64::INFINITY } else { max_km };
-            let res = graph::multi_source(g, &sources, limit, |a, b, _| {
+            let res = graph::multi_source(g, &sources, limit, |a, b, _, edge_len| {
                 if plate[a] == plate[b] {
-                    Some(g.pos[a].angle_to(g.pos[b]) * r_km)
+                    Some(edge_len * r_km)
                 } else {
                     None
                 }

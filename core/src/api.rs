@@ -1,7 +1,7 @@
 //! Command interface shared by the Tauri app and the headless HTTP server.
 //! Every command takes JSON arguments and returns either JSON or raw bytes.
 
-use crate::edits::{EditLayer, Edits, MotionArrow, PlatePin, Stroke};
+use crate::edits::{EditLayer, Edits, Imports, MotionArrow, PlatePin, Sketch, Stroke};
 use crate::export::{export, ExportOptions};
 use crate::fields::Field;
 use crate::params::WorldParams;
@@ -10,6 +10,7 @@ use crate::stages::nations::NationSim;
 use crate::stages::{climate, Step, STEPS};
 use crate::world::World;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -30,11 +31,73 @@ pub struct ProgressState {
 pub struct Session {
     pub world: World,
     pub path: Option<PathBuf>,
-    undo: Vec<Edits>,
-    redo: Vec<Edits>,
+    undo: VecDeque<EditHistory>,
+    redo: VecDeque<EditHistory>,
     pub dirty: bool,
     /// A Stage 3 or 4 simulation running step by step.
     pub live: Option<Live>,
+}
+
+/// Undo stores only the part an action can change instead of cloning all edit
+/// layers for every brush stroke. Applying an entry yields its redo inverse.
+enum EditHistory {
+    Layers(Vec<(EditLayer, LayerState)>),
+    Pins(Vec<PlatePin>),
+    Arrows(Vec<MotionArrow>),
+    AutoBase(bool),
+    Imports(Imports),
+}
+
+enum LayerState {
+    Sketch(Sketch),
+    Strokes(Vec<Stroke>),
+    Directives(Vec<crate::directives::Directive>),
+}
+
+impl LayerState {
+    fn capture(edits: &Edits, layer: EditLayer) -> LayerState {
+        match layer {
+            EditLayer::Sketch => LayerState::Sketch(edits.sketch.clone()),
+            EditLayer::Directives => LayerState::Directives(edits.overrides.directives.clone()),
+            _ => LayerState::Strokes(edits.strokes(layer).clone()),
+        }
+    }
+    fn restore(self, edits: &mut Edits, layer: EditLayer) {
+        match (layer, self) {
+            (EditLayer::Sketch, LayerState::Sketch(v)) => edits.sketch = v,
+            (EditLayer::Directives, LayerState::Directives(v)) => edits.overrides.directives = v,
+            (EditLayer::Plates, LayerState::Strokes(v)) => edits.overrides.plates = v,
+            (EditLayer::Elevation, LayerState::Strokes(v)) => edits.overrides.elevation = v,
+            (EditLayer::Biomes, LayerState::Strokes(v)) => edits.overrides.biomes = v,
+            (EditLayer::Barriers, LayerState::Strokes(v)) => edits.overrides.barriers = v,
+            (EditLayer::States, LayerState::Strokes(v)) => edits.overrides.states = v,
+            (EditLayer::Provinces, LayerState::Strokes(v)) => edits.overrides.provinces = v,
+            (EditLayer::Sites, LayerState::Strokes(v)) => edits.overrides.sites = v,
+            (EditLayer::Fertility, LayerState::Strokes(v)) => edits.overrides.fertility = v,
+            (EditLayer::Bands, LayerState::Strokes(v)) => edits.overrides.bands = v,
+            (EditLayer::Attraction, LayerState::Strokes(v)) => edits.overrides.attraction = v,
+            _ => unreachable!("history state does not match edit layer"),
+        }
+    }
+}
+
+impl EditHistory {
+    fn swap(self, edits: &mut Edits) -> EditHistory {
+        match self {
+            EditHistory::Layers(saved) => {
+                let mut inverse = Vec::with_capacity(saved.len());
+                for (layer, state) in saved {
+                    inverse.push((layer, LayerState::capture(edits, layer)));
+                    state.restore(edits, layer);
+                }
+                EditHistory::Layers(inverse)
+            }
+            EditHistory::Pins(mut saved) => { std::mem::swap(&mut saved, &mut edits.sketch.pins); EditHistory::Pins(saved) }
+            EditHistory::Arrows(mut saved) => { std::mem::swap(&mut saved, &mut edits.sketch.arrows); EditHistory::Arrows(saved) }
+            EditHistory::AutoBase(saved) => EditHistory::AutoBase(std::mem::replace(&mut edits.sketch.auto_base, saved)),
+            EditHistory::Imports(mut saved) => { std::mem::swap(&mut saved, &mut edits.imports); EditHistory::Imports(saved) }
+        }
+    }
 }
 
 pub enum LiveSim {
@@ -129,16 +192,25 @@ impl Default for Session {
 
 impl Session {
     pub fn new(params: WorldParams) -> Session {
-        Session { world: World::new(params), path: None, undo: vec![], redo: vec![], dirty: false, live: None }
+        Session { world: World::new(params), path: None, undo: VecDeque::new(), redo: VecDeque::new(), dirty: false, live: None }
     }
 
-    fn snapshot(&mut self) {
-        self.undo.push(self.world.edits.clone());
+    fn remember(&mut self, state: EditHistory) {
+        self.undo.push_back(state);
         if self.undo.len() > 500 {
-            self.undo.remove(0);
+            self.undo.pop_front();
         }
         self.redo.clear();
         self.dirty = true;
+    }
+
+    fn snapshot_layers(&mut self, layers: &[EditLayer]) {
+        let mut unique = Vec::new();
+        for &layer in layers {
+            if !unique.contains(&layer) { unique.push(layer); }
+        }
+        let state = EditHistory::Layers(unique.into_iter().map(|l| (l, LayerState::capture(&self.world.edits, l))).collect());
+        self.remember(state);
     }
 
     pub fn status(&mut self) -> Value {
@@ -418,37 +490,39 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             if st.points.is_empty() {
                 return Err("empty stroke".into());
             }
-            s.snapshot();
+            s.snapshot_layers(&[st.tool.layer()]);
             s.world.edits.add_stroke(st);
             Ok(Reply::Json(s.status()))
         }
         "add_pin" => {
             let p: PlatePin = arg(&args, "pin")?;
-            s.snapshot();
+            s.remember(EditHistory::Pins(s.world.edits.sketch.pins.clone()));
             s.world.edits.sketch.pins.push(p);
             Ok(Reply::Json(s.status()))
         }
         "add_arrow" => {
             let a: MotionArrow = arg(&args, "arrow")?;
-            s.snapshot();
+            s.remember(EditHistory::Arrows(s.world.edits.sketch.arrows.clone()));
             s.world.edits.sketch.arrows.push(a);
             Ok(Reply::Json(s.status()))
         }
         "remove_pin" | "remove_arrow" => {
             let i: usize = arg(&args, "index")?;
-            s.snapshot();
-            let sk = &mut s.world.edits.sketch;
-            if cmd == "remove_pin" && i < sk.pins.len() {
-                sk.pins.remove(i);
-            } else if cmd == "remove_arrow" && i < sk.arrows.len() {
-                sk.arrows.remove(i);
+            if cmd == "remove_pin" && i < s.world.edits.sketch.pins.len() {
+                s.remember(EditHistory::Pins(s.world.edits.sketch.pins.clone()));
+                s.world.edits.sketch.pins.remove(i);
+            } else if cmd == "remove_arrow" && i < s.world.edits.sketch.arrows.len() {
+                s.remember(EditHistory::Arrows(s.world.edits.sketch.arrows.clone()));
+                s.world.edits.sketch.arrows.remove(i);
             }
             Ok(Reply::Json(s.status()))
         }
         "clear_layer" => {
             let layer: EditLayer = arg(&args, "layer")?;
-            s.snapshot();
-            s.world.edits.clear_layer(layer);
+            if s.world.edits.count(layer) > 0 {
+                s.snapshot_layers(&[layer]);
+                s.world.edits.clear_layer(layer);
+            }
             Ok(Reply::Json(s.status()))
         }
         "overrides" => Ok(Reply::Json(overrides_report(&s.world))),
@@ -456,8 +530,11 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             // { layer, indices }: drop strokes, e.g. the unapplied ones.
             let layer: EditLayer = arg(&args, "layer")?;
             let idx: Vec<usize> = arg(&args, "indices")?;
-            s.snapshot();
-            let removed = s.world.edits.remove_strokes(layer, &idx);
+            let len = if layer == EditLayer::Directives { s.world.edits.overrides.directives.len() } else { s.world.edits.strokes(layer).len() };
+            let removed = if idx.iter().any(|&i| i < len) {
+                s.snapshot_layers(&[layer]);
+                s.world.edits.remove_strokes(layer, &idx)
+            } else { 0 };
             let mut st = s.status();
             st["removed"] = json!(removed);
             Ok(Reply::Json(st))
@@ -480,8 +557,10 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             let b: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
             let mut edits = s.world.edits.clone();
             let taken = edits.apply_bundle(&b, only.as_deref(), replace)?;
-            s.snapshot();
-            s.world.edits = edits;
+            if !taken.is_empty() {
+                s.snapshot_layers(&taken.iter().map(|x| x.0).collect::<Vec<_>>());
+                s.world.edits = edits;
+            }
             let mut st = s.status();
             st["imported"] = json!(taken.iter().map(|(l, n)| json!({ "layer": l.key(), "edits": n })).collect::<Vec<_>>());
             Ok(Reply::Json(st))
@@ -489,7 +568,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
         "set_auto_base" => {
             let v: bool = arg(&args, "value")?;
             if v != s.world.edits.sketch.auto_base {
-                s.snapshot();
+                s.remember(EditHistory::AutoBase(s.world.edits.sketch.auto_base));
                 s.world.edits.sketch.auto_base = v;
             }
             Ok(Reply::Json(s.status()))
@@ -508,7 +587,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 }
                 None => None,
             };
-            s.snapshot();
+            s.remember(EditHistory::Imports(s.world.edits.imports.clone()));
             s.world.edits.imports.elevation = imp;
             Ok(Reply::Json(s.status()))
         }
@@ -527,7 +606,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 }
                 None => (None, Value::Null),
             };
-            s.snapshot();
+            s.remember(EditHistory::Imports(s.world.edits.imports.clone()));
             s.world.edits.imports.provinces = imp;
             let mut st = s.status();
             st["report"] = report;
@@ -572,9 +651,10 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
         "undo" | "redo" => {
             // A live run cannot take back what it already simulated: undo ends it.
             s.live = None;
-            let (from, to) = if cmd == "undo" { (&mut s.undo, &mut s.redo) } else { (&mut s.redo, &mut s.undo) };
-            if let Some(e) = from.pop() {
-                to.push(std::mem::replace(&mut s.world.edits, e));
+            let entry = if cmd == "undo" { s.undo.pop_back() } else { s.redo.pop_back() };
+            if let Some(entry) = entry {
+                let inverse = entry.swap(&mut s.world.edits);
+                if cmd == "undo" { s.redo.push_back(inverse); } else { s.undo.push_back(inverse); }
                 s.dirty = true;
             }
             Ok(Reply::Json(s.status()))
@@ -728,7 +808,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             if live.done() {
                 return Err("the simulation has reached its end; restart it to steer it".into());
             }
-            s.snapshot();
+            s.snapshot_layers(&[EditLayer::Directives]);
             s.world.edits.overrides.directives.push(d.clone());
             let live = s.live.as_mut().unwrap();
             match &mut live.sim {
@@ -786,5 +866,28 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             Ok(Reply::Json(s.status()))
         }
         _ => Err(format!("unknown command `{cmd}`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::edits::Tool;
+
+    #[test]
+    fn layer_history_swaps_only_the_changed_layer() {
+        let mut edits = Edits::default();
+        edits.add_stroke(Stroke { tool: Tool::PlatePaint, value: 1.0, points: vec![[0.0, 0.0]], ..Default::default() });
+        edits.add_stroke(Stroke { tool: Tool::Raise, value: 100.0, points: vec![[1.0, 1.0]], ..Default::default() });
+        let saved = EditHistory::Layers(vec![(EditLayer::Plates, LayerState::capture(&edits, EditLayer::Plates))]);
+        edits.add_stroke(Stroke { tool: Tool::PlatePaint, value: 2.0, points: vec![[2.0, 2.0]], ..Default::default() });
+        edits.add_stroke(Stroke { tool: Tool::Raise, value: 200.0, points: vec![[3.0, 3.0]], ..Default::default() });
+
+        let redo = saved.swap(&mut edits);
+        assert_eq!(edits.overrides.plates.len(), 1);
+        assert_eq!(edits.overrides.elevation.len(), 2, "unrelated layer changed by undo");
+        let _undo = redo.swap(&mut edits);
+        assert_eq!(edits.overrides.plates.len(), 2);
+        assert_eq!(edits.overrides.elevation.len(), 2);
     }
 }

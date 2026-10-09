@@ -18,6 +18,7 @@ use crate::hash;
 use crate::params::WorldParams;
 use crate::stages::{self, Ctx, Step, StepData, Upstream, STEPS};
 use serde::Serialize;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -164,7 +165,7 @@ impl World {
             for (name, f) in &d.fields.0 {
                 let file = format!("fields/{}/{}.bin", s.key(), name);
                 let bytes = f.to_bytes();
-                std::fs::write(dir.join(&file), &bytes)?;
+                write_atomic(&dir.join(&file), &bytes)?;
                 fields_json.push(serde_json::json!({
                     "name": name, "type": f.type_name(), "len": f.len(), "file": file,
                     "content_hash": hash::hex(hash::bytes(&bytes)),
@@ -179,7 +180,9 @@ impl World {
             "params": self.params,
             "steps": steps_json,
         });
-        write_json(&dir.join("world.json"), &world)?;
+        // Inputs first, manifest last: world.json is the commit marker for a
+        // save. Each file is replaced atomically, so an interrupted save
+        // leaves either the previous file or the complete new file.
         write_json(&dir.join("sketch.json"), &self.edits.sketch)?;
         write_json(&dir.join("overrides").join("plates.json"), &self.edits.overrides.plates)?;
         write_json(&dir.join("overrides").join("elevation.json"), &self.edits.overrides.elevation)?;
@@ -193,6 +196,7 @@ impl World {
         write_json(&dir.join("overrides").join("attraction.json"), &self.edits.overrides.attraction)?;
         write_json(&dir.join("overrides").join("directives.json"), &self.edits.overrides.directives)?;
         write_json(&dir.join("imports.json"), &self.edits.imports)?;
+        write_json(&dir.join("world.json"), &world)?;
         Ok(())
     }
 
@@ -202,22 +206,22 @@ impl World {
             return Err(format!("{} is not a {FORMAT} project", dir.display()));
         }
         let params: WorldParams = serde_json::from_value(world["params"].clone()).map_err(|e| e.to_string())?;
-        let sketch: Sketch = read_json(&dir.join("sketch.json")).unwrap_or_default();
+        let sketch: Sketch = read_json_optional(&dir.join("sketch.json"))?;
         let overrides = Overrides {
-            plates: read_json(&dir.join("overrides").join("plates.json")).unwrap_or_default(),
-            elevation: read_json(&dir.join("overrides").join("elevation.json")).unwrap_or_default(),
-            biomes: read_json(&dir.join("overrides").join("biomes.json")).unwrap_or_default(),
-            barriers: read_json(&dir.join("overrides").join("barriers.json")).unwrap_or_default(),
-            states: read_json(&dir.join("overrides").join("states.json")).unwrap_or_default(),
-            provinces: read_json(&dir.join("overrides").join("provinces.json")).unwrap_or_default(),
-            sites: read_json(&dir.join("overrides").join("sites.json")).unwrap_or_default(),
-            fertility: read_json(&dir.join("overrides").join("fertility.json")).unwrap_or_default(),
-            bands: read_json(&dir.join("overrides").join("bands.json")).unwrap_or_default(),
-            attraction: read_json(&dir.join("overrides").join("attraction.json")).unwrap_or_default(),
-            directives: read_json(&dir.join("overrides").join("directives.json")).unwrap_or_default(),
+            plates: read_json_optional(&dir.join("overrides").join("plates.json"))?,
+            elevation: read_json_optional(&dir.join("overrides").join("elevation.json"))?,
+            biomes: read_json_optional(&dir.join("overrides").join("biomes.json"))?,
+            barriers: read_json_optional(&dir.join("overrides").join("barriers.json"))?,
+            states: read_json_optional(&dir.join("overrides").join("states.json"))?,
+            provinces: read_json_optional(&dir.join("overrides").join("provinces.json"))?,
+            sites: read_json_optional(&dir.join("overrides").join("sites.json"))?,
+            fertility: read_json_optional(&dir.join("overrides").join("fertility.json"))?,
+            bands: read_json_optional(&dir.join("overrides").join("bands.json"))?,
+            attraction: read_json_optional(&dir.join("overrides").join("attraction.json"))?,
+            directives: read_json_optional(&dir.join("overrides").join("directives.json"))?,
         };
         let mut w = World::new(params);
-        let imports = read_json(&dir.join("imports.json")).unwrap_or_default();
+        let imports = read_json_optional(&dir.join("imports.json"))?;
         w.edits = Edits { sketch, overrides, imports };
         if let Some(steps) = world["steps"].as_array() {
             'steps: for sj in steps {
@@ -228,12 +232,22 @@ impl World {
                     let (Some(name), Some(ty), Some(file)) = (fj["name"].as_str(), fj["type"].as_str(), fj["file"].as_str()) else {
                         continue 'steps;
                     };
-                    let Ok(bytes) = std::fs::read(dir.join(file)) else { continue 'steps };
+                    let rel = Path::new(file);
+                    let safe = !rel.is_absolute()
+                        && rel.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+                        && rel.starts_with(Path::new("fields").join(step.key()));
+                    if !safe {
+                        return Err(format!("unsafe field path `{file}` in {}", dir.join("world.json").display()));
+                    }
+                    let Ok(bytes) = std::fs::read(dir.join(rel)) else { continue 'steps };
                     // A field edited or truncated outside the app invalidates the step.
                     if fj["content_hash"].as_str() != Some(&hash::hex(hash::bytes(&bytes))) {
                         continue 'steps;
                     }
                     let Some(f) = Field::from_bytes(ty, &bytes) else { continue 'steps };
+                    if fj["len"].as_u64() != Some(f.len() as u64) {
+                        continue 'steps;
+                    }
                     fields.put(name, f);
                 }
                 w.steps[step.index()] = Some(StepData {
@@ -265,21 +279,39 @@ impl World {
 /// left out and fetched separately with the `political` command.
 fn summary_meta(m: &serde_json::Value) -> serde_json::Value {
     match m {
-        serde_json::Value::Object(o) if o.contains_key("table") => {
-            let mut o = o.clone();
-            o.remove("table");
-            serde_json::Value::Object(o)
-        }
+        // Do not clone the (potentially very large) province/culture/nation
+        // table just to throw it away. Status fetches tables separately.
+        serde_json::Value::Object(o) if o.contains_key("table") => serde_json::Value::Object(
+            o.iter().filter(|(k, _)| k.as_str() != "table").map(|(k, v)| (k.clone(), v.clone())).collect(),
+        ),
         _ => m.clone(),
     }
 }
 
 fn write_json<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
     let s = serde_json::to_string_pretty(v).map_err(std::io::Error::other)?;
-    std::fs::write(path, s)
+    write_atomic(path, s.as_bytes())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| std::io::Error::other("project file has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let s = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn read_json_optional<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }

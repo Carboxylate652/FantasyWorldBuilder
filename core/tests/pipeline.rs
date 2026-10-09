@@ -27,6 +27,16 @@ fn grid_counts_and_topology() {
                 pent += 1;
             }
         }
+        let (off, nbr) = g.neighbor_csr();
+        let (len, rev) = g.neighbor_geometry();
+        for i in 0..g.len() {
+            for e in off[i] as usize..off[i + 1] as usize {
+                let r = rev[e] as usize;
+                assert_eq!(nbr[r] as usize, i);
+                assert_eq!(len[e], g.pos[i].angle_to(g.pos[nbr[e] as usize]));
+                assert!((len[e] - len[r]).abs() < 1e-15);
+            }
+        }
         assert_eq!(pent, 12);
         let total: f64 = g.area.iter().sum();
         assert!((total - 4.0 * std::f64::consts::PI).abs() < 1e-9);
@@ -95,6 +105,34 @@ fn deterministic_and_round_trips() {
     assert_eq!(c.edits, a.edits);
     assert!(STEPS.iter().all(|&s| c.is_fresh(s)));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn malformed_optional_project_file_is_reported() {
+    let dir = std::env::temp_dir().join(format!("fwm-corrupt-{}", std::process::id()));
+    let w = World::new(small_params(17));
+    w.save(&dir).unwrap();
+    std::fs::write(dir.join("overrides/barriers.json"), b"not json").unwrap();
+    let err = World::load(&dir).err().expect("corrupt override should fail to load");
+    assert!(err.contains("barriers.json"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn coarse_climate_cache_preserves_results_across_level_changes() {
+    let mut params = small_params(7);
+    params.climate.climate_level = 4;
+    let mut a = World::new(params.clone());
+    a.run_to(Step::Climate, &|_, _, _| {});
+    let expected = a.fingerprint();
+    let mut b = World::new(params);
+    b.run_to(Step::Climate, &|_, _, _| {});
+    assert_eq!(b.fingerprint(), expected, "cached coarse grid changed the result");
+    b.params.planet.grid_level = 6;
+    b.run_to(Step::Climate, &|_, _, _| {});
+    b.params.planet.grid_level = 5;
+    b.run_to(Step::Climate, &|_, _, _| {});
+    assert_eq!(b.fingerprint(), expected, "replacing the cache changed the result");
 }
 
 #[test]

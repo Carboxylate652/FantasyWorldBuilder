@@ -304,7 +304,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let near_cont = if cont_src.is_empty() {
         vec![0u32; n]
     } else {
-        graph::multi_source(g, &cont_src, f64::INFINITY, |a, b, _| Some(g.pos[a].angle_to(g.pos[b]))).label
+        graph::multi_source(g, &cont_src, f64::INFINITY, |_a, _b, _, edge_len| Some(edge_len)).label
     };
 
     #[derive(Clone)]
@@ -698,7 +698,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let passable_land = |i: usize| land(i) && label[i] != NONE && provs[label[i] as usize].kind == kind::LAND;
     let coast: Vec<(u32, f64, u32)> =
         (0..n).filter(|&i| passable_land(i) && g.neighbors(i).iter().any(|&j| ocean(j as usize))).map(|i| (i as u32, 0.0, i as u32)).collect();
-    let reach = graph::multi_source(g, &coast, max_km, |a, b, _| if ocean(b) { Some(g.pos[a].angle_to(g.pos[b]) * r_km) } else { None });
+    let reach = graph::multi_source(g, &coast, max_km, |_a, b, _, edge_len| if ocean(b) { Some(edge_len * r_km) } else { None });
     let mut straits: BTreeMap<(u32, u32), (f64, usize, usize, usize)> = BTreeMap::new();
     let consider = |from: usize, to: usize, via: usize, km: f64, straits: &mut BTreeMap<(u32, u32), (f64, usize, usize, usize)>| {
         if km > max_km || lm[from] == lm[to] {

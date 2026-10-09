@@ -73,4 +73,21 @@ The desktop shell (Tauri command `api`) and `worldgen serve` (POST `/api/<cmd>` 
 | `sim_actions`, `sim_start`, `sim_step`, `sim_state`, `sim_directive`, `sim_commit`, `sim_cancel` | Live runs (see [steering.md](steering.md)) |
 | `guide_presets`, `guide_config_get`, `guide_config_set`, `guide_test`, `guide_turn` | The AI guide |
 
-Every state-changing command records an undo snapshot of the edits.
+Undo history stores the affected edit layer, pins, arrows, auto-base flag or imports,
+rather than copying every edit. Undo and redo exchange that saved state with the
+current state. Empty clears and invalid removals do not add history entries.
+
+## CLI regression smoke test
+
+Build the CLI and run the end-to-end test (requires Bash, `jq` and `rg`):
+
+```sh
+cargo build -p worldgen
+bash cli/tests/smoke.sh "$PWD/target/debug/worldgen" 5
+```
+
+The script checks generation through nations, determinism and save/load identity,
+validation, cached reruns, editing and override bundles, PNG/CSV exports, heightmap
+and province imports, seed sweeps, directive discovery, and rejection of corrupt
+project JSON. It retains generated projects and command logs in a fresh temporary
+directory, printed at the start and end. See [the change and test report](core-review-changes.md).

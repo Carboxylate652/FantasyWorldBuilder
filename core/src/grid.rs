@@ -37,6 +37,10 @@ pub struct Grid {
     pub tris: Vec<[u32; 3]>,
     nbr_off: Vec<u32>,
     nbr: Vec<u32>,
+    /// Angular length of each directed neighbour edge, aligned with `nbr`.
+    nbr_len: Vec<f64>,
+    /// Index in `nbr` of the same edge in the opposite direction.
+    nbr_rev: Vec<u32>,
     vtri_off: Vec<u32>,
     vtri: Vec<u32>,
     /// Cell area on the unit sphere (steradians); sums to 4π.
@@ -137,6 +141,19 @@ impl Grid {
             }
         }
 
+        // Static edge geometry is used by many Dijkstra passes. Compute it
+        // once instead of repeatedly evaluating acos in every stage.
+        let mut nbr_len = vec![0.0f64; nbr.len()];
+        let mut nbr_rev = vec![u32::MAX; nbr.len()];
+        for i in 0..n {
+            for e in off[i] as usize..off[i + 1] as usize {
+                let j = nbr[e] as usize;
+                nbr_len[e] = pos[i].angle_to(pos[j]);
+                let r = (off[j] as usize..off[j + 1] as usize).find(|&q| nbr[q] as usize == i).expect("closed mesh edge has no reverse");
+                nbr_rev[e] = r as u32;
+            }
+        }
+
         // Cell areas from the chord triangles, normalised to 4π.
         let mut area = vec![0.0f64; n];
         for t in &tris {
@@ -173,6 +190,8 @@ impl Grid {
             tris,
             nbr_off: off,
             nbr,
+            nbr_len,
+            nbr_rev,
             vtri_off: fill_offsets_from(&deg),
             vtri,
             area,
@@ -202,6 +221,12 @@ impl Grid {
     /// CSR neighbour arrays (offsets, indices) for export to the UI.
     pub fn neighbor_csr(&self) -> (&[u32], &[u32]) {
         (&self.nbr_off, &self.nbr)
+    }
+
+    /// Directed edge lengths (radians) and reverse-edge indices, both aligned
+    /// with the neighbour indices returned by `neighbor_csr`.
+    pub fn neighbor_geometry(&self) -> (&[f64], &[u32]) {
+        (&self.nbr_len, &self.nbr_rev)
     }
 
     fn build_start_table(&mut self) {
