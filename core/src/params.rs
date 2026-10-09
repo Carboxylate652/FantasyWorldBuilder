@@ -517,6 +517,19 @@ pub struct NationParams {
     pub railway_every_years: u32,
     /// People a railway station draws (railway towns, also in the desert).
     pub station_people: f64,
+    /// Attraction (0–1) a capital grows into: people move there and it holds more.
+    pub capital_pull: f64,
+    /// Years a new capital takes to grow into its full pull.
+    pub capital_years: f64,
+    /// Share of a conquered province's people lost in the sack (four times for a capital).
+    pub war_sack: f64,
+    /// Attraction lost by a conquered province (devastation: people leave).
+    pub war_devastation: f64,
+    /// Share of devastation that heals each year.
+    pub recovery: f64,
+    /// Share of a nation's people that move each year toward its attractive
+    /// provinces (capitals, stations, city pins), more from devastated land.
+    pub migration: f64,
 }
 
 impl Default for NationParams {
@@ -542,6 +555,12 @@ impl Default for NationParams {
             railway_cities: 8,
             railway_every_years: 8,
             station_people: 15_000.0,
+            capital_pull: 0.5,
+            capital_years: 60.0,
+            war_sack: 0.03,
+            war_devastation: 0.25,
+            recovery: 0.03,
+            migration: 0.002,
         }
     }
 }

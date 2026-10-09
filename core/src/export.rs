@@ -484,6 +484,8 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
             "nations.csv": "id;name;government (city-state, kingdom, empire);color;capital_province;capital_name;primary_culture;culture_name;provinces;population;overseas_provinces;founded;ended;fate;fate_other;parent — every nation that ever existed",
             "nation_events.csv": "year;event (founded, independence, conquest of a capital, war summary, colony, union, renamed, railway, ended);nation;other;province;text",
             "railways.csv": "id;owner;opened;stations (province ids);provinces (province ids along the line, in order)",
+            "cities.csv": "rank;province;name;owner;population;capital;station;attraction (−1 to +1 at the start date);peak_population;peak_year — the 100 largest cities",
+            "ruins.csv": "province;name;population;peak_population;peak_year — cities that lost three quarters of their people (war, devastation, abandonment) and never recovered",
             "province_nations.csv": "province;owner (nation, 0 = none);culture (majority at the start date, after assimilation);shares;population;railway (0 none, 1 track, 2 station)",
             "trade_goods.csv": "good;kind (trade good, deposit, sea zone);category (staple, cash crop, livestock, forest, mineral, energy, sea);provinces;area_km2 — how much of the world has each good",
             "province_adjacency.csv": "from;to;type;border_km;barrier;crossing_km — every border between two provinces; type: land, river (along a border river), impassable (wasteland), coast (land–sea), lake, sea, strait (crossing_km = width); barrier = mean crossing cost of the border (0 = open)",
@@ -1055,7 +1057,17 @@ fn write_nation_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>,
         pn += &format!("{};{};{};{};{};{}\n", p["id"], p["owner"], p["culture"], sh, p["population"], p["railway"]);
     }
     write("province_nations.csv", pn)?;
-    Ok(["nations.csv", "nation_events.csv", "railways.csv", "province_nations.csv"].map(String::from).to_vec())
+    let mut ci = String::from("rank;province;name;owner;population;capital;station;attraction;peak_population;peak_year\n");
+    for (k, c) in arr("cities").iter().enumerate() {
+        ci += &format!("{};{};{};{};{};{};{};{};{};{}\n", k + 1, c["province"], csv_text(&c["name"]), c["owner"], c["population"], c["capital"], c["station"], c["attraction"], c["peak"], c["peak_year"]);
+    }
+    write("cities.csv", ci)?;
+    let mut ru = String::from("province;name;population;peak_population;peak_year\n");
+    for r in arr("ruins") {
+        ru += &format!("{};{};{};{};{}\n", r["province"], csv_text(&r["name"]), r["population"], r["peak"], r["peak_year"]);
+    }
+    write("ruins.csv", ru)?;
+    Ok(["nations.csv", "nation_events.csv", "railways.csv", "province_nations.csv", "cities.csv", "ruins.csv"].map(String::from).to_vec())
 }
 
 /// cultures.csv, culture_groups.csv, culture_events.csv, province_cultures.csv.

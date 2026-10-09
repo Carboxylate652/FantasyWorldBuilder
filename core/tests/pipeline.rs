@@ -705,3 +705,69 @@ fn nations_are_consistent() {
     assert!(ev.windows(2).all(|w| w[0]["year"].as_i64() <= w[1]["year"].as_i64()), "events in order");
     assert!(worldcore::validate::validate(&mut w).ok);
 }
+
+#[test]
+fn cities_rise_and_fall() {
+    use worldcore::directives::Directive;
+    let mut p = small_params(29);
+    p.cultures.ticks = 60;
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let t = w.meta(Step::Nations).unwrap()["table"].clone();
+    // Capitals become the largest cities.
+    let cities = t["cities"].as_array().unwrap();
+    let caps = cities.iter().take(10).filter(|c| c["capital"] == true).count();
+    assert!(caps >= 6, "capitals among the 10 largest cities: {caps}");
+    // Pins: a boom town and an abandoned city, placed in 1300 on two populous
+    // provinces that are not capitals, then the boom town moved and a capital moved.
+    let pop_of = |w: &World, id: u64| w.meta(Step::Nations).unwrap()["table"]["provinces"].as_array().unwrap().iter().find(|q| q["id"] == id).unwrap()["population"].as_f64().unwrap();
+    let mid: Vec<u64> = cities.iter().skip(20).filter(|c| c["capital"] == false).take(3).map(|c| c["province"].as_u64().unwrap()).collect();
+    let (boom, bust, later) = (mid[0], mid[1], mid[2]);
+    let d = |at: i64, action: &str, args: serde_json::Value| Directive { stage: "nations".into(), at, action: action.into(), args, note: String::new(), by: "user".into() };
+    w.edits.overrides.directives = vec![
+        d(1300, "pin_add", serde_json::json!({ "province": boom, "value": 1.0, "years": null, "label": "silver rush" })),
+        d(1300, "pin_add", serde_json::json!({ "province": bust, "value": -1.0, "years": null, "label": "sacked and abandoned" })),
+        d(1500, "pin_add", serde_json::json!({ "province": later, "value": 0.5, "years": 100, "label": null })),
+        d(1900, "pin_move", serde_json::json!({ "pin": 99, "province": boom })),
+    ];
+    for x in &w.edits.overrides.directives {
+        worldcore::directives::validate(x).unwrap();
+    }
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m = w.meta(Step::Nations).unwrap().clone();
+    let applied = m["directives"].as_array().unwrap();
+    assert_eq!(applied.iter().map(|a| a["applied"] == true).collect::<Vec<_>>(), vec![true, true, true, false], "{applied:?}");
+    let before = |id: u64| t["provinces"].as_array().unwrap().iter().find(|q| q["id"] == id).unwrap()["population"].as_f64().unwrap();
+    assert!(pop_of(&w, boom) > 1.3 * before(boom), "boom town grew: {} vs {}", pop_of(&w, boom), before(boom));
+    assert!(pop_of(&w, bust) < 0.2 * before(bust), "abandoned city emptied: {} vs {}", pop_of(&w, bust), before(bust));
+    let pins = m["table"]["pins"].as_array().unwrap();
+    assert_eq!(pins.len(), 2, "the 100-year pin expired: {pins:?}");
+    assert_eq!(pins[0]["label"], "silver rush");
+    assert!(m["table"]["events"].as_array().unwrap().iter().any(|e| e["event"] == "ruined" || e["event"] == "metropolis"));
+    assert!(worldcore::validate::validate(&mut w).ok);
+
+    // Moving a capital late (dated between two steps: it applies in the step
+    // that covers its year) to a deep interior province, which cannot change
+    // hands in that last step.
+    let ptab = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().clone();
+    let nt = m["table"].clone();
+    let owner: std::collections::HashMap<u64, u64> = nt["provinces"].as_array().unwrap().iter().map(|q| (q["id"].as_u64().unwrap(), q["owner"].as_u64().unwrap())).collect();
+    let (nation, target) = ptab
+        .iter()
+        .filter_map(|q| {
+            let id = q["id"].as_u64()?;
+            let o = *owner.get(&id)?;
+            let nb: Vec<u64> = q["neighbors"].as_array()?.iter().filter_map(|x| x.as_u64()).collect();
+            let cap = nt["nations"].as_array()?.iter().find(|n| n["id"] == o)?["capital"].as_u64()?;
+            (o > 0 && id != cap && nb.len() >= 3 && nb.iter().all(|x| owner.get(x).map_or(true, |&y| y == o))).then_some((o, id))
+        })
+        .next()
+        .expect("an interior province");
+    w.edits.overrides.directives.push(d(1913, "move_capital", serde_json::json!({ "nation": nation, "province": target })));
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m2 = w.meta(Step::Nations).unwrap();
+    assert_eq!(m2["directives"].as_array().unwrap().last().unwrap()["applied"], true);
+    assert!(m2["table"]["events"].as_array().unwrap().iter().any(|e| e["event"] == "capital" && e["year"] == 1912 && e["province"] == target));
+    let n2 = m2["table"]["nations"].as_array().unwrap().iter().find(|n| n["id"] == nation).unwrap();
+    assert_eq!(n2["capital"], target);
+}

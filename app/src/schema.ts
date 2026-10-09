@@ -21,7 +21,8 @@ export type ToolId =
   | 'barrier_paint' | 'barrier_erase' | 'site_pin' | 'state_paint' | 'province_paint'
   | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase'
   | 'attraction' | 'attraction_erase'
-  | 'goods_paint' | 'province_merge' | 'state_merge' | 'province_to_state' | 'rename_province' | 'rename_state';
+  | 'goods_paint' | 'province_merge' | 'state_merge' | 'province_to_state' | 'rename_province' | 'rename_state'
+  | 'city_pin' | 'city_unpin';
 
 export type ToolDef = {
   id: ToolId;
@@ -66,6 +67,8 @@ export const TOOLS: ToolDef[] = [
   { id: 'band_erase', label: 'Remove founder', step: 'cultures', gesture: 'point', hint: 'Click near a founding-band pin to remove it.' },
   { id: 'attraction', label: 'Attraction', key: 'h', step: 'cultures', value: 'attraction', defaultValue: 0.8, hint: 'Paint where people are drawn (+, up to 5× as many: a metropolis) or driven away (−, down to none: a ghost town) during the culture simulation. States and provinces stay as they are.' },
   { id: 'attraction_erase', label: 'Erase attraction', step: 'cultures', hint: 'Remove attraction paint under the brush.' },
+  { id: 'city_pin', label: 'City pin', key: 'y', step: 'nations', gesture: 'link', value: 'attraction', defaultValue: 0.8, hint: 'In a live Stage 4 run: click a province to make it draw people (+, a boom town or metropolis) or lose them (−, an abandoned city) from now on. Drag from a pin to move it.' },
+  { id: 'city_unpin', label: 'Remove city pin', step: 'nations', gesture: 'point', hint: 'In a live Stage 4 run: click near a city pin to remove it.' },
   { id: 'goods_paint', label: 'Paint goods', key: 'q', step: 'provinces', value: 'goods', defaultValue: 1, hint: 'Provinces under the brush get this trade good, or gain or lose a deposit.' },
   { id: 'province_merge', label: 'Merge provinces', key: 'u', step: 'provinces', gesture: 'link', hint: 'Drag from a province (an island, a sliver) onto the province that should absorb it.' },
   { id: 'state_merge', label: 'Merge states', step: 'states', gesture: 'link', hint: 'Drag from a state onto the state that should absorb it.' },
@@ -282,7 +285,7 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'nations', title: 'Nations & history', layer: 'nations', tools: [],
+    key: 'nations', title: 'Nations & history', layer: 'nations', tools: ['city_pin', 'city_unpin'],
     blurb: 'Polities form where people are many, then grow over the culture map: they settle empty land, fight over borders, colonise overseas and break apart along culture lines. Borders can cut through states, and colonies and exclaves are allowed. Railways link the largest cities in the industrial era. Run it in one go, step by step with your own directives, or let an AI guide steer it toward the history you describe.',
     params: [
       p('nations', 'start_year', 'First polities (year)', -5000, 1800, 10),
@@ -302,6 +305,12 @@ export const STEPS: StepUI[] = [
       p('nations', 'overseas_km', 'Colony range (km)', 500, 20000, 100),
       p('nations', 'railway_cities', 'Cities linked by rail per nation', 2, 40, 1),
       p('nations', 'station_people', 'People per railway station', 0, 200000, 1000, 'Railway towns, also in the desert.'),
+      p('nations', 'capital_pull', 'Capital pull', 0, 1, 0.05, 'Attraction a capital grows into: people move there and it holds more (up to 5× at 1).'),
+      p('nations', 'capital_years', 'Years to grow a capital', 1, 300, 1),
+      p('nations', 'war_sack', 'Sack (share of people lost)', 0, 0.5, 0.01, 'When a province is conquered; four times as much for a capital.'),
+      p('nations', 'war_devastation', 'War devastation', 0, 1, 0.05, 'Conquest stops growth and drives people away until it heals: cities fought over again and again empty.'),
+      p('nations', 'recovery', 'Recovery per year', 0, 0.2, 0.005),
+      p('nations', 'migration', 'Migration to cities per year', 0, 0.05, 0.0005, 'Share of a nation\'s people that moves each year toward its capitals, stations and city pins.'),
     ],
   },
 ];

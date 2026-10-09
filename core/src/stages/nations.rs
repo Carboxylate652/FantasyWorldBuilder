@@ -26,6 +26,17 @@
 //!   along the cheapest route over its own land, with stations at the ends,
 //!   every few provinces and in dry land (water stops). Stations draw people,
 //!   which grows railway towns, also in the desert.
+//! - **Cities rise and fall:** each province has an attraction (−1 to +1)
+//!   that changes with history. A capital grows into its pull over a few
+//!   decades (more for a large nation) and loses it when the capital moves;
+//!   a conquered province is sacked and devastated, and the devastation
+//!   heals slowly, so a city fought over again and again empties; railway
+//!   stations draw people. City pins (directives, by hand or from the AI
+//!   guide) add, move or remove attraction anywhere. Attraction scales how
+//!   many people a province holds (up to 5×, down to none), and each year a
+//!   share of a nation's people moves toward its attractive provinces, more
+//!   from devastated or shunned ones: capitals become metropolises,
+//!   battlefields become ruins.
 //! - **Directives** (by hand or from the AI guide) apply in the year they
 //!   were issued, so a steered history replays exactly.
 
@@ -78,6 +89,20 @@ struct Nation {
     other: u32,
     parent: u32,
     aggression: f64,
+    /// Year the current capital became the capital.
+    capital_since: i32,
+}
+
+/// A city pin: attraction placed by a directive.
+#[derive(Clone)]
+struct CityPin {
+    id: u32,
+    province: usize,
+    value: f64,
+    label: String,
+    until: Option<i32>,
+    by: String,
+    since: i32,
 }
 
 #[derive(Clone)]
@@ -121,7 +146,29 @@ pub struct NationSim {
     next_directive: usize,
     effects: Vec<(Effect, i32)>,
     applied: Vec<Value>,
+    /// Devastation per province (0 to −1), healing over time.
+    devastation: Vec<f64>,
+    /// Attraction per province this step (devastation + capital + station + pins).
+    attr: Vec<f64>,
+    pins: Vec<CityPin>,
+    next_pin: u32,
+    /// Most people a province ever held, and when.
+    peak: Vec<(f64, i32)>,
+    ruined: Vec<bool>,
+    metropolis: Vec<bool>,
 }
+
+/// Capacity multiplier of an attraction: ×5 at +1, ×0 at −1 (as in Stage 3).
+fn pull_of(a: f64) -> f64 {
+    if a >= 0.0 {
+        1.0 + 4.0 * a
+    } else {
+        (1.0 + a).powi(2)
+    }
+}
+
+/// People at which a city counts as a metropolis (an event).
+const METROPOLIS: f64 = 1_000_000.0;
 
 fn hsl(h: f64, s: f64, l: f64) -> [u8; 3] {
     let h = h.rem_euclid(360.0);
@@ -260,6 +307,13 @@ impl NationSim {
             next_directive: 0,
             effects: Vec::new(),
             applied: Vec::new(),
+            devastation: vec![0.0; n],
+            attr: vec![0.0; n],
+            pins: Vec::new(),
+            next_pin: 1,
+            peak: vec![(0.0, 0); n],
+            ruined: vec![false; n],
+            metropolis: vec![false; n],
             provs,
         })
     }
@@ -378,6 +432,7 @@ impl NationSim {
             other: 0,
             parent,
             aggression,
+            capital_since: self.year,
         });
         self.members.push(BTreeSet::new());
         self.rail_net.push(BTreeSet::new());
@@ -418,9 +473,8 @@ impl NationSim {
         if old > 0 && self.alive(old) && self.nation(old).capital == p {
             // The capital moves to the most populous remaining province.
             let next = self.members[old as usize].iter().copied().max_by(|&a, &b| self.pop[a].partial_cmp(&self.pop[b]).unwrap().then(b.cmp(&a)));
-            match next {
-                Some(q) => self.nations[old as usize - 1].capital = q,
-                None => {}
+            if let Some(q) = next {
+                self.set_capital(old, q);
             }
         }
         if old > 0 && self.alive(old) && self.members[old as usize].is_empty() {
@@ -431,6 +485,71 @@ impl NationSim {
             let (a, b) = (self.nations[k].name.clone(), if n > 0 { self.nation(n).name.clone() } else { String::new() });
             self.event("ended", old, n, Some(p), if n > 0 { format!("{a} falls to {b}") } else { format!("{a} collapses") });
         }
+    }
+
+    /// Move a nation's capital: the new one grows into its pull from now on.
+    fn set_capital(&mut self, n: u32, q: usize) {
+        let k = n as usize - 1;
+        if self.nations[k].capital == q {
+            return;
+        }
+        self.nations[k].capital = q;
+        self.nations[k].capital_since = self.year;
+        let (a, b) = (self.nations[k].name.clone(), self.provs[q].name.clone());
+        self.event("capital", n, 0, Some(q), format!("{b} becomes the capital of {a}"));
+    }
+
+    /// Attraction of every province this step: devastation, capitals (grown
+    /// into over `capital_years`, larger for larger nations), railway
+    /// stations and city pins.
+    fn update_attraction(&mut self) {
+        let np = &self.np;
+        for p in 0..self.provs.len() {
+            self.attr[p] = self.devastation[p] + if self.rail[p] == 2 { 0.15 } else { 0.0 };
+        }
+        for (k, x) in self.nations.iter().enumerate() {
+            if x.ended.is_some() {
+                continue;
+            }
+            let size = self.members[k + 1].len().max(1) as f64;
+            let grown = ((self.year - x.capital_since) as f64 / np.capital_years.max(1.0)).clamp(0.0, 1.0);
+            let scale = 0.4 + 0.6 * (size.ln() / 30f64.ln()).clamp(0.0, 1.0);
+            self.attr[x.capital] += np.capital_pull * grown * scale;
+        }
+        for pin in &self.pins {
+            self.attr[pin.province] += pin.value;
+        }
+        for a in self.attr.iter_mut() {
+            *a = a.clamp(-1.0, 1.0);
+        }
+    }
+
+    fn pin_rows(&self) -> Vec<Value> {
+        self.pins
+            .iter()
+            .map(|p| {
+                let (la, lo) = self.provs[p.province].center.lat_lon();
+                json!({ "id": p.id, "province": self.provs[p.province].id, "province_name": self.provs[p.province].name, "value": p.value, "label": p.label,
+                        "until": p.until, "since": p.since, "by": p.by, "owner": self.owner[p.province],
+                        "at": [(la.to_degrees() * 100.0).round() / 100.0, (lo.to_degrees() * 100.0).round() / 100.0] })
+            })
+            .collect()
+    }
+
+    /// The largest cities (provinces by people), with how they changed.
+    fn city_rows(&self, n: usize) -> Vec<Value> {
+        let mut order: Vec<usize> = (0..self.provs.len()).filter(|&p| self.provs[p].land && self.pop[p] > 0.0).collect();
+        order.sort_by(|&a, &b| self.pop[b].partial_cmp(&self.pop[a]).unwrap().then(a.cmp(&b)));
+        let capital_of: HashMap<usize, u32> = self.nations.iter().enumerate().filter(|(_, x)| x.ended.is_none()).map(|(k, x)| (x.capital, k as u32 + 1)).collect();
+        order
+            .into_iter()
+            .take(n)
+            .map(|p| {
+                json!({ "province": self.provs[p].id, "name": self.provs[p].name, "population": self.pop[p].round() as u64, "owner": self.owner[p],
+                        "capital": capital_of.contains_key(&p), "attraction": (self.attr[p] * 100.0).round() / 100.0, "station": self.rail[p] == 2,
+                        "peak": self.peak[p].0.round() as u64, "peak_year": self.peak[p].1 })
+            })
+            .collect()
     }
 
     fn places(&self, args: &Value) -> Vec<usize> {
@@ -446,7 +565,9 @@ impl NationSim {
     fn apply_directives(&mut self) {
         let y = self.year;
         self.effects.retain(|(_, until)| y < *until);
-        while self.next_directive < self.directives.len() && self.directives[self.next_directive].at <= y as i64 {
+        // A step covers years y .. y + years_per_step: directives dated in it apply now.
+        let end = (y + self.np.years_per_step.max(1) as i32) as i64;
+        while self.next_directive < self.directives.len() && self.directives[self.next_directive].at < end {
             let d = self.directives[self.next_directive].clone();
             self.next_directive += 1;
             let a = &d.args;
@@ -504,6 +625,36 @@ impl NationSim {
                         self.pop[p] *= 1.0 - sev;
                     }
                 }
+                "pin_add" => match p_province.filter(|&p| self.provs[p].land) {
+                    Some(p) => {
+                        let id = self.next_pin;
+                        self.next_pin += 1;
+                        let until = a["years"].as_f64().map(|yrs| y + yrs.ceil().max(1.0) as i32);
+                        let label = a["label"].as_str().unwrap_or("").trim().to_string();
+                        self.pins.push(CityPin { id, province: p, value: arg_f64(a, "value", 0.0).clamp(-1.0, 1.0), label, until, by: d.by.clone(), since: y });
+                    }
+                    None => ok = false,
+                },
+                "pin_move" => {
+                    let pid = arg_u64(a, "pin").unwrap_or(0) as u32;
+                    match (self.pins.iter_mut().find(|x| x.id == pid), p_province.filter(|&p| self.provs[p].land)) {
+                        (Some(pin), Some(p)) => {
+                            pin.province = p;
+                            pin.since = y;
+                        }
+                        _ => ok = false,
+                    }
+                }
+                "pin_remove" => {
+                    let pid = arg_u64(a, "pin").unwrap_or(0) as u32;
+                    let before = self.pins.len();
+                    self.pins.retain(|x| x.id != pid);
+                    ok = self.pins.len() < before;
+                }
+                "move_capital" if self.alive(nat) => match p_province.filter(|&p| self.owner[p] == nat) {
+                    Some(p) => self.set_capital(nat, p),
+                    None => ok = false,
+                },
                 "note" => {}
                 _ => ok = false,
             }
@@ -650,6 +801,9 @@ impl NationSim {
             let capital = self.nation(o).capital == q && self.members[o as usize].len() > 1;
             let (a, b, c) = (self.nation(n).name.clone(), self.nation(o).name.clone(), self.provs[q].name.clone());
             self.take(q, n);
+            // The sack: people lost now, and devastation that drives more away until it heals.
+            self.pop[q] *= 1.0 - (self.np.war_sack * if capital { 4.0 } else { 1.0 }).clamp(0.0, 0.9);
+            self.devastation[q] = (self.devastation[q] - self.np.war_devastation).max(-1.0);
             *self.tally.entry((n, o)).or_insert(0) += 1;
             if capital {
                 self.event("conquest", n, o, Some(q), format!("{a} takes {b}'s capital {c}"));
@@ -763,14 +917,73 @@ impl NationSim {
             progress(((y - self.np.start_year) as f32 / span).clamp(0.0, 1.0) * 0.95, &format!("Year {y}: {} nations", self.nations.iter().filter(|x| x.ended.is_none()).count()));
         }
         let n = self.provs.len();
-        // 1. growth
+        // City pins that have run their time.
+        self.pins.retain(|x| x.until.map_or(true, |u| y < u));
+        self.update_attraction();
+        // 1. growth: attraction scales how many people a province holds.
         let rate = self.np.growth + if ind { self.np.industrial_growth } else { 0.0 };
         for p in 0..n {
             if self.pop[p] > 0.0 {
-                let k = self.cap[p] * if ind { 2.0 } else { 1.0 };
-                if k > 0.0 {
-                    self.pop[p] = (self.pop[p] + self.pop[p] * rate * dt * (1.0 - self.pop[p] / k)).max(0.0);
+                // Devastation stops growth (and pushes people out, below) but
+                // leaves the land able to hold them once it heals.
+                let k = self.cap[p] * if ind { 2.0 } else { 1.0 } * pull_of((self.attr[p] - self.devastation[p]).clamp(-1.0, 1.0));
+                let r = rate * (1.0 + 0.5 * self.devastation[p]).max(0.0);
+                if k > 1.0 {
+                    self.pop[p] = (self.pop[p] + self.pop[p] * r * dt * (1.0 - self.pop[p] / k).max(if self.pop[p] > k { -1.0 } else { 0.0 })).max(0.0);
+                } else {
+                    // Nothing holds people here any more: they leave.
+                    self.pop[p] *= 0.9f64.powf(dt);
                 }
+            }
+        }
+        // Migration within each nation toward its attractive provinces, as far
+        // as they have room; devastated or shunned provinces send more.
+        if self.np.migration > 0.0 {
+            let m = (self.np.migration * dt).clamp(0.0, 0.5);
+            let ind_mult = if ind { 2.0 } else { 1.0 };
+            for k in 1..=self.nations.len() {
+                if self.nations[k - 1].ended.is_some() {
+                    continue;
+                }
+                let members: Vec<usize> = self.members[k].iter().copied().collect();
+                let room: Vec<f64> = members.iter().map(|&p| if self.attr[p] > 0.0 { (self.cap[p] * ind_mult * pull_of((self.attr[p] - self.devastation[p]).clamp(-1.0, 1.0)) - self.pop[p]).max(0.0) } else { 0.0 }).collect();
+                let total_room: f64 = room.iter().sum();
+                if total_room <= 0.0 {
+                    continue;
+                }
+                let want: Vec<f64> = members.iter().map(|&p| if self.attr[p] <= 0.0 { self.pop[p] * (m * (1.0 + 4.0 * (-self.attr[p]))).min(0.5) } else { 0.0 }).collect();
+                let total_want: f64 = want.iter().sum();
+                if total_want <= 0.0 {
+                    continue;
+                }
+                let scale = (total_room / total_want).min(1.0);
+                let moved = total_want * scale;
+                for (i, &p) in members.iter().enumerate() {
+                    self.pop[p] += room[i] / total_room * moved - want[i] * scale;
+                }
+            }
+        }
+        // Devastation heals; peaks, metropolises and ruins.
+        let heal = (1.0 - self.np.recovery * dt).clamp(0.0, 1.0);
+        let fp0 = self.np.found_population.max(1.0);
+        for p in 0..n {
+            self.devastation[p] *= heal;
+            if self.pop[p] > self.peak[p].0 {
+                self.peak[p] = (self.pop[p], y);
+            }
+            if self.ruined[p] && self.pop[p] > 0.6 * self.peak[p].0 {
+                // Rebuilt.
+                self.ruined[p] = false;
+            }
+            if !self.metropolis[p] && self.pop[p] >= METROPOLIS {
+                self.metropolis[p] = true;
+                let (o, name) = (self.owner[p], self.provs[p].name.clone());
+                self.event("metropolis", o, 0, Some(p), format!("{name} passes a million people"));
+            }
+            if !self.ruined[p] && self.peak[p].0 >= 3.0 * fp0 && self.pop[p] < 0.25 * self.peak[p].0 {
+                self.ruined[p] = true;
+                let (o, name) = (self.owner[p], self.provs[p].name.clone());
+                self.event("ruined", o, 0, Some(p), format!("{name} lies abandoned: {} people of {} at its height in {}", self.pop[p].round(), self.peak[p].0.round(), self.peak[p].1));
             }
         }
         // 2. new polities
@@ -930,6 +1143,8 @@ impl NationSim {
         f.put("nation_culture", Field::U16(f_cult));
         f.put("railway", Field::U8(f_rail));
         f.put("nation_population", Field::F32(f_pop));
+        let f_attr: Vec<f32> = (0..n).map(|i| self.index.get(&self.prov_field[i]).map_or(0.0, |&p| self.attr[p] as f32)).collect();
+        f.put("nation_attraction", Field::F32(f_attr));
         f
     }
 
@@ -990,6 +1205,9 @@ impl NationSim {
             "nations": nations, "nations_ever": self.nations.len(),
             "regions": regions, "effects": effects,
             "railways": self.railways.len(),
+            "pins": self.pin_rows(),
+            "cities": self.city_rows(20),
+            "ruins": self.ruined.iter().filter(|&&r| r).count(),
             "events": self.events.iter().rev().take(20).rev().cloned().collect::<Vec<_>>(),
             "directives": self.applied,
             "queued": self.directives[self.next_directive..].iter().map(|d| json!({ "year": d.at, "action": d.action, "args": d.args, "note": d.note, "by": d.by })).collect::<Vec<_>>(),
@@ -1024,12 +1242,17 @@ impl NationSim {
                 "conquests": count("conquest"),
                 "independences": count("independence"),
                 "colonies": count("colony"),
+                "metropolises": self.metropolis.iter().filter(|&&m| m).count(),
+                "ruins": self.ruined.iter().filter(|&&r| r).count(),
                 "directives": self.applied,
                 "table": {
                     "nations": nations,
                     "provinces": provinces,
                     "events": self.events,
                     "railways": self.railways,
+                    "cities": self.city_rows(100),
+                    "pins": self.pin_rows(),
+                    "ruins": (0..self.provs.len()).filter(|&p| self.ruined[p]).map(|p| json!({ "province": self.provs[p].id, "name": self.provs[p].name, "population": self.pop[p].round() as u64, "peak": self.peak[p].0.round() as u64, "peak_year": self.peak[p].1 })).collect::<Vec<_>>(),
                 },
             }),
         }
@@ -1042,5 +1265,6 @@ fn empty_output(n: usize) -> StepOutput {
     f.put("nation_culture", Field::U16(vec![0; n]));
     f.put("railway", Field::U8(vec![0; n]));
     f.put("nation_population", Field::F32(vec![0.0; n]));
+    f.put("nation_attraction", Field::F32(vec![0.0; n]));
     StepOutput { fields: f, meta: json!({ "nations": 0, "nations_ever": 0, "table": { "nations": [], "provinces": [], "events": [], "railways": [] } }) }
 }

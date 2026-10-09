@@ -562,6 +562,8 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                         t["nations"] = nm["nations"].clone();
                         t["nation_events"] = nm["events"].clone();
                         t["railways"] = nm["railways"].clone();
+                        t["city_pins"] = nm["pins"].clone();
+                        t["cities"] = nm["cities"].clone();
                     }
                 }
             }

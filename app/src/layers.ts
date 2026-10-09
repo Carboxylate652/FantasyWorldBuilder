@@ -148,7 +148,7 @@ export type LayerId =
   | 'sketch' | 'plates' | 'crust' | 'boundaries' | 'elevation' | 'temperature' | 'precipitation'
   | 'continentality' | 'currents' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress'
   | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population' | 'attraction'
-  | 'nations' | 'railways';
+  | 'nations' | 'railways' | 'city_growth';
 
 export type LayerDef = {
   id: LayerId;
@@ -189,6 +189,7 @@ export const LAYERS: LayerDef[] = [
   { id: 'population', label: 'Population density', fields: ['population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'nations', label: 'Nations', fields: ['owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
   { id: 'railways', label: 'Railways', fields: ['railway', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'city_growth', label: 'City growth', fields: ['nation_attraction', 'nation_population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
 ];
 
 /** Same colours as states.png (core/src/export.rs state_color). */
@@ -515,6 +516,20 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       legend = rail
         ? { title: 'Railways (industrial era)', items: [{ color: [35, 35, 35], label: 'Track' }, { color: [200, 30, 30], label: 'Station' }, { color: [150, 146, 138], label: 'No ruler' }] }
         : { title: 'Nations (hover for the owner)', items: [{ color: [20, 20, 20], label: 'Border' }, { color: [150, 146, 138], label: 'No ruler' }] };
+      break;
+    }
+    case 'city_growth': {
+      const at = f['nation_attraction'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const a = at ? at[i] : 0;
+        const c: RGB = a > 0 ? mix([200, 196, 186], [230, 150, 20], Math.min(1, a * 1.5)) : mix([200, 196, 186], [120, 40, 40], Math.min(1, -a * 1.5));
+        put(i, c, 0.85 + 0.15 * sh(i));
+      }
+      legend = { title: 'City growth (Stage 4 attraction)', items: [
+        { color: [230, 150, 20], label: 'Draws people: capital, station, city pin' }, { color: [200, 196, 186], label: 'Neutral' }, { color: [120, 40, 40], label: 'Loses people: war devastation, abandoned' },
+      ] };
       break;
     }
     case 'attraction': {

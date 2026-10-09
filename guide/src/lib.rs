@@ -276,6 +276,9 @@ Use the tools to nudge the simulation toward the user's goal. The tools change c
 the simulation decides what follows, so prefer a few plausible nudges, aimed with care, over forcing outcomes, and act only when it serves the goal. \
 Take ids (cultures, nations, provinces, regions) from the state; never invent them. Effects with a duration last that many years from now. \
 After any tool calls, write one to three sentences for the chronicle: what happened since the last turn and what you set in motion. \
+In Stage 4, cities rise and fall with history (capitals grow, sacked cities empty, stations draw people); \
+city pins (pin_add, pin_move, pin_remove) let you make a boom town, a metropolis or an abandoned city wherever the story needs one, \
+and move_capital moves a court. Keep the pins you placed in mind: move or remove them when the story moves on. \
 You may choose how many years pass before the next turn with set_pace.";
 
 fn pace_tool() -> Tool {

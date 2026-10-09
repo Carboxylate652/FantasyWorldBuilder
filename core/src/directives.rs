@@ -190,6 +190,30 @@ pub fn actions() -> Vec<ActionSpec> {
         },
         ActionSpec {
             stage: "nations",
+            name: "pin_add",
+            description: "Place a city pin: from now on the province draws people (value > 0: a boom town, a new capital, a trade hub; up to +1 a metropolis) or loses them (value < 0: a city abandoned after war, plague or a dried-up mine; −1 empties it). Lasts the given years, or until moved or removed (years null). Returns a pin id shown in the state.",
+            schema: object(json!({ "province": { "type": "integer" }, "value": num("−1 (abandoned) to +1 (metropolis)", -1.0, 1.0), "years": { "type": ["number", "null"], "minimum": 1.0, "maximum": 5000.0, "description": "How long it lasts, or null until removed" }, "label": { "type": ["string", "null"], "description": "What it stands for (\"royal capital\", \"silver rush\", \"burned in the war\")" } })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "pin_move",
+            description: "Move a city pin to another province (the court moves, trade shifts to a new port).",
+            schema: object(json!({ "pin": { "type": "integer", "description": "Pin id" }, "province": { "type": "integer" } })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "pin_remove",
+            description: "Remove a city pin: the province goes back to its own fortunes.",
+            schema: object(json!({ "pin": { "type": "integer", "description": "Pin id" } })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "move_capital",
+            description: "A nation moves its capital to one of its provinces; the new capital grows over the following decades, the old one loses its pull.",
+            schema: object(json!({ "nation": { "type": "integer" }, "province": { "type": "integer" } })),
+        },
+        ActionSpec {
+            stage: "nations",
             name: "catastrophe",
             description: "A plague, famine or war kills a share of the people in the places at once.",
             schema: with_place(map(json!({ "severity": num("Share of people lost", 0.0, 0.95) }))),

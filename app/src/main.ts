@@ -1,6 +1,6 @@
 import './style.css';
 import * as api from './api';
-import { Grid, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
+import { Grid, angle, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
 import { BOUNDARY, DEPOSITS, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
@@ -13,7 +13,7 @@ import { EDITOR_TOOLS, LIVE_STEPS, STAGE2_START, STAGE3_START, STAGE4_START, STA
 type Political = {
   states: any[]; regions: any[]; continents: any[]; provinces: any[]; adjacencies: any[];
   cultures: any[]; groups: any[]; events: any[];
-  nations: any[]; nationEvents: any[]; railways: any[];
+  nations: any[]; nationEvents: any[]; railways: any[]; cityPins: any[];
   byState: Map<number, any>; byRegion: Map<number, any>; byProv: Map<number, any>; byCont: Map<number, any>;
   byCulture: Map<number, any>; byGroup: Map<number, any>; byNation: Map<number, any>;
 };
@@ -159,7 +159,7 @@ async function political(): Promise<Political | null> {
     S.political = {
       states: t.states ?? [], regions: t.regions ?? [], continents: t.continents ?? [], provinces: t.provinces ?? [], adjacencies: t.adjacencies ?? [],
       cultures: t.cultures ?? [], groups: t.culture_groups ?? [], events: t.culture_events ?? [],
-      nations: t.nations ?? [], nationEvents: t.nation_events ?? [], railways: t.railways ?? [],
+      nations: t.nations ?? [], nationEvents: t.nation_events ?? [], railways: t.railways ?? [], cityPins: t.city_pins ?? [],
       byState: idx(t.states), byRegion: idx(t.regions), byProv: idx(t.provinces), byCont: idx(t.continents),
       byCulture: idx(t.cultures), byGroup: idx(t.culture_groups), byNation: idx(t.nations),
     };
@@ -220,7 +220,7 @@ function stepOfLayer(id: LayerId): string {
     habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
     resources: 'Provinces',
     cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures', attraction: 'Cultures',
-    nations: 'Nations & history', railways: 'Nations & history',
+    nations: 'Nations & history', railways: 'Nations & history', city_growth: 'Nations & history',
   };
   return m[id];
 }
@@ -446,6 +446,22 @@ function drawEditMarkers() {
   if (!(st.edits.band_pins ?? []).length) {
     const founders = st.steps.find((s) => s.key === 'cultures')?.meta?.founders ?? [];
     for (const f of founders) ring(fromLatLon((f.lat * Math.PI) / 180, (f.lon * Math.PI) / 180), 0.012, [1, 0.85, 0.2, 0.7], false);
+  }
+  // City pins of the live Stage 4 run (or of the kept run): orange draws people, red-brown loses them.
+  for (const pin of (SIM.state?.stage === 'nations' ? SIM.state.pins : S.political?.cityPins) ?? []) {
+    if (!pin.at) continue;
+    const p = fromLatLon((pin.at[0] * Math.PI) / 180, (pin.at[1] * Math.PI) / 180);
+    const [e, n] = eastNorth(p);
+    const r = 0.012 + 0.01 * Math.abs(pin.value);
+    const col: [number, number, number, number] = pin.value >= 0 ? [1, 0.6, 0.1, 1] : [0.75, 0.2, 0.2, 1];
+    ring(p, r, col, false);
+    if (pin.value >= 0) {
+      L.seg(offset(p, e, n, -r * 0.6, 0), offset(p, e, n, r * 0.6, 0), col, 0.004);
+      L.seg(offset(p, e, n, 0, -r * 0.6), offset(p, e, n, 0, r * 0.6), col, 0.004);
+    } else {
+      L.seg(offset(p, e, n, -r * 0.5, -r * 0.5), offset(p, e, n, r * 0.5, r * 0.5), col, 0.004);
+      L.seg(offset(p, e, n, -r * 0.5, r * 0.5), offset(p, e, n, r * 0.5, -r * 0.5), col, 0.004);
+    }
   }
   for (const a of st.edits.arrows) {
     const p = fromLatLon((a.lat * Math.PI) / 180, (a.lon * Math.PI) / 180);
@@ -1022,7 +1038,10 @@ async function applySim(r: any) {
 }
 
 async function simCall(cmd: string, args: any = {}): Promise<any | null> {
-  if (SIM.busy) return null;
+  if (SIM.busy) {
+    toast('The simulation is busy; try again in a moment.', true);
+    return null;
+  }
   SIM.busy = true;
   renderSim();
   const stop = pollProgress();
@@ -1160,6 +1179,44 @@ async function guideRun() {
   renderSim();
 }
 
+/** City pins on the map in a live Stage 4 run: click to add, drag a pin to move it, or remove. */
+async function cityPinGesture(tool: ToolId, start: Vec3, end: Vec3, moved: boolean) {
+  const live = S.status?.live;
+  if (!live || live.stage !== 'nations') return toast('Start Stage 4 step by step first: city pins steer a live run.', true);
+  if (live.done) return toast('The run has reached its end; restart it to place pins.', true);
+  const prov = await getField('province');
+  if (!prov) return;
+  const kind = await getField('province_kind');
+  const provAt = (p: Vec3) => prov.values[S.grid!.nearest(p)];
+  const onLand = (p: Vec3) => !kind || kind.values[S.grid!.nearest(p)] < 2;
+  const pins: any[] = SIM.state?.pins ?? [];
+  const near = (p: Vec3) => {
+    let best: any = null, bd = 0.04;
+    for (const pin of pins) {
+      const d = angle(p, fromLatLon((pin.at[0] * Math.PI) / 180, (pin.at[1] * Math.PI) / 180));
+      if (d < bd) { bd = d; best = pin; }
+    }
+    return best;
+  };
+  if (tool === 'city_unpin') {
+    const pin = near(start);
+    if (!pin) return toast('Click near a city pin to remove it.', true);
+    await simCall('sim_directive', { action: 'pin_remove', args: { pin: pin.id }, note: `pin at ${pin.province_name} removed` });
+    return;
+  }
+  const from = moved ? near(start) : null;
+  if (from) {
+    if (!onLand(end)) return toast('City pins go on land.', true);
+    await simCall('sim_directive', { action: 'pin_move', args: { pin: from.id, province: provAt(end) } });
+    return;
+  }
+  if (!onLand(moved ? end : start)) return toast('City pins go on land.', true);
+  const value = S.toolValue['city_pin'] ?? 0.8;
+  const label = window.prompt('What makes this city rise or fall? (optional)', value >= 0 ? 'boom town' : 'abandoned city');
+  if (label === null) return;
+  await simCall('sim_directive', { action: 'pin_add', args: { province: provAt(moved ? end : start), value, years: null, label: label.trim() || null } });
+}
+
 function renderSim() {
   const box = document.querySelector('#simpanel') as HTMLElement | null;
   if (!box || !S.status) return;
@@ -1223,6 +1280,16 @@ function renderSim() {
         } }, h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${nc.join(',')})` }), `${n.name} `, h('span', { class: 'muted' }, `#${n.id}`)),
           h('span', { class: 'muted' }, `${n.government} · ${n.provinces} prov. · ${fmtM(n.population)}${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
       }
+      if (st.cities?.length) {
+        body.append(h('h4', {}, 'Largest cities'), ...st.cities.slice(0, 8).map((c: any) => h('div', { class: 'item' },
+          h('span', {}, `${c.name}${c.capital ? ' ★' : ''}${c.station ? ' 🚉' : ''}`),
+          h('span', { class: 'muted' }, `${fmtM(c.population)}${c.attraction ? ' · pull ' + (c.attraction > 0 ? '+' : '') + c.attraction : ''}${SIM.nations.get(c.owner) ? ' · ' + SIM.nations.get(c.owner).name : ''}`))));
+      }
+      if (st.pins?.length) {
+        body.append(h('h4', {}, `City pins (${st.ruins ?? 0} cities in ruins)`), ...st.pins.map((p: any) => h('div', { class: 'item' },
+          h('span', {}, `#${p.id} ${p.province_name} ${p.value > 0 ? '+' : ''}${p.value}${p.label ? ' · ' + p.label : ''}${p.by === 'guide' ? ' (guide)' : ''}`),
+          h('button', { class: 'x', title: 'Remove', disabled: busy || live.done, onclick: () => simCall('sim_directive', { action: 'pin_remove', args: { pin: p.id } }) }, '×'))));
+      } else if (st.ruins) body.append(h('div', { class: 'muted small' }, `${st.ruins} cities in ruins. City pins: tool on the left, or the Steer tab.`));
       if (st.effects?.length) body.append(h('h4', {}, 'In effect'), ...st.effects.map((e: any) => h('div', { class: 'muted small' }, `${e.effect} · nation #${e.nation}${e.target ? ' → #' + e.target : ''}${e.factor !== undefined ? ' ×' + e.factor : ''} until ${e.until}`)));
       const ev = (st.events ?? []).slice(-10).reverse();
       if (ev.length) body.append(h('h4', {}, 'Recent events'), ...ev.map((e: any) => h('div', { class: 'muted small' }, `${e.year}: ${e.text}`)));
@@ -1631,7 +1698,8 @@ function summary(key: string, m: any): HTMLElement {
       box.append(stat('Nations', `${fmt(m.nations)} in ${m.start_date} (${fmt(m.nations_ever)} ever since ${m.start_year})`),
         stat('Land ruled', `${fmt((m.ruled_share ?? 0) * 100)}%`), stat('Population', `${fmt((m.population ?? 0) / 1e6, 1)} M`),
         stat('History', `${fmt(m.conquests)} capitals taken, ${fmt(m.independences)} independences, ${fmt(m.colonies)} colonies`),
-        stat('Railways', `${fmt(m.railways)} lines over ${fmt(m.railway_provinces)} provinces`));
+        stat('Railways', `${fmt(m.railways)} lines over ${fmt(m.railway_provinces)} provinces`),
+        stat('Cities', `${fmt(m.metropolises ?? 0)} passed a million · ${fmt(m.ruins ?? 0)} lie in ruins`));
       if (m.directives?.length) box.append(stat('Directives', `${m.directives.filter((d: any) => d.action !== 'note').length} applied, ${m.directives.filter((d: any) => d.by === 'guide').length} by the guide`));
       const list = h('div', { class: 'list' });
       box.append(list);
@@ -1959,6 +2027,10 @@ function bindCanvas() {
       const t = TOOLS.find((x) => x.id === S.tool)!;
       const deg = (p: Vec3) => toLatLon(p).map((v) => +((v * 180) / Math.PI).toFixed(4));
       const moved = Math.acos(Math.max(-1, Math.min(1, d.start[0] * d.end[0] + d.start[1] * d.end[1] + d.start[2] * d.end[2]))) > 0.004;
+      if (t.id === 'city_pin' || t.id === 'city_unpin') {
+        await cityPinGesture(t.id, d.start, d.end, moved);
+        return;
+      }
       if (t.gesture === 'link' && !moved && t.id !== 'band_pin') {
         toast('Drag from the first place to the second.');
         return;

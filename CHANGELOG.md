@@ -8,6 +8,7 @@ Stage 4: nations and history, and history you can steer.
 - **Step by step** (Stages 3 and 4): a panel on the map runs the simulation a generation or a few years at a time, to the next era or to the end, or plays it while the map updates. *Finish and keep* keeps the history.
 - **Directives:** steer a live run (a fertile age, isolation, a schism, a plague, a migration wave; aggression, war, peace, stability, a split, a founding, a union, a treaty, a rename, a railway). They are saved with the world and replay exactly.
 - **AI guide:** describe the history you want; an LLM steers the live run turn by turn with the same directives and writes a chronicle. Works with the Claude API, the Vercel AI Gateway, OpenAI, OpenRouter, local servers and other OpenAI- or Anthropic-compatible gateways. Keys stay on your computer, never in a world.
+- **Cities rise and fall** (Stage 4): capitals grow into metropolises over decades, conquered cities are sacked and devastated (a city fought over again and again empties), stations draw people, and people migrate toward attractive cities. *City pins* (a map tool in a live run, a directive, and a tool of the AI guide) make boom towns, metropolises or abandoned cities anywhere, and can be moved, removed or expire; capitals can be moved. New *City growth* layer, `cities.csv` and `ruins.csv`, and metropolis and ruin events in the chronicle.
 - **CLI:** `worldgen guide` (a guided history without the app), `worldgen guide-setup`, `worldgen directive`; `worldgen validate` checks Stage 4 too.
 
 ## 0.1.0-beta.3
