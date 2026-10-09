@@ -17,6 +17,8 @@ A desktop world generator, built from `Fantasy World Maker — Proposal.md`. It 
 
 Every step is checkpointed and can be viewed on the globe or flat map, and hand-edited, before the next one runs. Output is a Paradox-style PNG package that can be edited in GIMP and imported back in.
 
+Detailed documentation — architecture, every step, Stage 4's model, steering and the AI guide, the CLI and API, the export package, all parameters, development recipes, what is not implemented yet and future plans — is in [`doc/`](doc/README.md).
+
 Stack, as the proposal recommends: a **Rust simulation core** (`core/`), a **Tauri 2 desktop shell** (`app/src-tauri/`) and a **TypeScript + WebGL2 UI** (`app/src/`). The same core also runs headless through the `worldgen` CLI (`cli/`).
 
 ## Download (Windows)
