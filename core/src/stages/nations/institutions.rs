@@ -59,7 +59,7 @@ impl NationSim {
 
     /// Whether institution i can be born now (its year has come and the one before it is born).
     fn inst_due(&self, i: usize) -> bool {
-        self.born[i].is_none() && (i == 0 || self.born[i - 1].is_some()) && self.t + 1e-9 >= self.era_year(i as u8 + 1) as f64
+        self.born[i].is_none() && (i == 0 || self.born[i - 1].is_some()) && self.year >= self.era_year(i as u8 + 1)
     }
 
     /// Candidate birthplaces of institution i, best first, with their scores.
@@ -353,7 +353,7 @@ impl NationSim {
         let k = m as usize - 1;
         let cost = self.nations[k].income.max(0.0);
         self.nations[k].treasury -= cost;
-        self.nations[k].reform_until = self.t + years;
+        self.nations[k].reform_until = self.t + months(years);
         self.nations[k].reform_model = model;
         let a = self.nations[k].name.clone();
         let b = if model > 0 { format!(" on the model of {}", self.nation(model).name) } else { String::new() };

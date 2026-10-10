@@ -6,7 +6,7 @@ Stage 4 reads the finished Stage 2 province graph, the Stage 3 population and cu
 
 ## Time steps
 
-Steps get shorter toward the present, where history is denser: `years_per_step` (2 years) at first, `years_per_step_1` (1 year) from `step_year_1` (1400), and `years_per_step_2` (half a year) from `step_year_2` (1800). A step never crosses one of those years or the start date. Time is fractional (a step can start at 1850.5); directives record the fractional time they were issued, and apply in the step whose span contains it. Events are dated by their whole year. Rates are per year and scale with the step length, and road and railway projects, war summaries and progress reports run on their own timers, so results don't depend on how long the steps are (beyond the randomness of when things happen). The default run has about 1,000 steps.
+Time is counted in whole months (an integer; month 0 of year *y* is *y* × 12), and the year is that count divided by 12. Steps get shorter toward the present, where history is denser: `months_per_step` (24 months) at first, `months_per_step_1` (12) from `step_year_1` (1400), and `months_per_step_2` (6) from `step_year_2` (1800). A step never crosses one of those years or the start date. Directives record the year and month they were issued, and apply in the step whose months contain it. Events are dated by their year. Rates are per year and scale with the step length, and road and railway projects, war summaries and progress reports run on their own timers, so results don't depend on how long the steps are (beyond the randomness of when things happen). The default run has about 1,000 steps.
 
 ## State kept per province and per nation
 

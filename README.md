@@ -116,7 +116,7 @@ worldgen overrides <project-dir> clear <layer> | remove <layer> <i,j,...> | prun
 worldgen overrides <project-dir> export <file> [--layers a,b]
 worldgen overrides <project-dir> import <file> [--layers a,b] [--replace]
 worldgen edit <project-dir> --tool TOOL --at LAT,LON[;LAT,LON...] [--value V] [--radius KM] [--name NAME] [--run]
-worldgen directive <project-dir> --stage cultures|nations --at N --action NAME [--args JSON] [--note TEXT] [--run]
+worldgen directive <project-dir> --stage cultures|nations --at N [--month 1-12] --action NAME [--args JSON] [--note TEXT] [--run]
 worldgen directive --list                                # every directive and its arguments
 worldgen guide <project-dir> --goal TEXT [--stage nations|cultures] [--years 50] [--max-turns 60] [--max-actions 4]
 worldgen guide-setup [--provider anthropic|openai] [--base-url URL] [--model ID] [--key KEY] [--effort medium]
@@ -273,7 +273,7 @@ Each cell then takes its province by majority pixel vote. A province joins the s
   - The proposal names Leiden for community detection; this uses Louvain, which is simpler. The persistence rule covers the flicker Leiden's refinement step would reduce.
   - The simulation runs one generation at a time (`CultureSim`), so the same code serves a full run and a live step-by-step run.
 
-- **Nations and history** (`core/src/stages/nations.rs`), on the province graph with a clock in years from *First polities* (default 800) to the *Start date* (default 1949, late in the second great war's era and early in the cold war's), in steps of two years until 1400, one year until 1800 and half a year after (adjustable). The full model is in [`doc/nations.md`](doc/nations.md):
+- **Nations and history** (`core/src/stages/nations.rs`), on the province graph with a clock in whole months from *First polities* (default 800) to the *Start date* (default 1949, late in the second great war's era and early in the cold war's), in steps of 24 months until 1400, 12 until 1800 and 6 after (adjustable). The full model is in [`doc/nations.md`](doc/nations.md):
   - *Ownership is per province:* a border can cut through a state, and a nation's land need not be connected (colonies, exclaves). States are never redrawn.
   - *Formation:* a province with *People to found a polity* and no ruler founds one with a small chance each step (less once ocean shipping has begun), named after it and ruled by its majority culture.
   - *Expansion:* each nation tries to take frontier provinces (*Expansion* attempts per step × its aggression). A target is worth its people and land and costs more across barriers, far from the capital (*Reach*) and among other cultures (*Culture border weight*, half within the culture group). Empty land is settled, and settlers bring the ruler's culture; held land is fought over, won with the odds of the two nations' strength near it (people, reach from the capital, a bonus for defending one's own culture). Barren ice stays unclaimed.

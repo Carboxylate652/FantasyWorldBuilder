@@ -21,7 +21,7 @@ worldgen overrides <project-dir> clear <layer> | remove <layer> <i,j,...> | prun
 worldgen overrides <project-dir> export <file> [--layers a,b]
 worldgen overrides <project-dir> import <file> [--layers a,b] [--replace]
 worldgen edit <project-dir> --tool TOOL --at LAT,LON[;LAT,LON...] [--value V] [--radius KM] [--name NAME] [--run]
-worldgen directive <project-dir> --stage cultures|nations --at N --action NAME [--args JSON] [--note TEXT] [--run]
+worldgen directive <project-dir> --stage cultures|nations --at N [--month 1-12] --action NAME [--args JSON] [--note TEXT] [--run]
 worldgen directive --list
 worldgen guide <project-dir> --goal TEXT [--stage nations|cultures] [--years 50] [--max-turns 60] [--max-actions 4]
 worldgen guide-setup [--provider anthropic|openai] [--base-url URL] [--model ID] [--key KEY] [--effort medium]

@@ -351,7 +351,7 @@ pub fn turn(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, goal
         return Ok(json!({ "done": true, "position": sim["position"], "narration": "", "actions": [] }));
     }
     let stage = sim["stage"].as_str().unwrap_or("cultures").to_string();
-    let when = if stage == "nations" { format!("year {} of {}–{}", sim["year"], sim["start_year"], sim["end_year"]) } else { format!("generation {} of {} (year {})", sim["tick"], sim["ticks"], sim["year"]) };
+    let when = if stage == "nations" { format!("year {}, month {}, of {}–{}", sim["year"], sim["month"], sim["start_year"], sim["end_year"]) } else { format!("generation {} of {} (year {})", sim["tick"], sim["ticks"], sim["year"]) };
     let user = format!(
         "The history the user wants:\n{}\n\nNow: Stage {} ({when}). At most {max_actions} tool calls this turn.\n\nState of the world (JSON):\n{}",
         goal.trim(),

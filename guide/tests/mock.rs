@@ -89,7 +89,7 @@ fn guided_turns_with_both_formats() {
         let s = session.lock().unwrap();
         let d = &s.world.edits.overrides.directives;
         assert_eq!(d.len(), 2, "aggression and the chronicle note");
-        assert!(d.iter().all(|x| x.by == "guide" && x.stage == "nations" && x.at == 1610.0));
+        assert!(d.iter().all(|x| x.by == "guide" && x.stage == "nations" && x.at == 1610));
     }
 
     // OpenAI-compatible format (Vercel AI Gateway style), arguments as a JSON string.

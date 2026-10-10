@@ -10,7 +10,7 @@ A live run is a `CultureSim` or `NationSim` held in memory by the session (`core
 | --- | --- | --- |
 | `sim_actions` | `stage` | The directive catalogue for a stage (name, description, JSON schema) |
 | `sim_start` | `stage` (`cultures` \| `nations`) | Brings earlier steps up to date, starts a live run (replaying the directives already saved) |
-| `sim_step` | `steps?`, `years?`, `to?` (`era` \| `end`), `stop_at_choice?` | Advances one step (a generation, or the current step length), N steps, a number of years, to the next era (the label changes) or to the end. With `stop_at_choice`, Stage 4 stops before an institution is born until its birthplace is chosen |
+| `sim_step` | `steps?`, `years?`, `months?`, `to?` (`era` \| `end`), `stop_at_choice?` | Advances one step (a generation, or the current step length), N steps, a number of years and months (the Stage 4 clock counts whole months), to the next era (the label changes) or to the end. With `stop_at_choice`, Stage 4 stops before an institution is born until its birthplace is chosen |
 | `sim_state` | — | The world summary (below) and the map fields of the current position |
 | `sim_directive` | `action`, `args`, `note?`, `by?` | Validates and queues a directive at the current position, and saves it in the `directives` override layer (undoable) |
 | `sim_commit` | — | Runs to the end and keeps the result as the step's output. If the inputs are unchanged since the start, the live result is stored; otherwise the stage is replayed from scratch with the same directives (`replayed: true`) |
@@ -18,7 +18,7 @@ A live run is a `CultureSim` or `NationSim` held in memory by the session (`core
 
 In the UI this is the panel that opens with the Cultures or Nations card: *Start step by step*, *Step*, *+N years*, *Next era*, *Play*, *To the end*, *Finish and keep*, *Restart*, *Stop*, with *World*, *Steer* and *AI guide* tabs. Undo ends a live run.
 
-**The replay guarantee.** A directive records when it was issued (a generation for cultures, a time in years for nations — fractional when steps are shorter than a year). A run applies it at the start of the step whose time span contains that moment, ordered by time and then by issue order. Because the step-by-step run and the full run are the same code, a kept live run equals a fresh run with the same directives — this is tested (`live_steps_and_directives_match_a_fresh_run`).
+**The replay guarantee.** A directive records when it was issued (a generation for cultures; a year and month for nations, whose clock counts whole months). A run applies it at the start of the step whose time span contains that moment, ordered by time and then by issue order. Because the step-by-step run and the full run are the same code, a kept live run equals a fresh run with the same directives — this is tested (`live_steps_and_directives_match_a_fresh_run`).
 
 **Choosing where institutions are born.** When the next institution's time has come, the Stage 4 summary carries `pending_institution` with its candidates. With *Ask me where institutions are born* checked (the default), the panel stops there, shows the candidates (gold stars on the map) with *Here* buttons and *Let chance decide*, and issues an `institution_birth` directive; stepping on, the institution is born there. Unchecked (and in full runs, the CLI and the guide's turns), chance picks among the candidates unless a choice was made earlier — `next_institution` in the summary lists the coming institution's candidates, so the guide can choose ahead.
 

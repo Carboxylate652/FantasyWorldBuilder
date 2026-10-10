@@ -129,10 +129,26 @@ impl Live {
     }
 
     /// Where the run stands: the next generation (Stage 3) or year (Stage 4).
-    pub fn position(&self) -> f64 {
+    pub fn position(&self) -> i64 {
         match &self.sim {
-            LiveSim::Cultures(c) => c.t as f64,
+            LiveSim::Cultures(c) => c.t as i64,
+            LiveSim::Nations(n) => n.year as i64,
+        }
+    }
+
+    /// The next generation (Stage 3), or month counted from year 0 (Stage 4).
+    fn clock(&self) -> i64 {
+        match &self.sim {
+            LiveSim::Cultures(c) => c.t as i64,
             LiveSim::Nations(n) => n.time(),
+        }
+    }
+
+    /// When a directive issued now applies: (generation or year, month).
+    fn when(&self) -> (i64, u8) {
+        match &self.sim {
+            LiveSim::Cultures(c) => (c.t as i64, 0),
+            LiveSim::Nations(n) => (n.year as i64, n.month()),
         }
     }
 
@@ -162,17 +178,20 @@ impl Live {
             };
             v["done"] = json!(self.done());
             v["position"] = json!(self.position());
+            if let LiveSim::Nations(n) = &self.sim {
+                v["month"] = json!(n.month());
+            }
             self.cache = Some((v, f));
         }
         self.cache.as_ref().unwrap()
     }
 
     fn info(&self) -> Value {
-        let (pos, end, unit) = match &self.sim {
-            LiveSim::Cultures(c) => (c.t as f64, c.ticks() as f64, "generation"),
-            LiveSim::Nations(n) => (n.time(), n.end_year() as f64, "year"),
+        let (end, unit, month) = match &self.sim {
+            LiveSim::Cultures(c) => (c.ticks() as i64, "generation", None),
+            LiveSim::Nations(n) => (n.end_year() as i64, "year", Some(n.month())),
         };
-        json!({ "stage": self.stage(), "position": pos, "end": end, "unit": unit, "done": self.done() })
+        json!({ "stage": self.stage(), "position": self.position(), "month": month, "end": end, "unit": unit, "done": self.done() })
     }
 }
 
@@ -752,22 +771,24 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             sim_state(s)
         }
         "sim_step" => {
-            // { steps?, years?, to?: "era" | "end", stop_at_choice? } — one
-            // step (a generation, or the current step length in years) by
+            // { steps?, years?, months?, to?: "era" | "end", stop_at_choice? }
+            // — one step (a generation, or the current step length) by
             // default. With stop_at_choice, Stage 4 stops before an
             // institution is born so the user can choose its birthplace.
             let live = s.live.as_mut().ok_or("no live simulation; start one first")?;
             let years: Option<f64> = arg(&args, "years")?;
+            let months: Option<i64> = arg(&args, "months")?;
             let to: Option<String> = arg(&args, "to")?;
             let stop_at_choice = arg::<Option<bool>>(&args, "stop_at_choice")?.unwrap_or(false);
             let mut steps: u64 = arg::<Option<u64>>(&args, "steps")?.unwrap_or(1);
-            // Stage 4 steps vary in length: step until the time is reached.
-            let mut target: Option<f64> = None;
-            if let Some(y) = years {
+            // Stage 4 steps vary in length: step until the month is reached.
+            let mut target: Option<i64> = None;
+            if years.is_some() || months.is_some() {
+                let m = months.unwrap_or(0) + years.map_or(0, |y| (y * 12.0).round() as i64);
                 match &live.sim {
-                    LiveSim::Cultures(c) => steps = (y / c.years_per_tick().max(1e-9)).ceil().max(1.0) as u64,
+                    LiveSim::Cultures(c) => steps = (m as f64 / 12.0 / c.years_per_tick().max(1e-9)).ceil().max(1.0) as u64,
                     LiveSim::Nations(n) => {
-                        target = Some(n.time() + y);
+                        target = Some(n.time() + m.max(1));
                         steps = u64::MAX;
                     }
                 }
@@ -786,7 +807,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                     Some("era") if live.era() != era0 => break,
                     Some("era") => {}
                     _ if k >= steps => break,
-                    _ if target.is_some_and(|t| live.position() + 1e-9 >= t) => break,
+                    _ if target.is_some_and(|t| live.clock() >= t) => break,
                     _ => {}
                 }
                 live.step_once(&report);
@@ -795,7 +816,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                     let pos = live.position();
                     set_progress(progress, |p| {
                         p.frac = 0.0;
-                        p.msg = format!("{} {}", if live_unit_is_year(&live.sim) { "Year" } else { "Generation" }, (pos * 10.0).round() / 10.0);
+                        p.msg = format!("{} {}", if live_unit_is_year(&live.sim) { "Year" } else { "Generation" }, pos);
                     });
                 }
             }
@@ -807,9 +828,11 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             // { action, args, note?, by? }: applies from the next step on, and
             // is stored with the other directives so re-runs replay it.
             let live = s.live.as_ref().ok_or("no live simulation; start one first")?;
+            let (at, month) = live.when();
             let d = crate::directives::Directive {
                 stage: live.stage().into(),
-                at: live.position(),
+                at,
+                month,
                 action: arg(&args, "action")?,
                 args: args.get("args").cloned().unwrap_or(json!({})),
                 note: arg::<Option<String>>(&args, "note")?.unwrap_or_default(),

@@ -484,14 +484,15 @@ pub struct NationParams {
     /// second great war's era, early in the cold war's; 1910–1920 for a
     /// pre-war start).
     pub start_date: i32,
-    /// Years per simulation step at first; steps get shorter toward the
-    /// present (`step_year_1`/`years_per_step_1`, then `_2`), so recent
-    /// centuries are simulated in finer detail.
-    pub years_per_step: f64,
+    /// Months per simulation step at first; steps get shorter toward the
+    /// present (`step_year_1`/`months_per_step_1`, then `_2`), so recent
+    /// centuries are simulated in finer detail. Time is counted in whole
+    /// months; the year is the month count divided by 12.
+    pub months_per_step: u32,
     pub step_year_1: i32,
-    pub years_per_step_1: f64,
+    pub months_per_step_1: u32,
     pub step_year_2: i32,
-    pub years_per_step_2: f64,
+    pub months_per_step_2: u32,
     /// People a province needs before a polity can form there.
     pub found_population: f64,
     /// Chance per step that a province with that many people and no ruler
@@ -585,11 +586,11 @@ impl Default for NationParams {
         NationParams {
             start_year: 800,
             start_date: 1949,
-            years_per_step: 2.0,
+            months_per_step: 24,
             step_year_1: 1400,
-            years_per_step_1: 1.0,
+            months_per_step_1: 12,
             step_year_2: 1800,
-            years_per_step_2: 0.5,
+            months_per_step_2: 6,
             found_population: 60_000.0,
             found_rate: 0.0015,
             expansion_rate: 0.8,

@@ -660,7 +660,7 @@ fn live_steps_and_directives_match_a_fresh_run() {
     assert_eq!(st["replayed"], false, "the live result is kept");
     // Stage 4 the same way.
     let st = call("sim_start", serde_json::json!({ "stage": "nations" }));
-    assert_eq!(st["live"]["position"], 1300.0);
+    assert_eq!(st["live"]["position"], 1300);
     let st = call("sim_step", serde_json::json!({ "years": 120 }));
     let n1 = st["sim"]["nations"][0]["id"].as_u64().expect("nations formed");
     let n2 = st["sim"]["nations"][1]["id"].as_u64().unwrap_or(n1);
@@ -674,16 +674,17 @@ fn live_steps_and_directives_match_a_fresh_run() {
     call("sim_directive", serde_json::json!({ "action": "tag", "args": { "scope": "world", "id": null, "tag": "stable_realms", "on": true } }));
     call("sim_directive", serde_json::json!({ "action": "feudal_empire", "args": { "nation": n3, "on": true, "name": "Holy Empire", "provinces": null, "states": null, "regions": null } }));
     call("sim_directive", serde_json::json!({ "action": "institution_birth", "args": { "institution": 2, "province": null } }));
-    // Past 1800 steps are half a year: a directive at a fractional time.
-    let st = call("sim_step", serde_json::json!({ "years": 400.5 }));
-    assert_eq!(st["live"]["position"], 1853.5);
+    // Past 1800 steps are six months: a directive in July (month 7).
+    let st = call("sim_step", serde_json::json!({ "years": 400, "months": 6 }));
+    assert_eq!(st["live"]["position"], 1853);
+    assert_eq!(st["live"]["month"], 7);
     let n4 = st["sim"]["nations"][0]["id"].as_u64().unwrap();
     call("sim_directive", serde_json::json!({ "action": "reform", "args": { "nation": n4, "years": 20 } }));
     let st = call("sim_commit", serde_json::json!({}));
     assert_eq!(st["replayed"], false);
     let s = session.lock().unwrap();
     assert_eq!(s.world.edits.overrides.directives.len(), 11);
-    assert!(s.world.edits.overrides.directives.iter().any(|d| d.at == 1853.5));
+    assert!(s.world.edits.overrides.directives.iter().any(|d| d.at == 1853 && d.month == 7));
     let applied = s.world.meta(Step::Nations).unwrap()["directives"].as_array().unwrap().clone();
     assert_eq!(applied.len(), 8);
     assert!(applied.iter().all(|d| d["applied"] == true), "{applied:?}");
@@ -827,7 +828,7 @@ fn transport_economy_and_eras() {
     let mut far: Vec<u64> = mine.iter().copied().filter(|&p| p != cap && interior(p)).collect();
     far.sort();
     let to = *far.last().or(mine.iter().find(|&&p| p != cap)).expect("a second province");
-    let d = |action: &str, args: serde_json::Value| Directive { stage: "nations".into(), at: 1948.0, action: action.into(), args, note: String::new(), by: "user".into() };
+    let d = |action: &str, args: serde_json::Value| Directive { stage: "nations".into(), at: 1948, month: 0, action: action.into(), args, note: String::new(), by: "user".into() };
     w.edits.overrides.directives = vec![
         d("tech", serde_json::json!({ "nation": nid, "years": 200 })),
         d("subsidy", serde_json::json!({ "nation": nid, "years": 5 })),
@@ -864,14 +865,18 @@ fn institutions_ports_and_step_schedule() {
         }
     };
     let st = call("sim_start", serde_json::json!({ "stage": "nations" }));
-    // Steps shorten toward the present: 2 years, then 1 from 1400, then 0.5 from 1800.
-    assert_eq!(st["sim"]["step_years"], 2.0);
+    // Time is counted in whole months. Steps shorten toward the present: 24
+    // months, then 12 from 1400, then 6 from 1800.
+    assert_eq!(st["sim"]["step_months"], 24);
+    assert_eq!(st["sim"]["time"], st["sim"]["year"].as_i64().unwrap() * 12);
+    assert_eq!(st["sim"]["month"], 1);
     // Step until gunpowder is ready to be born and the run stops for a choice.
     let st = call("sim_step", serde_json::json!({ "to": "end", "stop_at_choice": true }));
     let pend = &st["sim"]["pending_institution"];
     assert_eq!(pend["index"], 0, "stopped for gunpowder: {pend}");
-    assert!(st["live"]["position"].as_f64().unwrap() >= 1450.0);
-    assert_eq!(st["sim"]["step_years"], 1.0);
+    assert!(st["live"]["position"].as_i64().unwrap() >= 1450);
+    assert_eq!(st["sim"]["step_months"], 12);
+    assert_eq!(st["sim"]["time"].as_i64().unwrap() % 12, 0, "yearly steps start in January");
     let cands = pend["candidates"].as_array().unwrap();
     assert!(!cands.is_empty());
     // Stepping again without choosing stays put.
@@ -886,7 +891,8 @@ fn institutions_ports_and_step_schedule() {
     assert!(st["sim"]["pending_institution"].is_null());
     // The rest to the end, choices left to chance.
     let st = call("sim_step", serde_json::json!({ "to": "end" }));
-    assert_eq!(st["sim"]["step_years"], 0.5);
+    assert_eq!(st["sim"]["step_months"], 6);
+    assert_eq!(st["sim"]["time"], st["sim"]["year"].as_i64().unwrap() * 12);
     let commit = call("sim_commit", serde_json::json!({}));
     assert_eq!(commit["replayed"], false);
     let mut s = session.lock().unwrap();
@@ -937,12 +943,12 @@ fn cities_rise_and_fall() {
     let pop_of = |w: &World, id: u64| w.meta(Step::Nations).unwrap()["table"]["provinces"].as_array().unwrap().iter().find(|q| q["id"] == id).unwrap()["population"].as_f64().unwrap();
     let mid: Vec<u64> = cities.iter().skip(20).filter(|c| c["capital"] == false).take(3).map(|c| c["province"].as_u64().unwrap()).collect();
     let (boom, bust, later) = (mid[0], mid[1], mid[2]);
-    let d = |at: f64, action: &str, args: serde_json::Value| Directive { stage: "nations".into(), at, action: action.into(), args, note: String::new(), by: "user".into() };
+    let d = |at: i64, month: u8, action: &str, args: serde_json::Value| Directive { stage: "nations".into(), at, month, action: action.into(), args, note: String::new(), by: "user".into() };
     w.edits.overrides.directives = vec![
-        d(1300.0, "pin_add", serde_json::json!({ "province": boom, "value": 1.0, "years": null, "label": "silver rush" })),
-        d(1300.0, "pin_add", serde_json::json!({ "province": bust, "value": -1.0, "years": null, "label": "sacked and abandoned" })),
-        d(1500.0, "pin_add", serde_json::json!({ "province": later, "value": 0.5, "years": 100, "label": null })),
-        d(1900.0, "pin_move", serde_json::json!({ "pin": 99, "province": boom })),
+        d(1300, 0, "pin_add", serde_json::json!({ "province": boom, "value": 1.0, "years": null, "label": "silver rush" })),
+        d(1300, 0, "pin_add", serde_json::json!({ "province": bust, "value": -1.0, "years": null, "label": "sacked and abandoned" })),
+        d(1500, 0, "pin_add", serde_json::json!({ "province": later, "value": 0.5, "years": 100, "label": null })),
+        d(1900, 0, "pin_move", serde_json::json!({ "pin": 99, "province": boom })),
     ];
     for x in &w.edits.overrides.directives {
         worldcore::directives::validate(x).unwrap();
@@ -977,8 +983,8 @@ fn cities_rise_and_fall() {
         })
         .next()
         .expect("an interior province");
-    // Dated inside the half-year step that starts in 1913.
-    w.edits.overrides.directives.push(d(1913.3, "move_capital", serde_json::json!({ "nation": nation, "province": target })));
+    // Dated April 1913, inside the six-month step that starts in January.
+    w.edits.overrides.directives.push(d(1913, 4, "move_capital", serde_json::json!({ "nation": nation, "province": target })));
     w.run_to(Step::Nations, &|_, _, _| {});
     let m2 = w.meta(Step::Nations).unwrap();
     assert_eq!(m2["directives"].as_array().unwrap().last().unwrap()["applied"], true);

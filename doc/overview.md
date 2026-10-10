@@ -82,5 +82,5 @@ The same seed, parameters, edits and directives always give the same world. Rand
 | --- | --- |
 | Level-8 world, Stages 1–2 | about 7 s on a desktop (about 22 s in the container) |
 | Cultures, 5,000 bands × 400 generations | about 10 s |
-| Nations, 800–1949 in 2-, 1- and ½-year steps (level 6) | about 5 s |
+| Nations, 800–1949 in 24-, 12- and 6-month steps (level 6) | about 5 s |
 | Export 8192 × 4096 | about 28 s with the province clean-up |

@@ -138,12 +138,12 @@ impl NationSim {
             income: 0.0,
             upkeep: 0.0,
             infra: 0.0,
-            debt_until: f64::MIN,
+            debt_until: i64::MIN,
             liege,
             rank,
-            next_road: self.t + (id % 7) as f64,
-            next_rail: self.t + (id % 5) as f64,
-            reform_until: f64::MIN,
+            next_road: self.t + (id % 7) as i64 * MONTHS,
+            next_rail: self.t + (id % 5) as i64 * MONTHS,
+            reform_until: i64::MIN,
             reform_model: 0,
         });
         self.members.push(BTreeSet::new());

@@ -112,6 +112,19 @@ pub const ERA_NAMES: [&str; 7] = ["early", "gunpowder", "ocean shipping", "indus
 /// Number of institutions (one per era after the first).
 const N_INST: usize = 6;
 
+/// Simulation time is a whole number of months; the year is the count divided by 12.
+pub const MONTHS: i64 = 12;
+
+/// A duration in years as whole months.
+fn months(years: f64) -> i64 {
+    (years * MONTHS as f64).round() as i64
+}
+
+/// A time in months as "year-month" (e.g. "1853-07") for the state and tables.
+fn date(t: i64) -> String {
+    format!("{}-{:02}", t.div_euclid(MONTHS), t.rem_euclid(MONTHS) + 1)
+}
+
 mod era {
     pub const GUN: u8 = 1;
     pub const SHIP: u8 = 2;
@@ -187,7 +200,7 @@ struct Nation {
     parent: u32,
     aggression: f64,
     /// When the current capital became the capital.
-    capital_since: f64,
+    capital_since: i64,
     /// Technology, in years (the era follows it).
     tech: f64,
     era: u8,
@@ -198,15 +211,15 @@ struct Nation {
     /// Upkeep of roads, railways and airports per year.
     infra: f64,
     /// Bankrupt until this time (less stable; no new cuts).
-    debt_until: f64,
+    debt_until: i64,
     /// Feudal liege (0 = independent) and rank (see `RANKS`).
     liege: u32,
     rank: u8,
     /// When the next road and railway projects are due.
-    next_road: f64,
-    next_rail: f64,
+    next_road: i64,
+    next_rail: i64,
     /// Reforming (westernizing) until this time, on the model of this nation.
-    reform_until: f64,
+    reform_until: i64,
     reform_model: u32,
 }
 
@@ -217,9 +230,9 @@ struct CityPin {
     province: usize,
     value: f64,
     label: String,
-    until: Option<f64>,
+    until: Option<i64>,
     by: String,
-    since: f64,
+    since: i64,
 }
 
 #[derive(Clone)]
@@ -291,15 +304,16 @@ pub struct NationSim {
     /// Provinces taken from one nation by another since the last war summary.
     tally: BTreeMap<(u32, u32), u32>,
     rng: Rng,
-    /// Time the next step starts (years, fractional with short steps), and its whole year.
-    t: f64,
+    /// Time the next step starts, in whole months from year 0 (month 0 of
+    /// year y is y × 12), and its year (the month count divided by 12).
+    t: i64,
     pub year: i32,
-    /// When the next war summary and progress report are due.
-    next_flush: f64,
-    next_progress: f64,
+    /// When the next war summary and progress report are due (months).
+    next_flush: i64,
+    next_progress: i64,
     directives: Vec<Directive>,
     next_directive: usize,
-    effects: Vec<(Effect, f64)>,
+    effects: Vec<(Effect, i64)>,
     applied: Vec<Value>,
     /// Devastation per province (0 to −1), healing over time.
     devastation: Vec<f64>,
@@ -457,9 +471,9 @@ impl NationSim {
             .collect();
         Some(NationSim {
             year: np.start_year,
-            t: np.start_year as f64,
-            next_flush: np.start_year as f64 + 50.0,
-            next_progress: np.start_year as f64,
+            t: np.start_year as i64 * MONTHS,
+            next_flush: (np.start_year as i64 + 50) * MONTHS,
+            next_progress: np.start_year as i64 * MONTHS,
             directives: crate::directives::of_stage(&ctx.edits.overrides.directives, "nations").into_iter().cloned().collect(),
             np,
             r_km,
@@ -515,40 +529,55 @@ impl NationSim {
     }
 
     pub fn done(&self) -> bool {
-        self.t + 1e-9 >= self.np.start_date as f64
+        self.t >= self.np.start_date as i64 * MONTHS
     }
 
-    /// Current time in years (fractional with steps shorter than a year).
-    pub fn time(&self) -> f64 {
+    /// Current time in whole months from year 0.
+    pub fn time(&self) -> i64 {
         self.t
     }
 
-    /// Length of the step starting now: `years_per_step`, then the shorter
-    /// steps from `step_year_1` and `step_year_2`, never crossing one of those
-    /// years or the start date.
-    pub fn step_len(&self) -> f64 {
+    /// Month of the current year (1–12).
+    pub fn month(&self) -> u8 {
+        (self.t.rem_euclid(MONTHS) + 1) as u8
+    }
+
+    /// Current time in years, for rates and technology (not for keeping time).
+    fn now(&self) -> f64 {
+        self.t as f64 / MONTHS as f64
+    }
+
+    /// Length in months of the step starting now: `months_per_step`, then the
+    /// shorter steps from `step_year_1` and `step_year_2`, never crossing one
+    /// of those years or the start date.
+    pub fn step_months(&self) -> i64 {
         let np = &self.np;
-        let (y1, y2) = (np.step_year_1 as f64, np.step_year_2 as f64);
-        let mut dt = if self.t + 1e-9 >= y2 {
-            np.years_per_step_2
-        } else if self.t + 1e-9 >= y1 {
-            np.years_per_step_1
+        let (y1, y2) = (np.step_year_1 as i64 * MONTHS, np.step_year_2 as i64 * MONTHS);
+        let mut dm = if self.t >= y2 {
+            np.months_per_step_2
+        } else if self.t >= y1 {
+            np.months_per_step_1
         } else {
-            np.years_per_step
-        };
-        dt = dt.clamp(0.05, 100.0);
-        for b in [y1, y2, np.start_date as f64] {
-            if b > self.t + 1e-9 && self.t + dt > b {
-                dt = b - self.t;
+            np.months_per_step
+        } as i64;
+        dm = dm.clamp(1, 1200);
+        for b in [y1, y2, np.start_date as i64 * MONTHS] {
+            if b > self.t && self.t + dm > b {
+                dm = b - self.t;
             }
         }
-        dt
+        dm
+    }
+
+    /// Length of the step starting now in years (rates are per year).
+    pub fn step_len(&self) -> f64 {
+        self.step_months() as f64 / MONTHS as f64
     }
 
     /// Queue a directive issued during a live run (in the order a fresh run
     /// would apply it: by time, then as issued).
     pub fn add_directive(&mut self, d: crate::directives::Directive) {
-        let k = (self.next_directive..self.directives.len()).find(|&k| self.directives[k].at > d.at).unwrap_or(self.directives.len());
+        let k = (self.next_directive..self.directives.len()).find(|&k| self.directives[k].month_index() > d.month_index()).unwrap_or(self.directives.len());
         self.directives.insert(k, d);
     }
 
@@ -705,7 +734,7 @@ impl NationSim {
         } else {
             let mut t: Vec<f64> = self.nations.iter().filter(|x| x.ended.is_none()).map(|x| x.tech).collect();
             t.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            (t.get(t.len() / 2).copied().unwrap_or(self.t), 0)
+            (t.get(t.len() / 2).copied().unwrap_or(self.now()), 0)
         };
         self.nations.push(Nation {
             name: name.filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string()).unwrap_or_else(|| self.provs[p].name.clone()),
@@ -725,12 +754,12 @@ impl NationSim {
             income: 0.0,
             upkeep: 0.0,
             infra: 0.0,
-            debt_until: f64::MIN,
+            debt_until: i64::MIN,
             liege: 0,
             rank: 0,
-            next_road: self.t + (id % 7) as f64,
-            next_rail: self.t + (id % 5) as f64,
-            reform_until: f64::MIN,
+            next_road: self.t + (id % 7) as i64 * MONTHS,
+            next_rail: self.t + (id % 5) as i64 * MONTHS,
+            reform_until: i64::MIN,
             reform_model: 0,
         });
         self.members.push(BTreeSet::new());
@@ -823,7 +852,7 @@ impl NationSim {
                 continue;
             }
             let size = self.members[k + 1].len().max(1) as f64;
-            let grown = ((self.t - x.capital_since) / np.capital_years.max(1.0)).clamp(0.0, 1.0);
+            let grown = ((self.t - x.capital_since) as f64 / MONTHS as f64 / np.capital_years.max(1.0)).clamp(0.0, 1.0);
             let scale = 0.4 + 0.6 * (size.ln() / 30f64.ln()).clamp(0.0, 1.0);
             self.attr[x.capital] += np.capital_pull * grown * scale;
         }
@@ -841,7 +870,7 @@ impl NationSim {
             .map(|p| {
                 let (la, lo) = self.provs[p.province].center.lat_lon();
                 json!({ "id": p.id, "province": self.provs[p.province].id, "province_name": self.provs[p.province].name, "value": p.value, "label": p.label,
-                        "until": p.until, "since": p.since, "by": p.by, "owner": self.owner[p.province],
+                        "until": p.until.map(date), "since": date(p.since), "by": p.by, "owner": self.owner[p.province],
                         "at": [(la.to_degrees() * 100.0).round() / 100.0, (lo.to_degrees() * 100.0).round() / 100.0] })
             })
             .collect()
@@ -874,16 +903,15 @@ impl NationSim {
             .collect()
     }
 
-    fn apply_directives(&mut self, dt: f64) {
+    fn apply_directives(&mut self, dm: i64) {
         let t = self.t;
         self.effects.retain(|(_, until)| t < *until);
-        // A step covers t .. t + dt: directives dated in it apply now.
-        let end = t + dt - 1e-9;
-        while self.next_directive < self.directives.len() && self.directives[self.next_directive].at < end {
+        // A step covers months t .. t + dm: directives dated in it apply now.
+        while self.next_directive < self.directives.len() && self.directives[self.next_directive].month_index() < t + dm {
             let d = self.directives[self.next_directive].clone();
             self.next_directive += 1;
             let a = &d.args;
-            let until = t + arg_f64(a, "years", 0.0).max(dt);
+            let until = t + months(arg_f64(a, "years", 0.0)).max(dm);
             let nat = arg_u64(a, "nation").map(|x| x as u32).unwrap_or(0);
             let target = arg_u64(a, "target").map(|x| x as u32).unwrap_or(0);
             let index = &self.index;
@@ -995,7 +1023,7 @@ impl NationSim {
                     }
                 }
                 "reform" if self.alive(nat) => {
-                    let years = arg_f64(a, "years", 40.0).max(dt);
+                    let years = arg_f64(a, "years", 40.0).max(dm as f64 / MONTHS as f64);
                     self.start_reform(nat, 0, years);
                 }
                 "feudal_empire" if self.alive(nat) => {
@@ -1023,7 +1051,7 @@ impl NationSim {
                     Some(p) => {
                         let id = self.next_pin;
                         self.next_pin += 1;
-                        let until = a["years"].as_f64().map(|yrs| t + yrs.max(dt));
+                        let until = a["years"].as_f64().map(|yrs| t + months(yrs).max(dm));
                         let label = a["label"].as_str().unwrap_or("").trim().to_string();
                         self.pins.push(CityPin { id, province: p, value: arg_f64(a, "value", 0.0).clamp(-1.0, 1.0), label, until, by: d.by.clone(), since: t });
                     }
@@ -1052,7 +1080,7 @@ impl NationSim {
                 "note" => {}
                 _ => ok = false,
             }
-            self.applied.push(json!({ "year": (t * 100.0).round() / 100.0, "action": d.action, "args": d.args, "note": d.note, "by": d.by, "applied": ok }));
+            self.applied.push(json!({ "year": t.div_euclid(MONTHS), "month": t.rem_euclid(MONTHS) + 1, "action": d.action, "args": d.args, "note": d.note, "by": d.by, "applied": ok }));
         }
     }
 
@@ -1680,7 +1708,7 @@ impl NationSim {
         let wealth = rank(&|m| self.nation(m).income.max(0.0) / pops[&m].max(1.0));
         let power = rank(&|m| pops[&m]);
         let old: Vec<f64> = self.nations.iter().map(|x| x.tech).collect();
-        let ceiling = self.t + self.np.tech_lead_years;
+        let ceiling = self.now() + self.np.tech_lead_years;
         let spread = self.np.tech_spread.max(0.0);
         for &m in &living {
             let k = m as usize - 1;
@@ -1779,7 +1807,7 @@ impl NationSim {
     fn bankrupt(&mut self, n: u32) {
         let k = n as usize - 1;
         self.nations[k].treasury *= 0.5;
-        self.nations[k].debt_until = self.t + 10.0;
+        self.nations[k].debt_until = self.t + 10 * MONTHS;
         let wage = self.prod(n);
         let (rc, lc) = (self.np.road_cost.max(0.0) * wage, self.np.rail_cost.max(0.0) * wage);
         let mut over = self.nations[k].infra - INFRA_SHARE * self.nations[k].income;
@@ -1845,17 +1873,18 @@ impl NationSim {
         if self.done() {
             return;
         }
-        let dt = self.step_len();
-        self.apply_directives(dt);
+        let dm = self.step_months();
+        let dt = dm as f64 / MONTHS as f64;
+        self.apply_directives(dm);
         let y = self.year;
         // Founding slows once the world's seafarers have spread (by the calendar).
-        let ship = self.t >= self.np.shipping_year as f64;
-        let span = (self.np.start_date - self.np.start_year).max(1) as f32;
-        if self.t + 1e-9 >= self.next_progress {
-            while self.next_progress <= self.t + 1e-9 {
-                self.next_progress += 50.0;
+        let ship = self.year >= self.np.shipping_year;
+        let span = ((self.np.start_date - self.np.start_year).max(1) as i64 * MONTHS) as f32;
+        if self.t >= self.next_progress {
+            while self.next_progress <= self.t {
+                self.next_progress += 50 * MONTHS;
             }
-            progress(((self.t - self.np.start_year as f64) as f32 / span).clamp(0.0, 1.0) * 0.95, &format!("Year {y}: {} nations, {} era", self.nations.iter().filter(|x| x.ended.is_none()).count(), self.era()));
+            progress(((self.t - self.np.start_year as i64 * MONTHS) as f32 / span).clamp(0.0, 1.0) * 0.95, &format!("Year {y}: {} nations, {} era", self.nations.iter().filter(|x| x.ended.is_none()).count(), self.era()));
         }
         let n = self.provs.len();
         // City pins that have run their time.
@@ -2029,12 +2058,12 @@ impl NationSim {
         }
         // 6. building: roads, railways (industry) and airports (air age), each
         // nation on its own schedule.
-        let rail_every = self.np.railway_every_years.max(1) as f64;
-        let road_every = self.np.road_every_years.max(1) as f64;
+        let rail_every = self.np.railway_every_years.max(1) as i64 * MONTHS;
+        let road_every = self.np.road_every_years.max(1) as i64 * MONTHS;
         let living: Vec<u32> = (1..=self.nations.len() as u32).filter(|&m| self.alive(m)).collect();
         for m in living {
             // Up to three projects at a time, as far as the treasury goes.
-            if self.t + 1e-9 >= self.nation(m).next_road {
+            if self.t >= self.nation(m).next_road {
                 self.nations[m as usize - 1].next_road = self.t + road_every;
                 for _ in 0..3 {
                     if !self.alive(m) || !self.road_project(m) {
@@ -2045,7 +2074,7 @@ impl NationSim {
                     self.airport_project(m);
                 }
             }
-            if self.nation(m).era >= era::IND && self.t + 1e-9 >= self.nation(m).next_rail {
+            if self.nation(m).era >= era::IND && self.t >= self.nation(m).next_rail {
                 self.nations[m as usize - 1].next_rail = self.t + rail_every;
                 for _ in 0..3 {
                     if !self.railway_project(m) {
@@ -2054,11 +2083,11 @@ impl NationSim {
                 }
             }
         }
-        self.t += dt;
-        self.year = (self.t + 1e-9).floor() as i32;
-        if self.t + 1e-9 >= self.next_flush || self.done() {
+        self.t += dm;
+        self.year = self.t.div_euclid(MONTHS) as i32;
+        if self.t >= self.next_flush || self.done() {
             self.flush_wars();
-            self.next_flush += 50.0;
+            self.next_flush += 50 * MONTHS;
         }
     }
 
@@ -2311,17 +2340,17 @@ impl NationSim {
             .effects
             .iter()
             .map(|(e, until)| match e {
-                Effect::Aggression(n, f) => json!({ "effect": "aggression", "nation": n, "factor": f, "until": until }),
-                Effect::Toward(n, p) => json!({ "effect": "expand_toward", "nation": n, "province": self.provs[*p].id, "until": until }),
-                Effect::War(a, b) => json!({ "effect": "war", "nation": a, "target": b, "until": until }),
-                Effect::Peace(a, b) => json!({ "effect": "peace", "nation": a, "target": b, "until": until }),
-                Effect::Stability(n, f) => json!({ "effect": "stability", "nation": n, "factor": f, "until": until }),
+                Effect::Aggression(n, f) => json!({ "effect": "aggression", "nation": n, "factor": f, "until": date(*until) }),
+                Effect::Toward(n, p) => json!({ "effect": "expand_toward", "nation": n, "province": self.provs[*p].id, "until": date(*until) }),
+                Effect::War(a, b) => json!({ "effect": "war", "nation": a, "target": b, "until": date(*until) }),
+                Effect::Peace(a, b) => json!({ "effect": "peace", "nation": a, "target": b, "until": date(*until) }),
+                Effect::Stability(n, f) => json!({ "effect": "stability", "nation": n, "factor": f, "until": date(*until) }),
             })
             .collect();
         let leader = self.leader().map(|m| json!({ "nation": m, "name": self.nation(m).name, "tech": (self.nation(m).tech * 10.0).round() / 10.0, "era": ERA_NAMES[self.nation(m).era as usize] }));
         let summary = json!({
             "stage": "nations",
-            "year": self.year, "time": (self.t * 100.0).round() / 100.0, "step_years": self.step_len(),
+            "year": self.year, "month": self.month(), "time": self.t, "step_months": self.step_months(),
             "start_year": self.np.start_year, "end_year": self.np.start_date, "era": self.era(),
             "leader": leader, "eras": self.era_counts(),
             "institutions": self.institution_rows(), "next_institution": self.next_institution(), "pending_institution": self.pending_institution(),
@@ -2337,7 +2366,7 @@ impl NationSim {
             "ruins": self.ruined.iter().filter(|&&r| r).count(),
             "events": self.events.iter().rev().take(20).rev().cloned().collect::<Vec<_>>(),
             "directives": self.applied,
-            "queued": self.directives[self.next_directive..].iter().map(|d| json!({ "year": d.at, "action": d.action, "args": d.args, "note": d.note, "by": d.by })).collect::<Vec<_>>(),
+            "queued": self.directives[self.next_directive..].iter().map(|d| json!({ "year": d.at, "month": d.month.max(1), "action": d.action, "args": d.args, "note": d.note, "by": d.by })).collect::<Vec<_>>(),
         });
         (summary, self.fields())
     }

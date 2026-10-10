@@ -35,7 +35,7 @@ type Status = {
   dirty: boolean;
   override_edits: number;
   /** A Stage 3 or 4 simulation running step by step. */
-  live: { stage: string; position: number; end: number; unit: string; done: boolean } | null;
+  live: { stage: string; position: number; month?: number | null; end: number; unit: string; done: boolean } | null;
 };
 
 type Asset = { name: string; url: string; size: number; sha256: string | null };
@@ -1145,8 +1145,16 @@ function simStep(args: Record<string, unknown>) {
   return simCall('sim_step', { ...args, stop_at_choice: nations && SIM.askBirth });
 }
 
-function fmtYear(y: number): string {
-  return Math.abs(y - Math.round(y)) < 1e-6 ? String(Math.round(y)) : y.toFixed(1);
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** A year, with its month (1–12) when it is not January. */
+function fmtYear(y: number, month?: number): string {
+  return month && month > 1 ? `${MONTH_NAMES[month - 1]} ${y}` : String(y);
+}
+
+/** A step length in months, as years when it is a whole number of them. */
+function fmtStep(m: number): string {
+  return m % 12 === 0 ? `${m / 12} yr steps` : `${m} month steps`;
 }
 
 async function simStart(stage: string) {
@@ -1324,9 +1332,9 @@ function renderSim() {
   }
   const st = SIM.state;
   const pos = live.unit === 'year'
-    ? `Year ${fmtYear(live.position)} of ${st?.start_year ?? ''}–${live.end}${st?.era ? ' · ' + st.era + ' era' : ''}${st?.step_years ? ' · ' + st.step_years + ' yr steps' : ''}`
+    ? `${fmtYear(live.position, live.month ?? undefined)} of ${st?.start_year ?? ''}–${live.end}${st?.era ? ' · ' + st.era + ' era' : ''}${st?.step_months ? ' · ' + fmtStep(st.step_months) : ''}`
     : `Generation ${live.position} of ${live.end}${st ? ' · year ' + Math.round(st.year).toLocaleString() + ' · era ' + st.era : ''}`;
-  const frac = live.unit === 'year' && st ? (live.position - st.start_year) / Math.max(1, live.end - st.start_year) : live.position / Math.max(1, live.end);
+  const frac = live.unit === 'year' && st ? (live.position + ((live.month ?? 1) - 1) / 12 - st.start_year) / Math.max(1, live.end - st.start_year) : live.position / Math.max(1, live.end);
   const busy = SIM.busy || SIM.guide.running;
   const adv = SIM.advance[stage];
   box.append(
@@ -1439,7 +1447,7 @@ function renderSim() {
     const applied = [...(st.queued ?? []).map((d: any) => ({ ...d, queued: true })), ...(st.directives ?? []).slice(-14).reverse()];
     if (applied.length) {
       body.append(h('h4', {}, 'Directives so far'), ...applied.map((d: any) => {
-        const when = d.year !== undefined ? fmtYear(d.year) : d.tick;
+        const when = d.year !== undefined ? fmtYear(d.year, d.month) : d.tick;
         const what = d.action === 'note' ? `“${d.args?.text ?? ''}”` : `${d.action.replace(/_/g, ' ')} ${JSON.stringify(Object.fromEntries(Object.entries(d.args ?? {}).filter(([, v]) => v !== null && !(Array.isArray(v) && !v.length))))}`;
         return h('div', { class: 'muted small' }, `${when}: ${what}${d.note ? ' — ' + d.note : ''}${d.by === 'guide' ? ' (guide)' : ''}${d.queued ? ' (from the next step)' : d.applied === false ? ' (no effect)' : ''}`);
       }));

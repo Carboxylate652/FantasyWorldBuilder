@@ -4,8 +4,8 @@
 //!
 //! They are issued by hand or by the AI guide while a simulation runs step by
 //! step, and stored in the project like the other override layers. Each one
-//! records when it was issued (the generation for cultures, the year for
-//! nations); a run applies it just before that generation or year, so
+//! records when it was issued (the generation for cultures, the year and
+//! month for nations); a run applies it just before that time, so
 //! re-running a stage replays exactly the history that was steered. The same
 //! list describes the actions as tools for the AI guide and as forms for the
 //! UI, so both offer the same choices.
@@ -18,9 +18,12 @@ pub struct Directive {
     /// "cultures" (Stage 3) or "nations" (Stage 4).
     pub stage: String,
     /// When it applies: before this generation (cultures, counted from 0) or
-    /// at this time in years (nations; fractional when steps are shorter than
-    /// a year).
-    pub at: f64,
+    /// this year (nations).
+    pub at: i64,
+    /// Nations only: the month of `at` it applies in (1–12; 0 means the start
+    /// of the year), for steps shorter than a year.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub month: u8,
     pub action: String,
     #[serde(default)]
     pub args: Value,
@@ -30,6 +33,17 @@ pub struct Directive {
     /// "user" or "guide".
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub by: String,
+}
+
+fn is_zero(m: &u8) -> bool {
+    *m == 0
+}
+
+impl Directive {
+    /// When it applies, in months from year 0 (nations): `at` × 12 plus the month.
+    pub fn month_index(&self) -> i64 {
+        self.at.saturating_mul(12).saturating_add(self.month.clamp(1, 12) as i64 - 1)
+    }
 }
 
 pub struct ActionSpec {
@@ -299,6 +313,9 @@ pub fn validate(d: &Directive) -> Result<(), String> {
     if d.stage != "cultures" && d.stage != "nations" {
         return Err(format!("unknown stage `{}`", d.stage));
     }
+    if d.month > 12 {
+        return Err(format!("month {} should be 1–12", d.month));
+    }
     let spec = actions_for(&d.stage).into_iter().find(|a| a.name == d.action).ok_or_else(|| format!("unknown {} action `{}`", d.stage, d.action))?;
     let args = d.args.as_object().ok_or("arguments must be an object")?;
     let props = spec.schema["properties"].as_object().unwrap();
@@ -363,7 +380,7 @@ pub fn arg_f64(args: &Value, key: &str, default: f64) -> f64 {
 /// Directives of one stage in the order they apply (by time, then as issued).
 pub fn of_stage<'a>(all: &'a [Directive], stage: &str) -> Vec<&'a Directive> {
     let mut v: Vec<(usize, &Directive)> = all.iter().enumerate().filter(|(_, d)| d.stage == stage).collect();
-    v.sort_by(|(ka, a), (kb, b)| a.at.total_cmp(&b.at).then(ka.cmp(kb)));
+    v.sort_by_key(|(k, d)| (d.at, d.month.max(1), *k));
     v.into_iter().map(|x| x.1).collect()
 }
 
@@ -372,7 +389,7 @@ mod tests {
     use super::*;
 
     fn d(stage: &str, action: &str, args: Value) -> Directive {
-        Directive { stage: stage.into(), at: 0.0, action: action.into(), args, note: String::new(), by: String::new() }
+        Directive { stage: stage.into(), at: 0, month: 0, action: action.into(), args, note: String::new(), by: String::new() }
     }
 
     #[test]
