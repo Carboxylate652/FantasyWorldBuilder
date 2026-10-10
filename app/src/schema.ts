@@ -17,7 +17,7 @@ export type Param = {
 
 export type ToolId =
   | 'navigate' | 'land' | 'sea' | 'mountain' | 'erase_hint' | 'scatter_land' | 'scatter_sea' | 'scatter_mountain' | 'pin' | 'arrow' | 'plate_paint'
-  | 'raise' | 'lower' | 'smooth' | 'flatten' | 'biome_paint' | 'biome_erase'
+  | 'raise' | 'lower' | 'smooth' | 'flatten' | 'old_mountain' | 'scatter_old_mountain' | 'old_mountain_erase' | 'biome_paint' | 'biome_erase'
   | 'barrier_paint' | 'barrier_erase' | 'site_pin' | 'state_paint' | 'province_paint'
   | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase'
   | 'attraction' | 'attraction_erase'
@@ -56,6 +56,9 @@ export const TOOLS: ToolDef[] = [
   { id: 'lower', label: 'Lower', step: 'relief', value: 'metres', defaultValue: 600, hint: 'Lower elevation (override layer).' },
   { id: 'smooth', label: 'Smooth', step: 'relief', hint: 'Smooth elevation (override layer).' },
   { id: 'flatten', label: 'Flatten', step: 'relief', value: 'metres', defaultValue: 200, hint: 'Flatten toward a target elevation (override layer).' },
+  { id: 'old_mountain', label: 'Old mountains', key: 'w', step: 'relief', defaultValue: 1, hint: 'Add worn, rounded mountains from noise (not from plates): hills and old ranges like the Appalachians or the Urals. Strength sets how much.' },
+  { id: 'scatter_old_mountain', label: 'Scatter old mountains', step: 'relief', rust: 'old_mountain', scatter: true, defaultValue: 1, hint: 'Old mountains in broken, patchy clusters.' },
+  { id: 'old_mountain_erase', label: 'Flatten old mountains', step: 'relief', hint: 'Remove the old (noise) mountains under the brush. Ranges raised by plates stay.' },
   { id: 'biome_paint', label: 'Biome paint', key: 'b', step: 'biomes', value: 'terrain', defaultValue: 5, hint: 'Force a game terrain (override layer).' },
   { id: 'biome_erase', label: 'Biome erase', step: 'biomes', hint: 'Remove biome paint.' },
   { id: 'barrier_paint', label: 'Add barrier', key: 'k', step: 'habitability', value: 'barrier', defaultValue: 6, hint: 'Make land costly to cross, so state and province borders follow your stroke.' },
@@ -145,8 +148,8 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'relief', title: 'Tectonic relief', layer: 'elevation', tools: ['raise', 'lower', 'smooth', 'flatten'],
-    blurb: 'Boundaries are classified by relative plate motion; each type adds its cross-section profile.',
+    key: 'relief', title: 'Tectonic relief', layer: 'elevation', tools: ['raise', 'lower', 'smooth', 'flatten', 'old_mountain', 'scatter_old_mountain', 'old_mountain_erase'],
+    blurb: 'Boundaries are classified by relative plate motion; each type adds its cross-section profile: high, sharp ranges where plates collide. Old mountains from noise add worn, rounded clusters away from the boundaries; paint or flatten them with their own brushes.',
     params: [
       p('tectonics', 'sketch_fidelity', 'Sketch fidelity', 0, 1, 0.01, '0 = pure tectonics, 1 = the sketched coastline always wins.'),
       p('tectonics', 'mountain_scale', 'Mountain height ×', 0.1, 3, 0.05),
@@ -154,6 +157,9 @@ export const STEPS: StepUI[] = [
       p('tectonics', 'hotspots', 'Hotspots', 0, 40, 1),
       p('tectonics', 'hint_height_m', 'Mountain hint height (m)', 0, 8000, 50),
       p('tectonics', 'max_influence_km', 'Boundary influence (km)', 300, 4000, 50),
+      p('tectonics', 'old_mountains', 'Old mountains (share of land)', 0, 0.5, 0.01, 'Worn, rounded mountain clusters from noise, away from plate boundaries.'),
+      p('tectonics', 'old_mountain_height_m', 'Old mountain height (m)', 0, 4000, 50),
+      p('tectonics', 'old_mountain_size_km', 'Old mountain cluster size (km)', 100, 3000, 10),
     ],
   },
   {
@@ -286,11 +292,15 @@ export const STEPS: StepUI[] = [
   },
   {
     key: 'nations', title: 'Nations & history', layer: 'nations', tools: ['city_pin', 'city_unpin'],
-    blurb: 'Polities form where people are many, then grow over the culture map: they settle empty land, fight over borders, colonise overseas and break apart along culture lines. Borders can cut through states, and colonies and exclaves are allowed. Each nation\'s technology, and so its era, follows its wealth and size: gunpowder, ocean shipping, industry, synthetic fertilizer, the motor age and the air age. Nations tax their people to pay for armies, roads (track, paved, highway), railway lines with junctions, and airports, which bind their land together. Run it in one go, step by step with your own directives, or let an AI guide steer it toward the history you describe.',
+    blurb: 'Polities form where people are many, then grow over the culture map: they settle empty land, fight over borders, colonise overseas and break apart along culture lines. Borders can cut through states, and colonies and exclaves are allowed. Each era opens with an institution (gunpowder, navigation, industrialisation, synthetic fertilizer, motorisation, aviation) born in a province you choose or chance picks, spreading over land, roads, railways, ports and airports; nations enter the era as most of their provinces embrace it, the rich first. Good harbours become ports in the shipping era. Tags and feudal empires shape the story. Nations tax their people to pay for armies, roads (track, paved, highway), railway lines with junctions, and airports, which bind their land together. Run it in one go, step by step with your own directives, or let an AI guide steer it toward the history you describe.',
     params: [
       p('nations', 'start_year', 'First polities (year)', -5000, 1800, 10),
       p('nations', 'start_date', 'Start date (year)', 1800, 2000, 1, 'The year the map shows: 1949 (default) for late in the second great war\'s era, 1910–1920 for an early-20th-century start.'),
-      p('nations', 'years_per_step', 'Years per step', 1, 25, 1),
+      p('nations', 'months_per_step', 'Months per step (at first)', 1, 300, 1, 'Time is counted in whole months. Steps get shorter toward the present: finer detail where history is denser.'),
+      p('nations', 'step_year_1', 'Shorter steps from (year)', -5000, 2100, 10),
+      p('nations', 'months_per_step_1', 'Months per step then', 1, 300, 1),
+      p('nations', 'step_year_2', 'Shortest steps from (year)', -5000, 2100, 10),
+      p('nations', 'months_per_step_2', 'Months per step then ', 1, 300, 1),
       p('nations', 'found_population', 'People to found a polity', 1000, 1000000, 1000),
       p('nations', 'found_rate', 'Founding chance per step', 0, 0.05, 0.0005),
       p('nations', 'expansion_rate', 'Expansion', 0, 5, 0.05, 'Expansion attempts per nation and step.'),
@@ -299,12 +309,17 @@ export const STEPS: StepUI[] = [
       p('nations', 'reach_km', 'Reach from the capital (km)', 100, 5000, 50, 'Expansion costs twice as much this far from the capital.'),
       p('nations', 'collapse_rate', 'Breakups', 0, 0.2, 0.002, 'Chance of a breakup at instability 1 (mixed cultures, size, spread).'),
       p('nations', 'assimilation', 'Assimilation per year', 0, 0.02, 0.0005, 'Share of a province\'s other cultures that takes its ruler\'s culture each year.'),
-      p('nations', 'gunpowder_year', 'Gunpowder (technology year)', 0, 2000, 10, 'Eras begin for each nation when its own technology reaches the year: rich, large nations first.'),
-      p('nations', 'shipping_year', 'Ocean shipping (technology year)', 0, 2000, 10, 'Colonies across the sea.'),
-      p('nations', 'industrial_year', 'Industry (technology year)', 0, 2000, 10, 'Railways and faster growth.'),
-      p('nations', 'fertilizer_year', 'Synthetic fertilizer (technology year)', 0, 2100, 1, 'Farmland holds more people, phased in over 20 years (1909 in our world).'),
-      p('nations', 'motor_year', 'Motor age (technology year)', 0, 2100, 1, 'Cars and highways.'),
-      p('nations', 'air_year', 'Air age (technology year)', 0, 2100, 1, 'Airports and air routes.'),
+      p('nations', 'gunpowder_year', 'Gunpowder (earliest birth)', 0, 2000, 10, 'Each era opens with an institution born in one province (you choose, or chance does) once the calendar reaches this year; it spreads over land, roads, railways, ports and airports, and a nation enters the era once most of its provinces have embraced it.'),
+      p('nations', 'shipping_year', 'Navigation (earliest birth)', 0, 2000, 10, 'Ocean shipping: ports, colonies across the sea.'),
+      p('nations', 'industrial_year', 'Industrialisation (earliest birth)', 0, 2000, 10, 'Railways and faster growth.'),
+      p('nations', 'fertilizer_year', 'Synthetic fertilizer (earliest birth)', 0, 2100, 1, 'Farmland holds more people, phased in over 20 years (1909 in our world).'),
+      p('nations', 'motor_year', 'Motorisation (earliest birth)', 0, 2100, 1, 'Cars and highways.'),
+      p('nations', 'air_year', 'Aviation (earliest birth)', 0, 2100, 1, 'Airports and air routes.'),
+      p('nations', 'institution_spread', 'Institution spread', 0, 5, 0.05, 'How fast institutions spread from province to province (per year, at full contact).'),
+      p('nations', 'institution_share', 'Share of provinces for an era', 0.05, 1, 0.05, 'Share of a nation\'s provinces that must embrace an institution before it enters the era.'),
+      p('nations', 'institution_candidates', 'Birthplace candidates', 1, 30, 1),
+      p('nations', 'port_quality', 'Harbour needed for a port', 0, 1, 0.01, 'Harbour quality (calm winds, deep water, shelter, a river mouth, no winter ice) a coastal province needs to become a port.'),
+      p('nations', 'port_people', 'People for a port', 0, 2000000, 5000, 'People in the province and around it before trade makes it a port.'),
       p('nations', 'fertilizer_boost', 'Fertilizer boost', 1, 4, 0.05, 'How many times more people farmland holds with synthetic fertilizer.'),
       p('nations', 'tech_lead_years', 'Technology lead (years)', 0, 100, 1, 'How far ahead of the calendar the most advanced nation can get.'),
       p('nations', 'tech_spread', 'Technology catch-up', 0, 0.2, 0.005, 'Extra progress per year of gap to the level a nation\'s wealth, size and neighbours allow.'),

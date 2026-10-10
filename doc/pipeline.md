@@ -20,8 +20,9 @@ Radius (default 6,371 km), axial tilt (23.4°), day and year length, orbital ecc
 ### 4. Tectonic relief (`stages/tectonics.rs`)
 - Boundaries are classified by relative motion and crust type: collision, subduction (ocean–continent, ocean–ocean), ridge, rift, transform. Each type has a cross-section profile by distance from the boundary.
 - Sea floor deepens as 2.6 + 0.35·√age km; hotspot chains trail along plate motion; ridged noise is scaled by tectonic stress; *Sketch fidelity* pulls the coast back to the sketch.
+- **Old mountains** come from noise, not plates: clusters where low-frequency noise (*Old mountain cluster size*, 700 km) is highest, covering *Old mountains* (10%) of the continental land, up to *Old mountain height* (1,500 m). Their summits are rounded and their valleys cut (inverted ridged noise), like the Appalachians or the Urals, unlike the high, sharp crests of colliding plates. They fade where young ranges already stand, are added on top of the plate relief, and are kept in their own field, so the *Old mountains* brushes add or remove them without touching plate relief.
 - The model is static: it builds today's relief from today's plate motion and never moves your continents.
-- **Output fields:** `elevation`, `boundary`, `ocean_age`, `stress`. Relief brushes (*Raise*, *Lower*, *Smooth*, *Flatten*) and *Import heightmap* override it.
+- **Output fields:** `elevation`, `boundary`, `ocean_age`, `stress`, `old_relief` (metres added by old mountains). Relief brushes (*Raise*, *Lower*, *Smooth*, *Flatten*) and *Import heightmap* override it; *Old mountains*, *Scatter old mountains* and *Flatten old mountains* paint or erase the old mountains only.
 
 ### 5. Climate (`stages/climate.rs`, `stages/wind.rs`)
 - Seasonal Budyko–Sellers energy balance in sin(latitude), 12 months, with ice-albedo feedback and persistent ice sheets; separate land and ocean heat capacities; maritime air carried downwind; warm and cold coastal currents; 6.5 °C/km lapse rate.

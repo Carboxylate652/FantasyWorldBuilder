@@ -37,16 +37,19 @@
 | --- | --- |
 | `nations.png` | Owners at the start date, borders dark, unruled land grey, railways dark with white stations |
 | `railways.png` | Railways black, stations red, junctions blue |
-| `transport.png` | Roads (track light brown, paved dark brown, highway orange), railways with stations and junctions, airports purple, over nation borders |
-| `nations.csv` | Every nation that ever existed: name, government, colour, capital, culture, provinces, population, overseas provinces, founded, ended, fate, parent; era, technology, treasury, income, integration, track/paved/highway km, rail km, stations, airports |
+| `transport.png` | Roads (track light brown, paved dark brown, highway orange), railways with stations and junctions, ports dark blue, airports purple, over nation borders |
+| `nations.csv` | Every nation that ever existed: name, government, colour, capital, culture, provinces, population, overseas provinces, founded, ended, fate, parent; era, technology, treasury, income, integration, track/paved/highway km, rail km, stations, airports, ports; feudal liege, rank, realm and empire; share of provinces that embraced each institution |
 | `nation_events.csv` | The chronicle: `year;event;nation;other;province;text` |
 | `railways.csv` | Lines: name, builder, opened, closed, km, stations, provinces in order |
 | `stations.csv` | Stations with the open lines serving them; `junction` when two or more |
 | `roads.csv` | Roads between neighbouring provinces: quality (1 track, 2 paved, 3 highway), year built, km |
 | `airports.csv` | Airports: province, owner, year opened |
+| `ports.csv` | Ports: province, owner, year opened, harbour quality |
+| `institutions.csv` | The six institutions: era they open, earliest year, birth year and province, provinces that embraced them, nations in their era |
+| `titles.csv` | Feudal titles of the empires at the start date: empire, kings, dukes, counts (provinces) and barons, with holder and liege nations |
 | `cities.csv` | The 100 largest cities: owner, population, capital, station, attraction, peak and year |
 | `ruins.csv` | Cities that lost three quarters of their people and never recovered |
-| `province_nations.csv` | Per province: owner, culture after assimilation with shares, population, railway (0–3), best road, airport, integration |
+| `province_nations.csv` | Per province: owner, culture after assimilation with shares, population, railway (0–3), best road, airport, port, harbour quality, integration, embraced institutions, realm |
 
 ## Province clean-up (`core/src/export_clean.rs`)
 

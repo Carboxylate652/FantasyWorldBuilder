@@ -279,8 +279,11 @@ After any tool calls, write one to three sentences for the chronicle: what happe
 In Stage 4, cities rise and fall with history (capitals grow, sacked cities empty, stations draw people); \
 city pins (pin_add, pin_move, pin_remove) let you make a boom town, a metropolis or an abandoned city wherever the story needs one, \
 and move_capital moves a court. Keep the pins you placed in mind: move or remove them when the story moves on. \
-Each nation has its own technology and era (gunpowder, ocean shipping, industry, fertilizer, motor age, air age), set by its wealth and size, \
-and a treasury that pays for its army, roads, railway lines and airports; tech, subsidy, build_road, railway and airport shape who modernises first. \
+Each era opens with an institution (gunpowder, navigation, industrialisation, synthetic fertilizer, motorisation, aviation) born in one province \
+and spreading over land, roads, railways, ports and airports; a nation enters the era once most of its provinces have embraced it, rich nations first. \
+The state lists the next institution and its candidate birthplaces: institution_birth chooses one (or null for chance) before it is born. \
+Nations have treasuries that pay for armies, roads, railway lines, ports and airports; tech, reform, subsidy, build_road, railway, port and airport shape who modernises first. \
+Tags (tag) give the world, states or nations special rules, and feudal_empire makes a nation an empire of kings and dukes that lasts until you dissolve it. \
 You may choose how many years pass before the next turn with set_pace.";
 
 fn pace_tool() -> Tool {
@@ -319,7 +322,7 @@ pub fn brief(summary: &Value) -> String {
     if let Some(n) = s["nations"].as_array_mut() {
         for x in n.iter_mut() {
             if let Some(o) = x.as_object_mut() {
-                for k in ["color", "era_index", "upkeep", "railway_provinces", "ended", "fate", "fate_other"] {
+                for k in ["color", "era_index", "upkeep", "railway_provinces", "ended", "fate", "fate_other", "road_km", "regions"] {
                     o.remove(k);
                 }
             }
@@ -348,7 +351,7 @@ pub fn turn(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, goal
         return Ok(json!({ "done": true, "position": sim["position"], "narration": "", "actions": [] }));
     }
     let stage = sim["stage"].as_str().unwrap_or("cultures").to_string();
-    let when = if stage == "nations" { format!("year {} of {}–{}", sim["year"], sim["start_year"], sim["end_year"]) } else { format!("generation {} of {} (year {})", sim["tick"], sim["ticks"], sim["year"]) };
+    let when = if stage == "nations" { format!("year {}, month {}, of {}–{}", sim["year"], sim["month"], sim["start_year"], sim["end_year"]) } else { format!("generation {} of {} (year {})", sim["tick"], sim["ticks"], sim["year"]) };
     let user = format!(
         "The history the user wants:\n{}\n\nNow: Stage {} ({when}). At most {max_actions} tool calls this turn.\n\nState of the world (JSON):\n{}",
         goal.trim(),

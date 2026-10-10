@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0-beta.1
+
+Institutions, ports, feudal empires and finer time steps for Stage 4; old mountains in Stage 1.
+
+- **Old mountains:** besides the high, sharp ranges of plate boundaries, noise now raises worn, rounded mountain clusters away from them (share of land, height and cluster size are parameters). *Old mountains*, *Scatter old mountains* and *Flatten old mountains* brushes in the relief card add or remove them without touching plate relief; new *Old mountains* layer and `old_relief` field.
+- **Institutions** (EU4 style, with a touch of westernization): each era opens with an institution — gunpowder, navigation, industrialisation, synthetic fertilizer, motorisation, aviation — born in one province and spreading over land, roads, railways, ports, airports and from capitals. A nation enters the era once most of its provinces have embraced it; rich, developed nations take new ideas up first. Choose each birthplace among highlighted candidates in the step-by-step panel, or let chance decide. Nations far behind a neighbour may reform on its model. New *Institutions* layer, `institutions.csv`, directives *institution birth* and *reform*.
+- **Ports:** coastal provinces with a good harbour (calm winds, deep water, shelter, a river mouth, no winter ice) and enough people around become ports once their owner sails the oceans. Sea lanes, colonies, trade income and institutions cross the sea through ports. `ports.csv`, *port* directive.
+- **Tags and feudal empires:** tag the world, states or nations (isolationist, expansionist, merchant republic, eternal, holy land, free state, institution cradle, no overseas colonies, slow or fast institutions, frequent wars, stable realms). A *feudal empire* enfeoffs kings over regions and dukes over states, with counties and baronies; its members never fight each other or break apart, and it lasts in every era until you dissolve it — the largest member is elected if the emperor falls; land outside the imperial territory stays outside. New *Realms & empires* layer and `titles.csv`.
+- **Finer time steps toward the present:** the Stage 4 clock counts whole months; by default steps are 24 months until 1400, 12 until 1800 and 6 after (adjustable: `months_per_step`, `months_per_step_1`, `months_per_step_2`). Directives carry a year and an optional month (`--month` in `worldgen directive`); `sim_step` takes `months` as well as `years`.
+- **Transport map:** roads fill each province by quality, railways show as stripes over them, and stations, junctions, ports and airports are icons over the map.
+
 ## 0.2.0-beta.2
 
 Core performance and project reliability improvements.

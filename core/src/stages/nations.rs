@@ -18,7 +18,9 @@
 //! - **Technology and eras, per nation:** each nation's technology (in
 //!   years) advances faster when it is rich per head and large, and spreads
 //!   from more advanced neighbours; the leader can run a few years ahead of
-//!   the calendar. A nation enters an era when its own technology reaches it:
+//!   the calendar. A nation enters an era when most of its provinces have
+//!   embraced the era's institution (below); its technology cannot pass the
+//!   next era's year until then:
 //!   gunpowder (cheaper expansion, steadier states), ocean shipping (colonies
 //!   across the sea), industry (faster growth, railways), synthetic
 //!   fertilizer (farmland holds more people, phased in over 20 years), the
@@ -63,8 +65,24 @@
 //!   share of a nation's people moves toward its attractive provinces, more
 //!   from devastated or shunned ones: capitals become metropolises,
 //!   battlefields become ruins.
-//! - **Directives** (by hand or from the AI guide) apply in the year they
-//!   were issued, so a steered history replays exactly.
+//! - **Time steps** shorten toward the present (by default 2 years until
+//!   1400, 1 year until 1800, half a year after), so recent centuries get
+//!   finer detail.
+//! - **Ports** (`nations/ports.rs`): in the ocean-shipping era, coastal
+//!   provinces with a good harbour (calm winds, deep water, shelter, a river
+//!   mouth, no winter ice) and enough people around become ports; sea lanes,
+//!   colonies and institutions cross the sea through them.
+//! - **Institutions** (`nations/institutions.rs`): each era's idea is born in
+//!   one province (chosen by the user or the guide, or by chance among the
+//!   candidates) and spreads over land, roads, railways, ports and airports;
+//!   a nation enters the era once most of its provinces have embraced it.
+//!   Nations far behind a neighbour may reform on its model.
+//! - **Tags and feudal empires** (`nations/feudal.rs`): directives tag the
+//!   world, states or nations with special rules; a feudal empire enfeoffs
+//!   kings and dukes over its land and lasts until it is dissolved.
+//! - **Directives** (by hand or from the AI guide) apply in the step whose
+//!   time span contains the moment they were issued, so a steered history
+//!   replays exactly.
 
 use super::{Ctx, Step, StepOutput};
 use crate::directives::{arg_f64, arg_ids, arg_u64, Directive};
@@ -76,7 +94,14 @@ use serde_json::{json, Value};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
+mod feudal;
+mod institutions;
+mod ports;
 mod transport;
+use feudal::Empire;
+pub use feudal::RANKS;
+use institutions::EMBRACED;
+pub use institutions::INSTITUTIONS;
 use transport::{
     travel_costs, Line, AIRPORT_BUILD, AIRPORT_UPKEEP, AIR_FACTOR, AIR_PENALTY, RAIL_BUILD_KM, RAIL_UPKEEP_KM, ROAD_BUILD, ROAD_NAMES, ROAD_SPEED, ROAD_UPKEEP, SEA_FACTOR, SEA_PENALTY,
     STATION_BUILD, STATION_UPKEEP,
@@ -84,6 +109,21 @@ use transport::{
 
 /// Eras, in order; a nation's era is the last whose technology year it has reached.
 pub const ERA_NAMES: [&str; 7] = ["early", "gunpowder", "ocean shipping", "industry", "fertilizer", "motor age", "air age"];
+/// Number of institutions (one per era after the first).
+const N_INST: usize = 6;
+
+/// Simulation time is a whole number of months; the year is the count divided by 12.
+pub const MONTHS: i64 = 12;
+
+/// A duration in years as whole months.
+fn months(years: f64) -> i64 {
+    (years * MONTHS as f64).round() as i64
+}
+
+/// A time in months as "year-month" (e.g. "1853-07") for the state and tables.
+fn date(t: i64) -> String {
+    format!("{}-{:02}", t.div_euclid(MONTHS), t.rem_euclid(MONTHS) + 1)
+}
 
 mod era {
     pub const GUN: u8 = 1;
@@ -132,6 +172,12 @@ struct Prov {
     name: String,
     /// People the land can hold before industry, from its habitability.
     land_cap: f64,
+    /// Deposits that draw institutions (coal and iron: industry; oil: motors).
+    coal: bool,
+    iron: bool,
+    oil: bool,
+    /// How fertile the land is (0–1): synthetic fertilizer favours farmland.
+    fertile: f64,
 }
 
 struct Edge {
@@ -153,8 +199,8 @@ struct Nation {
     other: u32,
     parent: u32,
     aggression: f64,
-    /// Year the current capital became the capital.
-    capital_since: i32,
+    /// When the current capital became the capital.
+    capital_since: i64,
     /// Technology, in years (the era follows it).
     tech: f64,
     era: u8,
@@ -164,8 +210,17 @@ struct Nation {
     upkeep: f64,
     /// Upkeep of roads, railways and airports per year.
     infra: f64,
-    /// Bankrupt until this year (less stable; no new cuts).
-    debt_until: i32,
+    /// Bankrupt until this time (less stable; no new cuts).
+    debt_until: i64,
+    /// Feudal liege (0 = independent) and rank (see `RANKS`).
+    liege: u32,
+    rank: u8,
+    /// When the next road and railway projects are due.
+    next_road: i64,
+    next_rail: i64,
+    /// Reforming (westernizing) until this time, on the model of this nation.
+    reform_until: i64,
+    reform_model: u32,
 }
 
 /// A city pin: attraction placed by a directive.
@@ -175,9 +230,9 @@ struct CityPin {
     province: usize,
     value: f64,
     label: String,
-    until: Option<i32>,
+    until: Option<i64>,
     by: String,
-    since: i32,
+    since: i64,
 }
 
 #[derive(Clone)]
@@ -189,7 +244,7 @@ enum Effect {
     Stability(u32, f64),
 }
 
-/// The Stage 4 simulation, one step (`years_per_step` years) at a time.
+/// The Stage 4 simulation, one step at a time (see `step_len`).
 pub struct NationSim {
     np: NationParams,
     r_km: f64,
@@ -198,6 +253,7 @@ pub struct NationSim {
     index: HashMap<u32, usize>,
     prov_field: Vec<u32>,
     region_names: BTreeMap<u16, String>,
+    state_names: BTreeMap<u16, String>,
     culture_group: HashMap<u32, u32>,
     culture_names: HashMap<u32, String>,
     coastal_land: Vec<usize>,
@@ -217,6 +273,25 @@ pub struct NationSim {
     roads: BTreeMap<(usize, usize), (u8, i32)>,
     /// Airports: province and year opened.
     airports: BTreeMap<usize, i32>,
+    /// Harbour quality of each province (0 = no sea coast).
+    harbour: Vec<f64>,
+    /// Ports: province and year opened; the nearest ports of each (cached).
+    ports: BTreeMap<usize, i32>,
+    port_near: Option<Vec<(usize, Vec<usize>)>>,
+    /// Coastal sailing: for each coastal province, the nearest coasts of other
+    /// landmasses within reach (institutions cross the sea slowly before ports).
+    coast_near: Vec<(usize, Vec<usize>)>,
+    /// Presence (0–1) of each institution in each province.
+    presence: Vec<[f32; N_INST]>,
+    /// Year and province each institution was born in.
+    born: [Option<(i32, usize)>; N_INST],
+    /// Birthplaces chosen by directives (Some(None): by chance).
+    birth_choice: [Option<Option<usize>>; N_INST],
+    /// Institutions every settled province has embraced (no more spreading to do).
+    saturated: [bool; N_INST],
+    /// Tags: (scope, id, tag); see `feudal::scope`.
+    tags: BTreeSet<(u8, u32, String)>,
+    empires: Vec<Empire>,
     /// Per nation (by id): travel cost from the capital to its provinces and
     /// their neighbours; recomputed when `stale`.
     access: Vec<HashMap<usize, f64>>,
@@ -229,11 +304,16 @@ pub struct NationSim {
     /// Provinces taken from one nation by another since the last war summary.
     tally: BTreeMap<(u32, u32), u32>,
     rng: Rng,
-    /// Year the next step starts.
+    /// Time the next step starts, in whole months from year 0 (month 0 of
+    /// year y is y × 12), and its year (the month count divided by 12).
+    t: i64,
     pub year: i32,
+    /// When the next war summary and progress report are due (months).
+    next_flush: i64,
+    next_progress: i64,
     directives: Vec<Directive>,
     next_directive: usize,
-    effects: Vec<(Effect, i32)>,
+    effects: Vec<(Effect, i64)>,
     applied: Vec<Value>,
     /// Devastation per province (0 to −1), healing over time.
     devastation: Vec<f64>,
@@ -309,6 +389,7 @@ impl NationSim {
         let rows = ptable["provinces"].as_array().unwrap_or(&empty);
         let index: HashMap<u32, usize> = rows.iter().enumerate().map(|(k, p)| (p["id"].as_u64().unwrap_or(0) as u32, k)).collect();
         // Culture-step names and people per province.
+        let has = |p: &Value, d: &str| p["resources"].as_array().is_some_and(|a| a.iter().any(|x| x.as_str() == Some(d)));
         let cprov: HashMap<u64, &Value> = ctable["provinces"].as_array().unwrap_or(&empty).iter().map(|p| (p["id"].as_u64().unwrap_or(0), p)).collect();
         let provs: Vec<Prov> = rows
             .iter()
@@ -329,6 +410,10 @@ impl NationSim {
                     arid: p["rain_mm"].as_f64().unwrap_or(1000.0) < 300.0,
                     name: cprov.get(&id).and_then(|c| c["name"].as_str()).or_else(|| p["name"].as_str()).unwrap_or("").to_string(),
                     land_cap: if land { 3.0 * ctx.params.cultures.density_per_km2 * area * capf } else { 0.0 },
+                    coal: has(p, "coal"),
+                    iron: has(p, "iron"),
+                    oil: has(p, "oil"),
+                    fertile: p["habitability"].as_f64().unwrap_or(capf).clamp(0.0, 1.0),
                 }
             })
             .collect();
@@ -367,9 +452,28 @@ impl NationSim {
         let culture_group: HashMap<u32, u32> = ctable["cultures"].as_array().unwrap_or(&empty).iter().map(|c| (c["id"].as_u64().unwrap_or(0) as u32, c["group"].as_u64().unwrap_or(0) as u32)).collect();
         let culture_names: HashMap<u32, String> = ctable["cultures"].as_array().unwrap_or(&empty).iter().map(|c| (c["id"].as_u64().unwrap_or(0) as u32, c["name"].as_str().unwrap_or("").to_string())).collect();
         let region_names: BTreeMap<u16, String> = ptable["regions"].as_array().unwrap_or(&empty).iter().map(|r| (r["id"].as_u64().unwrap_or(0) as u16, r["name"].as_str().unwrap_or("").to_string())).collect();
-        let coastal_land: Vec<usize> = (0..n).filter(|&p| provs[p].land && provs[p].coastal).collect();
+        let state_names: BTreeMap<u16, String> = ptable["states"].as_array().unwrap_or(&empty).iter().map(|r| (r["id"].as_u64().unwrap_or(0) as u16, r["name"].as_str().unwrap_or("").to_string())).collect();
+        let harbour = ports::harbour_quality(ctx, &provs, &index);
+        let coastal_land: Vec<usize> = (0..n).filter(|&p| provs[p].land && provs[p].coastal && harbour[p] > 0.0).collect();
+        let coast_near: Vec<(usize, Vec<usize>)> = coastal_land
+            .iter()
+            .map(|&a| {
+                let mut near: Vec<(f64, usize)> = coastal_land
+                    .iter()
+                    .filter(|&&b| provs[b].continent != provs[a].continent)
+                    .map(|&b| (provs[a].center.angle_to(provs[b].center) * r_km, b))
+                    .filter(|x| x.0 <= 900.0)
+                    .collect();
+                near.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+                (a, near.into_iter().take(4).map(|x| x.1).collect())
+            })
+            .filter(|x: &(usize, Vec<usize>)| !x.1.is_empty())
+            .collect();
         Some(NationSim {
             year: np.start_year,
+            t: np.start_year as i64 * MONTHS,
+            next_flush: (np.start_year as i64 + 50) * MONTHS,
+            next_progress: np.start_year as i64 * MONTHS,
             directives: crate::directives::of_stage(&ctx.edits.overrides.directives, "nations").into_iter().cloned().collect(),
             np,
             r_km,
@@ -377,6 +481,7 @@ impl NationSim {
             index,
             prov_field: ctx.input.u32("province").to_vec(),
             region_names,
+            state_names,
             culture_group,
             culture_names,
             coastal_land,
@@ -392,6 +497,16 @@ impl NationSim {
             cap_extra: vec![0.0; n],
             roads: BTreeMap::new(),
             airports: BTreeMap::new(),
+            harbour,
+            ports: BTreeMap::new(),
+            port_near: None,
+            coast_near,
+            presence: vec![[0.0; N_INST]; n],
+            born: [None; N_INST],
+            birth_choice: [None; N_INST],
+            saturated: [false; N_INST],
+            tags: BTreeSet::new(),
+            empires: Vec::new(),
             access: vec![HashMap::new()],
             stale: vec![false],
             integ: vec![0.0; n],
@@ -414,13 +529,55 @@ impl NationSim {
     }
 
     pub fn done(&self) -> bool {
-        self.year >= self.np.start_date
+        self.t >= self.np.start_date as i64 * MONTHS
+    }
+
+    /// Current time in whole months from year 0.
+    pub fn time(&self) -> i64 {
+        self.t
+    }
+
+    /// Month of the current year (1–12).
+    pub fn month(&self) -> u8 {
+        (self.t.rem_euclid(MONTHS) + 1) as u8
+    }
+
+    /// Current time in years, for rates and technology (not for keeping time).
+    fn now(&self) -> f64 {
+        self.t as f64 / MONTHS as f64
+    }
+
+    /// Length in months of the step starting now: `months_per_step`, then the
+    /// shorter steps from `step_year_1` and `step_year_2`, never crossing one
+    /// of those years or the start date.
+    pub fn step_months(&self) -> i64 {
+        let np = &self.np;
+        let (y1, y2) = (np.step_year_1 as i64 * MONTHS, np.step_year_2 as i64 * MONTHS);
+        let mut dm = if self.t >= y2 {
+            np.months_per_step_2
+        } else if self.t >= y1 {
+            np.months_per_step_1
+        } else {
+            np.months_per_step
+        } as i64;
+        dm = dm.clamp(1, 1200);
+        for b in [y1, y2, np.start_date as i64 * MONTHS] {
+            if b > self.t && self.t + dm > b {
+                dm = b - self.t;
+            }
+        }
+        dm
+    }
+
+    /// Length of the step starting now in years (rates are per year).
+    pub fn step_len(&self) -> f64 {
+        self.step_months() as f64 / MONTHS as f64
     }
 
     /// Queue a directive issued during a live run (in the order a fresh run
     /// would apply it: by time, then as issued).
     pub fn add_directive(&mut self, d: crate::directives::Directive) {
-        let k = (self.next_directive..self.directives.len()).find(|&k| self.directives[k].at > d.at).unwrap_or(self.directives.len());
+        let k = (self.next_directive..self.directives.len()).find(|&k| self.directives[k].month_index() > d.month_index()).unwrap_or(self.directives.len());
         self.directives.insert(k, d);
     }
 
@@ -432,9 +589,6 @@ impl NationSim {
         self.np.start_date
     }
 
-    pub fn years_per_step(&self) -> i32 {
-        self.np.years_per_step.max(1) as i32
-    }
 
     /// The era a technology year falls in.
     fn era_from(&self, tech: f64) -> u8 {
@@ -442,9 +596,11 @@ impl NationSim {
         [np.gunpowder_year, np.shipping_year, np.industrial_year, np.fertilizer_year, np.motor_year, np.air_year].iter().filter(|&&y| tech >= y as f64).count() as u8
     }
 
-    /// The most advanced living nation.
+    /// The most advanced living nation (era first, then technology).
     fn leader(&self) -> Option<u32> {
-        (1..=self.nations.len() as u32).filter(|&m| self.alive(m)).max_by(|&a, &b| self.nation(a).tech.partial_cmp(&self.nation(b).tech).unwrap().then(b.cmp(&a)))
+        (1..=self.nations.len() as u32)
+            .filter(|&m| self.alive(m))
+            .max_by(|&a, &b| self.nation(a).era.cmp(&self.nation(b).era).then(self.nation(a).tech.total_cmp(&self.nation(b).tech)).then(b.cmp(&a)))
     }
 
     /// The world's era: the leading nation's (by the calendar before any nation).
@@ -472,6 +628,11 @@ impl NationSim {
         }
         let t = self.nation(n).tech - self.np.fertilizer_year as f64;
         1.0 + (self.np.fertilizer_boost - 1.0).max(0.0) * (t / 20.0).clamp(0.0, 1.0)
+    }
+
+    /// Institutions so far, the next one to come, and the empires (for the live view).
+    pub fn institutions(&self) -> Value {
+        json!({ "institutions": self.institution_rows(), "next": self.next_institution(), "pending": self.pending_institution() })
     }
 
     /// Directives of this run, in the order they apply.
@@ -506,7 +667,31 @@ impl NationSim {
     }
 
     fn aggression_mult(&self, n: u32) -> f64 {
-        self.effects.iter().filter_map(|(e, _)| if let Effect::Aggression(m, f) = e { (*m == n).then_some(*f) } else { None }).product()
+        let tags = if self.has_nation_tag(n, "expansionist") { 1.5 } else { 1.0 } * if self.world_tag("frequent_wars") { 1.5 } else { 1.0 };
+        tags * self.effects.iter().filter_map(|(e, _)| if let Effect::Aggression(m, f) = e { (*m == n).then_some(*f) } else { None }).product::<f64>()
+    }
+
+    /// A province of a free state: it never changes hands by war or settlement.
+    fn free(&self, p: usize) -> bool {
+        self.has_state_tag(self.provs[p].state as u32, "free_state")
+    }
+
+    /// How much a province is coveted: ×3 in a holy land.
+    fn coveted(&self, p: usize) -> f64 {
+        if self.has_state_tag(self.provs[p].state as u32, "holy_land") {
+            3.0
+        } else {
+            1.0
+        }
+    }
+
+    /// People of nation n, or of its whole feudal empire if it belongs to one.
+    fn realm_pop(&self, n: u32) -> f64 {
+        let list = match self.empire_of(n) {
+            Some(k) => self.empire_members(k),
+            None => vec![n],
+        };
+        list.iter().map(|&m| self.members[m as usize].iter().map(|&p| self.pop[p]).sum::<f64>()).sum()
     }
 
     fn stability_mult(&self, n: u32) -> f64 {
@@ -541,15 +726,16 @@ impl NationSim {
         let id = self.nations.len() as u32 + 1;
         let primary = if self.major[p] > 0 { self.major[p] } else { parent.checked_sub(1).map(|k| self.nations[k as usize].primary).unwrap_or(0) };
         let aggression = 0.6 + 0.8 * self.rng.f64();
-        // A breakaway keeps its parent's technology; a new polity starts at the world's median.
-        let tech = if parent > 0 {
-            self.nation(parent).tech
+        // A breakaway keeps its parent's technology and era; a new polity
+        // starts at the world's median technology, and its era follows the
+        // institutions its land has embraced.
+        let (tech, era) = if parent > 0 {
+            (self.nation(parent).tech, self.nation(parent).era)
         } else {
             let mut t: Vec<f64> = self.nations.iter().filter(|x| x.ended.is_none()).map(|x| x.tech).collect();
             t.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            t.get(t.len() / 2).copied().unwrap_or(self.year as f64)
+            (t.get(t.len() / 2).copied().unwrap_or(self.now()), 0)
         };
-        let era = self.era_from(tech);
         self.nations.push(Nation {
             name: name.filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string()).unwrap_or_else(|| self.provs[p].name.clone()),
             color: nation_color(id),
@@ -561,20 +747,27 @@ impl NationSim {
             other: 0,
             parent,
             aggression,
-            capital_since: self.year,
+            capital_since: self.t,
             tech,
             era,
             treasury: 0.0,
             income: 0.0,
             upkeep: 0.0,
             infra: 0.0,
-            debt_until: i32::MIN,
+            debt_until: i64::MIN,
+            liege: 0,
+            rank: 0,
+            next_road: self.t + (id % 7) as i64 * MONTHS,
+            next_rail: self.t + (id % 5) as i64 * MONTHS,
+            reform_until: i64::MIN,
+            reform_model: 0,
         });
         self.members.push(BTreeSet::new());
         self.access.push(HashMap::new());
         self.stale.push(true);
         let prev = self.owner[p];
         self.take(p, id);
+        self.set_era(id);
         let (nm, cn) = (self.nations[id as usize - 1].name.clone(), self.culture_name(primary));
         if prev > 0 {
             let old = self.nation(prev).name.clone();
@@ -633,7 +826,7 @@ impl NationSim {
             return;
         }
         self.nations[k].capital = q;
-        self.nations[k].capital_since = self.year;
+        self.nations[k].capital_since = self.t;
         self.stale[n as usize] = true;
         let (a, b) = (self.nations[k].name.clone(), self.provs[q].name.clone());
         self.event("capital", n, 0, Some(q), format!("{b} becomes the capital of {a}"));
@@ -651,14 +844,15 @@ impl NationSim {
                     3 => 0.2,
                     _ => 0.0,
                 }
-                + if self.airports.contains_key(&p) { 0.1 } else { 0.0 };
+                + if self.airports.contains_key(&p) { 0.1 } else { 0.0 }
+                + if self.ports.contains_key(&p) { 0.1 } else { 0.0 };
         }
         for (k, x) in self.nations.iter().enumerate() {
             if x.ended.is_some() {
                 continue;
             }
             let size = self.members[k + 1].len().max(1) as f64;
-            let grown = ((self.year - x.capital_since) as f64 / np.capital_years.max(1.0)).clamp(0.0, 1.0);
+            let grown = ((self.t - x.capital_since) as f64 / MONTHS as f64 / np.capital_years.max(1.0)).clamp(0.0, 1.0);
             let scale = 0.4 + 0.6 * (size.ln() / 30f64.ln()).clamp(0.0, 1.0);
             self.attr[x.capital] += np.capital_pull * grown * scale;
         }
@@ -676,7 +870,7 @@ impl NationSim {
             .map(|p| {
                 let (la, lo) = self.provs[p.province].center.lat_lon();
                 json!({ "id": p.id, "province": self.provs[p.province].id, "province_name": self.provs[p.province].name, "value": p.value, "label": p.label,
-                        "until": p.until, "since": p.since, "by": p.by, "owner": self.owner[p.province],
+                        "until": p.until.map(date), "since": date(p.since), "by": p.by, "owner": self.owner[p.province],
                         "at": [(la.to_degrees() * 100.0).round() / 100.0, (lo.to_degrees() * 100.0).round() / 100.0] })
             })
             .collect()
@@ -693,7 +887,7 @@ impl NationSim {
             .map(|p| {
                 json!({ "province": self.provs[p].id, "name": self.provs[p].name, "population": self.pop[p].round() as u64, "owner": self.owner[p],
                         "capital": capital_of.contains_key(&p), "attraction": (self.attr[p] * 100.0).round() / 100.0, "station": self.rail[p] >= 2,
-                        "junction": self.rail[p] == 3, "airport": self.airports.contains_key(&p), "road": self.road_at(p),
+                        "junction": self.rail[p] == 3, "airport": self.airports.contains_key(&p), "port": self.ports.contains_key(&p), "road": self.road_at(p),
                         "peak": self.peak[p].0.round() as u64, "peak_year": self.peak[p].1 })
             })
             .collect()
@@ -709,16 +903,15 @@ impl NationSim {
             .collect()
     }
 
-    fn apply_directives(&mut self) {
-        let y = self.year;
-        self.effects.retain(|(_, until)| y < *until);
-        // A step covers years y .. y + years_per_step: directives dated in it apply now.
-        let end = (y + self.np.years_per_step.max(1) as i32) as i64;
-        while self.next_directive < self.directives.len() && self.directives[self.next_directive].at < end {
+    fn apply_directives(&mut self, dm: i64) {
+        let t = self.t;
+        self.effects.retain(|(_, until)| t < *until);
+        // A step covers months t .. t + dm: directives dated in it apply now.
+        while self.next_directive < self.directives.len() && self.directives[self.next_directive].month_index() < t + dm {
             let d = self.directives[self.next_directive].clone();
             self.next_directive += 1;
             let a = &d.args;
-            let until = y + arg_f64(a, "years", 0.0).ceil().max(1.0) as i32;
+            let until = t + months(arg_f64(a, "years", 0.0)).max(dm);
             let nat = arg_u64(a, "nation").map(|x| x as u32).unwrap_or(0);
             let target = arg_u64(a, "target").map(|x| x as u32).unwrap_or(0);
             let index = &self.index;
@@ -787,9 +980,66 @@ impl NationSim {
                     x.treasury += x.income.max(0.0) * arg_f64(a, "years", 0.0).max(0.0);
                 }
                 "tech" if self.alive(nat) => {
-                    let t = self.nation(nat).tech + arg_f64(a, "years", 0.0);
-                    self.nations[nat as usize - 1].tech = t;
+                    let tech = self.nation(nat).tech + arg_f64(a, "years", 0.0);
+                    // Institutions whose era year the new technology passes:
+                    // born in its capital if they aren't yet, embraced everywhere.
+                    let mut upto = 0;
+                    for i in 0..N_INST {
+                        if tech + 1e-9 < self.era_year(i as u8 + 1) as f64 || (i > 0 && self.born[i - 1].is_none()) {
+                            break;
+                        }
+                        if self.born[i].is_none() {
+                            let cap = self.nation(nat).capital;
+                            self.bear(i, cap);
+                        }
+                        upto = i + 1;
+                    }
+                    self.embrace_all(nat, upto);
+                    self.nations[nat as usize - 1].tech = tech;
                     self.set_era(nat);
+                }
+                "port" if self.alive(nat) => match p_province {
+                    Some(p) if self.nation(nat).era >= era::SHIP && self.owner[p] == nat && self.harbour[p] > 0.0 && !self.ports.contains_key(&p) => {
+                        let cost = ports::PORT_BUILD * self.np.rail_cost.max(0.0) * self.prod(nat);
+                        self.nations[nat as usize - 1].treasury -= cost;
+                        self.open_port(nat, p);
+                    }
+                    _ => ok = false,
+                },
+                "institution_birth" => {
+                    let i = arg_f64(a, "institution", -1.0).round();
+                    if (0.0..N_INST as f64).contains(&i) && self.born[i as usize].is_none() {
+                        let choice = match arg_u64(a, "province") {
+                            Some(_) => p_province.filter(|&p| self.provs[p].land),
+                            None => None,
+                        };
+                        if a["province"].is_null() || choice.is_some() {
+                            self.birth_choice[i as usize] = Some(choice);
+                        } else {
+                            ok = false;
+                        }
+                    } else {
+                        ok = false;
+                    }
+                }
+                "reform" if self.alive(nat) => {
+                    let years = arg_f64(a, "years", 40.0).max(dm as f64 / MONTHS as f64);
+                    self.start_reform(nat, 0, years);
+                }
+                "feudal_empire" if self.alive(nat) => {
+                    if a["on"].as_bool().unwrap_or(true) {
+                        let places = self.places(a);
+                        ok = self.create_empire(nat, places, a["name"].as_str().map(str::to_string));
+                    } else {
+                        match self.empires.iter().position(|e| e.dissolved.is_none() && e.emperor == self.realm_of(nat)) {
+                            Some(k) => self.dissolve_empire(k),
+                            None => ok = false,
+                        }
+                    }
+                }
+                "tag" => {
+                    let id = arg_u64(a, "id").unwrap_or(0) as u32;
+                    ok = self.set_tag(a["scope"].as_str().unwrap_or(""), id, a["tag"].as_str().unwrap_or(""), a["on"].as_bool().unwrap_or(true));
                 }
                 "catastrophe" => {
                     let sev = arg_f64(a, "severity", 0.0).clamp(0.0, 0.95);
@@ -801,9 +1051,9 @@ impl NationSim {
                     Some(p) => {
                         let id = self.next_pin;
                         self.next_pin += 1;
-                        let until = a["years"].as_f64().map(|yrs| y + yrs.ceil().max(1.0) as i32);
+                        let until = a["years"].as_f64().map(|yrs| t + months(yrs).max(dm));
                         let label = a["label"].as_str().unwrap_or("").trim().to_string();
-                        self.pins.push(CityPin { id, province: p, value: arg_f64(a, "value", 0.0).clamp(-1.0, 1.0), label, until, by: d.by.clone(), since: y });
+                        self.pins.push(CityPin { id, province: p, value: arg_f64(a, "value", 0.0).clamp(-1.0, 1.0), label, until, by: d.by.clone(), since: t });
                     }
                     None => ok = false,
                 },
@@ -812,7 +1062,7 @@ impl NationSim {
                     match (self.pins.iter_mut().find(|x| x.id == pid), p_province.filter(|&p| self.provs[p].land)) {
                         (Some(pin), Some(p)) => {
                             pin.province = p;
-                            pin.since = y;
+                            pin.since = t;
                         }
                         _ => ok = false,
                     }
@@ -830,7 +1080,7 @@ impl NationSim {
                 "note" => {}
                 _ => ok = false,
             }
-            self.applied.push(json!({ "year": y, "action": d.action, "args": d.args, "note": d.note, "by": d.by, "applied": ok }));
+            self.applied.push(json!({ "year": t.div_euclid(MONTHS), "month": t.rem_euclid(MONTHS) + 1, "action": d.action, "args": d.args, "note": d.note, "by": d.by, "applied": ok }));
         }
     }
 
@@ -887,12 +1137,13 @@ impl NationSim {
             for e in &self.adj[p] {
                 let q = e.to as usize;
                 let o = self.owner[q];
-                // Barren land that holds no one (ice caps) is left unclaimed.
-                if o == n || !self.provs[q].land || (o > 0 && self.at_peace(n, o)) || (self.cap[q] < 1.0 && self.pop[q] < 1.0) {
+                // Barren land that holds no one (ice caps) is left unclaimed;
+                // fellow members of a feudal empire and free states are left alone.
+                if o == n || !self.provs[q].land || (o > 0 && (self.at_peace(n, o) || self.same_realm(n, o))) || (self.cap[q] < 1.0 && self.pop[q] < 1.0) || self.free(q) {
                     continue;
                 }
                 let step = self.edge_cost(p, e);
-                let value = (self.pop[q] + 0.1 * self.cap[q]).max(1.0).sqrt();
+                let value = (self.pop[q] + 0.1 * self.cap[q]).max(1.0).sqrt() * self.coveted(q);
                 let mut cost = (1.0 + step / 300.0) * (1.0 + self.reach_cost(n, q) / reach) * (1.0 + self.np.culture_weight * self.cdist(n, q));
                 if o > 0 {
                     cost *= if self.at_war(n, o) { 0.6 } else { 2.0 };
@@ -909,23 +1160,31 @@ impl NationSim {
                 }
             }
         }
-        // Colonies across the sea.
-        if ship && self.provs[cap].coastal || ship && members.iter().any(|&p| self.provs[p].coastal) {
-            if self.rng.f64() < 0.3 && !self.coastal_land.is_empty() {
-                let ports: Vec<usize> = members.iter().copied().filter(|&p| self.provs[p].coastal).take(12).collect();
+        // Colonies across the sea, sailing from the nation's ports (better
+        // harbours reach farther; merchant republics sail more often).
+        let ports: Vec<usize> = if ship && !self.world_tag("no_overseas_colonies") && !self.has_nation_tag(n, "isolationist") {
+            self.ports.keys().copied().filter(|&p| self.owner[p] == n).take(16).collect()
+        } else {
+            vec![]
+        };
+        if !ports.is_empty() {
+            let chance = if self.has_nation_tag(n, "merchant_republic") { 0.6 } else { 0.3 };
+            let harbour = ports.iter().map(|&p| self.harbour[p]).fold(0.0, f64::max);
+            let range = self.np.overseas_km * (0.6 + 0.8 * harbour);
+            if self.rng.f64() < chance && !self.coastal_land.is_empty() {
                 let own_pop: f64 = members.iter().map(|&p| self.pop[p]).sum();
                 for _ in 0..12 {
                     let q = self.coastal_land[self.rng.below(self.coastal_land.len())];
                     let o = self.owner[q];
                     // Free land, or land of a much weaker nation (colonial conquest).
-                    if o == n || (o > 0 && (self.at_peace(n, o) || self.members[o as usize].iter().map(|&p| self.pop[p]).sum::<f64>() > 0.25 * own_pop)) {
+                    if o == n || self.free(q) || (o > 0 && (self.at_peace(n, o) || self.same_realm(n, o) || self.realm_pop(o) > 0.25 * own_pop)) {
                         continue;
                     }
                     let d = ports.iter().map(|&p| self.km(p, q)).fold(f64::INFINITY, f64::min);
-                    if d > self.np.overseas_km {
+                    if d > range {
                         continue;
                     }
-                    let mut s = (self.pop[q] + 0.1 * self.cap[q]).max(1.0).sqrt() / (1.0 + d / 1500.0) * (0.5 + self.rng.f64());
+                    let mut s = (self.pop[q] + 0.1 * self.cap[q]).max(1.0).sqrt() * self.coveted(q) / (1.0 + d / 1500.0) * (0.5 + self.rng.f64());
                     if o > 0 {
                         s *= 0.5;
                     }
@@ -951,15 +1210,19 @@ impl NationSim {
             }
             return;
         }
-        // War over q: the two nations' strength near it.
-        let strength = |s: &NationSim, m: u32| {
-            let total: f64 = s.members[m as usize].iter().map(|&p| s.pop[p]).sum();
+        // War over q: the two nations' strength near it (a feudal empire's
+        // members stand together in defence).
+        let strength = |s: &NationSim, m: u32, defend: bool| {
+            let total: f64 = if defend { s.realm_pop(m) } else { s.members[m as usize].iter().map(|&p| s.pop[p]).sum() };
             let near = 1.0 / (1.0 + s.reach_cost(m, q) / reach);
             // Better-armed (more productive) nations fight better.
             total.max(1.0).powf(0.8) * near * s.prod(m).powf(0.4)
         };
-        let mut att = strength(self, n);
-        let mut def = strength(self, o);
+        let mut att = strength(self, n, false);
+        let mut def = strength(self, o, true);
+        if self.has_nation_tag(o, "eternal") {
+            def *= 1.5;
+        }
         if self.major[q] != 0 && self.major[q] == self.nation(o).primary {
             def *= 1.3;
         }
@@ -1037,15 +1300,8 @@ impl NationSim {
         };
         let lines: Vec<&Line> = self.lines.iter().filter(|l| l.is_open() && l.stations().any(|p| owner[p] == n)).collect();
         let mut links = Vec::new();
-        let members = &self.members[k];
         if era >= era::SHIP {
-            let ports: Vec<usize> = members.iter().copied().filter(|&p| self.provs[p].coastal).collect();
-            let main = if self.provs[cap].coastal { Some(cap) } else { ports.iter().copied().max_by(|&a, &b| self.pop[a].partial_cmp(&self.pop[b]).unwrap().then(b.cmp(&a))) };
-            if let Some(m) = main {
-                for &p in ports.iter().filter(|&&p| p != m) {
-                    links.push((m, p, self.km(m, p) * SEA_FACTOR + SEA_PENALTY));
-                }
-            }
+            links.extend(self.sea_links(n));
         }
         if era >= era::AIR {
             let air: Vec<usize> = self.airports.keys().copied().filter(|&p| owner[p] == n).collect();
@@ -1391,10 +1647,23 @@ impl NationSim {
     }
 
     /// Set a nation's era from its technology, with events for the first nations into each era.
+    /// Set a nation's era from the institutions its provinces have embraced
+    /// (eras never go back), keep its technology within the era, and log
+    /// the first nations into each era.
     fn set_era(&mut self, n: u32) {
         let k = n as usize - 1;
-        let new = self.era_from(self.nations[k].tech);
         let old = self.nations[k].era;
+        let mut new = old;
+        let share = self.np.institution_share.clamp(0.01, 1.0);
+        while (new as usize) < N_INST && self.born[new as usize].is_some() && self.embraced_share(n, new as usize) + 1e-9 >= share {
+            new += 1;
+        }
+        // Technology cannot pass the next era's year before its institution is embraced.
+        let mut tech = self.nations[k].tech;
+        if (new as usize) < N_INST {
+            tech = tech.min(self.era_year(new + 1) as f64 - 0.1);
+        }
+        self.nations[k].tech = tech;
         if new == old {
             return;
         }
@@ -1439,7 +1708,7 @@ impl NationSim {
         let wealth = rank(&|m| self.nation(m).income.max(0.0) / pops[&m].max(1.0));
         let power = rank(&|m| pops[&m]);
         let old: Vec<f64> = self.nations.iter().map(|x| x.tech).collect();
-        let ceiling = self.year as f64 + self.np.tech_lead_years;
+        let ceiling = self.now() + self.np.tech_lead_years;
         let spread = self.np.tech_spread.max(0.0);
         for &m in &living {
             let k = m as usize - 1;
@@ -1500,13 +1769,24 @@ impl NationSim {
             let o = self.owner[p] as usize;
             spend[o] += AIRPORT_UPKEEP * lc * wage[o];
         }
+        for &p in self.ports.keys() {
+            let o = self.owner[p] as usize;
+            spend[o] += ports::PORT_UPKEEP * lc * wage[o];
+        }
         let tax = self.np.tax.max(0.0);
         for m in 1..=nn as u32 {
             if !self.alive(m) {
                 continue;
             }
             let prod = self.prod(m);
-            let income: f64 = self.members[m as usize].iter().map(|&p| self.pop[p] * self.integ[p]).sum::<f64>() * prod * tax;
+            // Ports add trade: up to 30% more from a perfect harbour (double for merchant republics).
+            let trade = if self.has_nation_tag(m, "merchant_republic") { 0.6 } else { 0.3 };
+            let income: f64 = self.members[m as usize]
+                .iter()
+                .map(|&p| self.pop[p] * self.integ[p] * if self.ports.contains_key(&p) { 1.0 + trade * self.harbour[p] } else { 1.0 })
+                .sum::<f64>()
+                * prod
+                * tax;
             let x = &mut self.nations[m as usize - 1];
             // A full treasury is spent on the court, the army and the cities.
             let surplus = 0.5 * (x.treasury - RESERVE_YEARS * income).max(0.0);
@@ -1515,7 +1795,7 @@ impl NationSim {
             x.upkeep = upkeep;
             x.infra = spend[m as usize];
             x.treasury += (income - upkeep) * dt;
-            if x.treasury < -(2.0 * income).max(50_000.0) && self.year >= x.debt_until {
+            if x.treasury < -(2.0 * income).max(50_000.0) && self.t >= x.debt_until {
                 self.bankrupt(m);
             }
         }
@@ -1527,7 +1807,7 @@ impl NationSim {
     fn bankrupt(&mut self, n: u32) {
         let k = n as usize - 1;
         self.nations[k].treasury *= 0.5;
-        self.nations[k].debt_until = self.year + 10;
+        self.nations[k].debt_until = self.t + 10 * MONTHS;
         let wage = self.prod(n);
         let (rc, lc) = (self.np.road_cost.max(0.0) * wage, self.np.rail_cost.max(0.0) * wage);
         let mut over = self.nations[k].infra - INFRA_SHARE * self.nations[k].income;
@@ -1588,27 +1868,39 @@ impl NationSim {
         self.event("bankruptcy", n, 0, None, format!("{name} goes bankrupt{what}"));
     }
 
-    /// Run one step of `years_per_step` years.
+    /// Run one step (`step_len` years).
     pub fn step(&mut self, progress: &dyn Fn(f32, &str)) {
         if self.done() {
             return;
         }
-        self.apply_directives();
+        let dm = self.step_months();
+        let dt = dm as f64 / MONTHS as f64;
+        self.apply_directives(dm);
         let y = self.year;
-        let dt = self.np.years_per_step.max(1) as f64;
         // Founding slows once the world's seafarers have spread (by the calendar).
-        let ship = y >= self.np.shipping_year;
-        let span = (self.np.start_date - self.np.start_year).max(1) as f32;
-        if (y - self.np.start_year) % 50 < self.np.years_per_step as i32 {
-            progress(((y - self.np.start_year) as f32 / span).clamp(0.0, 1.0) * 0.95, &format!("Year {y}: {} nations, {} era", self.nations.iter().filter(|x| x.ended.is_none()).count(), self.era()));
+        let ship = self.year >= self.np.shipping_year;
+        let span = ((self.np.start_date - self.np.start_year).max(1) as i64 * MONTHS) as f32;
+        if self.t >= self.next_progress {
+            while self.next_progress <= self.t {
+                self.next_progress += 50 * MONTHS;
+            }
+            progress(((self.t - self.np.start_year as i64 * MONTHS) as f32 / span).clamp(0.0, 1.0) * 0.95, &format!("Year {y}: {} nations, {} era", self.nations.iter().filter(|x| x.ended.is_none()).count(), self.era()));
         }
         let n = self.provs.len();
         // City pins that have run their time.
-        self.pins.retain(|x| x.until.map_or(true, |u| y < u));
-        // Technology and eras, access and integration, the treasury.
+        let t = self.t;
+        self.pins.retain(|x| x.until.map_or(true, |u| t < u));
+        // Institutions are born and spread; eras follow them. Then access and
+        // integration, the treasury, tribute, ports and reforms.
+        self.births();
+        self.imperial_succession();
+        self.spread_institutions(dt);
         self.advance_tech(dt);
         self.refresh_access();
         self.economy(dt);
+        self.tribute(dt);
+        self.port_growth(dt);
+        self.reforms(dt);
         self.update_attraction();
         // 1. growth: attraction scales how many people a province holds; an
         // industrial owner doubles it and grows faster, fertilizer adds more.
@@ -1714,7 +2006,8 @@ impl NationSim {
         }
         // 4. breakups
         for &m in &living {
-            if !self.alive(m) || self.members[m as usize].len() < 4 {
+            // Members of a feudal empire and eternal nations never break apart.
+            if !self.alive(m) || self.members[m as usize].len() < 4 || self.empire_of(m).is_some() || self.has_nation_tag(m, "eternal") {
                 continue;
             }
             let members: Vec<usize> = self.members[m as usize].iter().copied().collect();
@@ -1725,8 +2018,10 @@ impl NationSim {
             let instability = 1.2 * foreign + 0.4 * size + 0.4 * spread.min(3.0);
             let e = self.nation(m).era;
             let era_f = if e >= era::IND { 0.5 } else if e >= era::GUN { 0.7 } else { 1.0 };
-            let debt = if y < self.nation(m).debt_until { 1.6 } else { 1.0 };
-            let chance = self.np.collapse_rate * dt / 2.0 * instability * instability * era_f * debt / self.stability_mult(m).max(0.05);
+            let debt = if self.t < self.nation(m).debt_until { 1.6 } else { 1.0 };
+            let reform = if self.t < self.nation(m).reform_until { 1.5 } else { 1.0 };
+            let calm = if self.world_tag("stable_realms") { 0.5 } else { 1.0 };
+            let chance = self.np.collapse_rate * dt / 2.0 * instability * instability * era_f * debt * reform * calm / self.stability_mult(m).max(0.05);
             if self.rng.f64() < chance {
                 self.split(m, None);
             }
@@ -1763,13 +2058,13 @@ impl NationSim {
         }
         // 6. building: roads, railways (industry) and airports (air age), each
         // nation on its own schedule.
-        let k = (y as f64 / dt).round() as i32;
-        let rail_every = (self.np.railway_every_years.max(1) as f64 / dt).round().max(1.0) as i32;
-        let road_every = (self.np.road_every_years.max(1) as f64 / dt).round().max(1.0) as i32;
+        let rail_every = self.np.railway_every_years.max(1) as i64 * MONTHS;
+        let road_every = self.np.road_every_years.max(1) as i64 * MONTHS;
         let living: Vec<u32> = (1..=self.nations.len() as u32).filter(|&m| self.alive(m)).collect();
         for m in living {
             // Up to three projects at a time, as far as the treasury goes.
-            if (k + m as i32) % road_every == 0 {
+            if self.t >= self.nation(m).next_road {
+                self.nations[m as usize - 1].next_road = self.t + road_every;
                 for _ in 0..3 {
                     if !self.alive(m) || !self.road_project(m) {
                         break;
@@ -1779,7 +2074,8 @@ impl NationSim {
                     self.airport_project(m);
                 }
             }
-            if self.nation(m).era >= era::IND && (k + m as i32) % rail_every == 0 {
+            if self.nation(m).era >= era::IND && self.t >= self.nation(m).next_rail {
+                self.nations[m as usize - 1].next_rail = self.t + rail_every;
                 for _ in 0..3 {
                     if !self.railway_project(m) {
                         break;
@@ -1787,9 +2083,11 @@ impl NationSim {
                 }
             }
         }
-        self.year += self.np.years_per_step.max(1) as i32;
-        if (self.year - self.np.start_year) % 50 < self.np.years_per_step as i32 || self.done() {
+        self.t += dm;
+        self.year = self.t.div_euclid(MONTHS) as i32;
+        if self.t >= self.next_flush || self.done() {
             self.flush_wars();
+            self.next_flush += 50 * MONTHS;
         }
     }
 
@@ -1849,12 +2147,17 @@ impl NationSim {
                 "founded": x.founded, "ended": x.ended, "fate": x.fate, "fate_other": x.other, "parent": x.parent,
                 "tech": (x.tech * 10.0).round() / 10.0, "era": ERA_NAMES[x.era as usize], "era_index": x.era,
                 "treasury": x.treasury.round(), "income": x.income.round(), "upkeep": x.upkeep.round(),
-                "integration": (integ * 1000.0).round() / 1000.0, "bankrupt": self.year < x.debt_until,
+                "integration": (integ * 1000.0).round() / 1000.0, "bankrupt": self.t < x.debt_until,
                 "road_km": { "track": rk[0].round(), "paved": rk[1].round(), "highway": rk[2].round() },
                 "rail_km": rail_km[id as usize].round(),
                 "railway_provinces": m.iter().filter(|&&p| self.rail[p] > 0).count(),
                 "stations": m.iter().filter(|&&p| self.rail[p] >= 2).count(),
                 "airports": m.iter().filter(|p| self.airports.contains_key(p)).count(),
+                "ports": m.iter().filter(|p| self.ports.contains_key(p)).count(),
+                "liege": x.liege, "rank": RANKS[x.rank as usize], "realm": if x.ended.is_none() { self.realm_of(id) } else { id },
+                "empire": if x.ended.is_none() { self.empire_of(id).map(|k| self.empires[k].name.clone()) } else { None },
+                "reforming": self.t < x.reform_until,
+                "institutions": (0..N_INST).map(|i| (self.embraced_share(id, i) * 100.0).round() / 100.0).collect::<Vec<_>>(),
                 "regions": regs.iter().take(4).map(|(r, c)| json!({ "id": r, "name": self.region_names.get(r).cloned().unwrap_or_default(), "provinces": c })).collect::<Vec<_>>(),
             }));
         }
@@ -1869,6 +2172,11 @@ impl NationSim {
         let mut f_road = vec![0u8; n];
         let mut f_air = vec![0u8; n];
         let mut f_era = vec![0u8; n];
+        let mut f_port = vec![0u8; n];
+        let mut f_realm = vec![0u16; n];
+        let mut f_imperial = vec![0u8; n];
+        let mut f_inst = vec![0u8; n];
+        let mut f_presence = vec![0f32; n];
         let mut f_pop = vec![0f32; n];
         // Province area from the cell count is not needed: density uses the cells' share.
         let mut cells = vec![0u32; self.provs.len()];
@@ -1878,6 +2186,16 @@ impl NationSim {
             }
         }
         let road: Vec<u8> = (0..self.provs.len()).map(|p| self.road_at(p)).collect();
+        // Per province: realm (top liege in a feudal empire, else the owner),
+        // imperial territory, embraced institutions and the newest one's presence.
+        let realm: Vec<u16> = (0..self.provs.len()).map(|p| if self.owner[p] > 0 { self.realm_of(self.owner[p]).min(u16::MAX as u32) as u16 } else { 0 }).collect();
+        let mut imperial = vec![0u8; self.provs.len()];
+        for e in self.empires.iter().filter(|e| e.dissolved.is_none()) {
+            for &p in &e.territory {
+                imperial[p] = 1;
+            }
+        }
+        let newest = (0..N_INST).rev().find(|&i| self.born[i].is_some());
         for i in 0..n {
             let Some(&p) = self.index.get(&self.prov_field[i]) else { continue };
             f_owner[i] = self.owner[p].min(u16::MAX as u32) as u16;
@@ -1887,6 +2205,19 @@ impl NationSim {
             f_air[i] = u8::from(self.airports.contains_key(&p));
             // Era of the owner, plus one (0: no owner).
             f_era[i] = if self.owner[p] > 0 { self.nation(self.owner[p]).era + 1 } else { 0 };
+            f_port[i] = if self.ports.contains_key(&p) {
+                2
+            } else if self.harbour[p] >= self.np.port_quality {
+                1
+            } else {
+                0
+            };
+            f_realm[i] = realm[p];
+            f_imperial[i] = imperial[p];
+            f_inst[i] = (0..N_INST).filter(|&k| self.presence[p][k] >= EMBRACED).fold(0u8, |a, k| a | (1 << k));
+            if let Some(k) = newest {
+                f_presence[i] = self.presence[p][k];
+            }
             if self.provs[p].land {
                 f_pop[i] = (self.pop[p] / cells[p].max(1) as f64) as f32;
             }
@@ -1898,6 +2229,11 @@ impl NationSim {
         f.put("road", Field::U8(f_road));
         f.put("airport", Field::U8(f_air));
         f.put("nation_era", Field::U8(f_era));
+        f.put("port", Field::U8(f_port));
+        f.put("realm", Field::U16(f_realm));
+        f.put("imperial", Field::U8(f_imperial));
+        f.put("institutions", Field::U8(f_inst));
+        f.put("institution", Field::F32(f_presence));
         f.put("nation_population", Field::F32(f_pop));
         let f_attr: Vec<f32> = (0..n).map(|i| self.index.get(&self.prov_field[i]).map_or(0.0, |&p| self.attr[p] as f32)).collect();
         f.put("nation_attraction", Field::F32(f_attr));
@@ -1958,6 +2294,7 @@ impl NationSim {
             "stations": self.rail.iter().filter(|&&r| r >= 2).count(),
             "junctions": self.rail.iter().filter(|&&r| r == 3).count(),
             "airports": self.airports.len(),
+            "ports": self.ports.len(),
         })
     }
 
@@ -2003,18 +2340,21 @@ impl NationSim {
             .effects
             .iter()
             .map(|(e, until)| match e {
-                Effect::Aggression(n, f) => json!({ "effect": "aggression", "nation": n, "factor": f, "until": until }),
-                Effect::Toward(n, p) => json!({ "effect": "expand_toward", "nation": n, "province": self.provs[*p].id, "until": until }),
-                Effect::War(a, b) => json!({ "effect": "war", "nation": a, "target": b, "until": until }),
-                Effect::Peace(a, b) => json!({ "effect": "peace", "nation": a, "target": b, "until": until }),
-                Effect::Stability(n, f) => json!({ "effect": "stability", "nation": n, "factor": f, "until": until }),
+                Effect::Aggression(n, f) => json!({ "effect": "aggression", "nation": n, "factor": f, "until": date(*until) }),
+                Effect::Toward(n, p) => json!({ "effect": "expand_toward", "nation": n, "province": self.provs[*p].id, "until": date(*until) }),
+                Effect::War(a, b) => json!({ "effect": "war", "nation": a, "target": b, "until": date(*until) }),
+                Effect::Peace(a, b) => json!({ "effect": "peace", "nation": a, "target": b, "until": date(*until) }),
+                Effect::Stability(n, f) => json!({ "effect": "stability", "nation": n, "factor": f, "until": date(*until) }),
             })
             .collect();
         let leader = self.leader().map(|m| json!({ "nation": m, "name": self.nation(m).name, "tech": (self.nation(m).tech * 10.0).round() / 10.0, "era": ERA_NAMES[self.nation(m).era as usize] }));
         let summary = json!({
             "stage": "nations",
-            "year": self.year, "start_year": self.np.start_year, "end_year": self.np.start_date, "era": self.era(),
+            "year": self.year, "month": self.month(), "time": self.t, "step_months": self.step_months(),
+            "start_year": self.np.start_year, "end_year": self.np.start_date, "era": self.era(),
             "leader": leader, "eras": self.era_counts(),
+            "institutions": self.institution_rows(), "next_institution": self.next_institution(), "pending_institution": self.pending_institution(),
+            "tags": self.tag_rows(), "empires": self.empire_rows(),
             "population": self.pop.iter().sum::<f64>().round(),
             "land_provinces": land, "ruled_provinces": ruled,
             "nations": nations, "nations_ever": self.nations.len(),
@@ -2026,7 +2366,7 @@ impl NationSim {
             "ruins": self.ruined.iter().filter(|&&r| r).count(),
             "events": self.events.iter().rev().take(20).rev().cloned().collect::<Vec<_>>(),
             "directives": self.applied,
-            "queued": self.directives[self.next_directive..].iter().map(|d| json!({ "year": d.at, "action": d.action, "args": d.args, "note": d.note, "by": d.by })).collect::<Vec<_>>(),
+            "queued": self.directives[self.next_directive..].iter().map(|d| json!({ "year": d.at, "month": d.month.max(1), "action": d.action, "args": d.args, "note": d.note, "by": d.by })).collect::<Vec<_>>(),
         });
         (summary, self.fields())
     }
@@ -2037,7 +2377,10 @@ impl NationSim {
             .map(|p| {
                 let sh: Vec<Value> = self.shares[p].iter().filter(|x| x.1 >= 0.05).map(|x| json!([x.0, (x.1 * 1000.0).round() / 1000.0])).collect();
                 json!({ "id": self.provs[p].id, "owner": self.owner[p], "culture": self.major[p], "shares": sh, "population": self.pop[p].max(0.0).round() as u64,
-                        "railway": self.rail[p], "road": self.road_at(p), "airport": self.airports.contains_key(&p), "integration": (self.integ[p] * 1000.0).round() / 1000.0 })
+                        "railway": self.rail[p], "road": self.road_at(p), "airport": self.airports.contains_key(&p), "port": self.ports.contains_key(&p),
+                        "harbour": (self.harbour[p] * 100.0).round() / 100.0, "integration": (self.integ[p] * 1000.0).round() / 1000.0,
+                        "institutions": (0..N_INST).filter(|&k| self.presence[p][k] >= EMBRACED).map(|k| INSTITUTIONS[k]).collect::<Vec<_>>(),
+                        "realm": if self.owner[p] > 0 { self.realm_of(self.owner[p]) } else { 0 } })
             })
             .collect();
         let nations = self.nation_rows(false);
@@ -2046,6 +2389,23 @@ impl NationSim {
         let land = (0..self.provs.len()).filter(|&p| self.provs[p].land).count();
         let count = |k: &str| self.events.iter().filter(|e| e["event"] == k).count();
         let leader = self.leader().map(|m| json!({ "nation": m, "name": self.nation(m).name, "tech": (self.nation(m).tech * 10.0).round() / 10.0, "era": ERA_NAMES[self.nation(m).era as usize] }));
+        let ruins: Vec<Value> = (0..self.provs.len()).filter(|&p| self.ruined[p]).map(|p| json!({ "province": self.provs[p].id, "name": self.provs[p].name, "population": self.pop[p].round() as u64, "peak": self.peak[p].0.round() as u64, "peak_year": self.peak[p].1 })).collect();
+        let table = json!({
+            "nations": nations,
+            "provinces": provinces,
+            "events": self.events,
+            "railways": self.line_rows(),
+            "stations": self.station_rows(),
+            "roads": self.road_rows(),
+            "airports": self.airport_rows(),
+            "ports": self.port_rows(),
+            "titles": self.title_rows(),
+            "institutions": self.institution_rows(),
+            "empires": self.empire_rows(),
+            "cities": self.city_rows(100),
+            "pins": self.pin_rows(),
+            "ruins": ruins,
+        });
         StepOutput {
             fields: self.fields(),
             meta: json!({
@@ -2065,21 +2425,14 @@ impl NationSim {
                 "independences": count("independence"),
                 "colonies": count("colony"),
                 "bankruptcies": count("bankruptcy"),
+                "reforms": count("reform"),
+                "institutions": self.institution_rows(),
+                "empires": self.empire_rows(),
+                "tags": self.tag_rows(),
                 "metropolises": self.metropolis.iter().filter(|&&m| m).count(),
                 "ruins": self.ruined.iter().filter(|&&r| r).count(),
                 "directives": self.applied,
-                "table": {
-                    "nations": nations,
-                    "provinces": provinces,
-                    "events": self.events,
-                    "railways": self.line_rows(),
-                    "stations": self.station_rows(),
-                    "roads": self.road_rows(),
-                    "airports": self.airport_rows(),
-                    "cities": self.city_rows(100),
-                    "pins": self.pin_rows(),
-                    "ruins": (0..self.provs.len()).filter(|&p| self.ruined[p]).map(|p| json!({ "province": self.provs[p].id, "name": self.provs[p].name, "population": self.pop[p].round() as u64, "peak": self.peak[p].0.round() as u64, "peak_year": self.peak[p].1 })).collect::<Vec<_>>(),
-                },
+                "table": table,
             }),
         }
     }
@@ -2093,10 +2446,15 @@ fn empty_output(n: usize) -> StepOutput {
     f.put("road", Field::U8(vec![0; n]));
     f.put("airport", Field::U8(vec![0; n]));
     f.put("nation_era", Field::U8(vec![0; n]));
+    f.put("port", Field::U8(vec![0; n]));
+    f.put("realm", Field::U16(vec![0; n]));
+    f.put("imperial", Field::U8(vec![0; n]));
+    f.put("institutions", Field::U8(vec![0; n]));
+    f.put("institution", Field::F32(vec![0.0; n]));
     f.put("nation_population", Field::F32(vec![0.0; n]));
     f.put("nation_attraction", Field::F32(vec![0.0; n]));
     StepOutput {
         fields: f,
-        meta: json!({ "nations": 0, "nations_ever": 0, "table": { "nations": [], "provinces": [], "events": [], "railways": [], "stations": [], "roads": [], "airports": [] } }),
+        meta: json!({ "nations": 0, "nations_ever": 0, "table": { "nations": [], "provinces": [], "events": [], "railways": [], "stations": [], "roads": [], "airports": [], "ports": [], "titles": [] } }),
     }
 }

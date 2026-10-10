@@ -47,6 +47,9 @@ Every parameter of the twelve steps, with its default and meaning. This file is 
 | `hotspots` | Hotspots (0–40) | `8` | — |
 | `hint_height_m` | Mountain hint height (m) (0–8000) | `3200.0` | Strength of "mountains here" hint strokes (metres at full brush). |
 | `max_influence_km` | Boundary influence (km) (300–4000) | `1600.0` | — |
+| `old_mountains` | Old mountains (share of land) (0–0.5) | `0.1` | Old mountains from noise, away from plate boundaries: worn, rounded clusters (Appalachians, Urals, Scottish Highlands) rather than the high, sharp ranges of colliding plates. Share of continental land they cover, their peak height, and the size of a cluster. |
+| `old_mountain_height_m` | Old mountain height (m) (0–4000) | `1500.0` | Old mountains from noise, away from plate boundaries: worn, rounded clusters (Appalachians, Urals, Scottish Highlands) rather than the high, sharp ranges of colliding plates. Share of continental land they cover, their peak height, and the size of a cluster. |
+| `old_mountain_size_km` | Old mountain cluster size (km) (100–3000) | `700.0` | Old mountains from noise, away from plate boundaries: worn, rounded clusters (Appalachians, Urals, Scottish Highlands) rather than the high, sharp ranges of colliding plates. Share of continental land they cover, their peak height, and the size of a cluster. |
 
 ## Climate (step 5)
 
@@ -185,7 +188,11 @@ Every parameter of the twelve steps, with its default and meaning. This file is 
 | --- | --- | --- | --- |
 | `start_year` | First polities (year) (-5000–1800) | `800` | Year the first polities can form. |
 | `start_date` | Start date (year) (1800–2000) | `1949` | Year history stops: the map's start date (default 1949: late in the second great war's era, early in the cold war's; 1910–1920 for a pre-war start). |
-| `years_per_step` | Years per step (1–25) | `2` | Years per simulation step. |
+| `months_per_step` | Months per step (at first) (1–300) | `24` | Months per simulation step at first; steps get shorter toward the present (`step_year_1`/`months_per_step_1`, then `_2`), so recent centuries are simulated in finer detail. Time is counted in whole months; the year is the month count divided by 12. |
+| `step_year_1` | Shorter steps from (year) (-5000–2100) | `1400` | Months per simulation step at first; steps get shorter toward the present (`step_year_1`/`months_per_step_1`, then `_2`), so recent centuries are simulated in finer detail. Time is counted in whole months; the year is the month count divided by 12. |
+| `months_per_step_1` | Months per step then (1–300) | `12` | Months per simulation step at first; steps get shorter toward the present (`step_year_1`/`months_per_step_1`, then `_2`), so recent centuries are simulated in finer detail. Time is counted in whole months; the year is the month count divided by 12. |
+| `step_year_2` | Shortest steps from (year) (-5000–2100) | `1800` | Months per simulation step at first; steps get shorter toward the present (`step_year_1`/`months_per_step_1`, then `_2`), so recent centuries are simulated in finer detail. Time is counted in whole months; the year is the month count divided by 12. |
+| `months_per_step_2` | Months per step then  (1–300) | `6` | Months per simulation step at first; steps get shorter toward the present (`step_year_1`/`months_per_step_1`, then `_2`), so recent centuries are simulated in finer detail. Time is counted in whole months; the year is the month count divided by 12. |
 | `found_population` | People to found a polity (1000–1000000) | `60_000.0` | People a province needs before a polity can form there. |
 | `found_rate` | Founding chance per step (0–0.05) | `0.0015` | Chance per step that a province with that many people and no ruler founds a polity (more people, likelier). |
 | `expansion_rate` | Expansion (0–5) | `0.8` | Expansion attempts per nation and step at aggression 1. |
@@ -196,9 +203,9 @@ Every parameter of the twelve steps, with its default and meaning. This file is 
 | `assimilation` | Assimilation per year (0–0.02) | `0.0015` | Share of a province's other cultures that takes its ruler's culture per year. |
 | `growth` | — | `0.0018` | Population growth per year before and during the industrial era. |
 | `industrial_growth` | — | `0.009` | Population growth per year before and during the industrial era. |
-| `gunpowder_year` | Gunpowder (technology year) (0–2000) | `1450` | Era technology years: gunpowder states, ocean shipping (overseas colonies), industry (railways, faster growth). Each nation enters an era when its own technology reaches the year, not the calendar. |
-| `shipping_year` | Ocean shipping (technology year) (0–2000) | `1500` | Era technology years: gunpowder states, ocean shipping (overseas colonies), industry (railways, faster growth). Each nation enters an era when its own technology reaches the year, not the calendar. |
-| `industrial_year` | Industry (technology year) (0–2000) | `1830` | Era technology years: gunpowder states, ocean shipping (overseas colonies), industry (railways, faster growth). Each nation enters an era when its own technology reaches the year, not the calendar. |
+| `gunpowder_year` | Gunpowder (earliest birth) (0–2000) | `1450` | Era years: gunpowder states, ocean shipping (ports, overseas colonies), industry (railways, faster growth). Each is the earliest year the era's institution can be born; a nation enters the era when most of its provinces have embraced the institution. |
+| `shipping_year` | Navigation (earliest birth) (0–2000) | `1500` | Era years: gunpowder states, ocean shipping (ports, overseas colonies), industry (railways, faster growth). Each is the earliest year the era's institution can be born; a nation enters the era when most of its provinces have embraced the institution. |
+| `industrial_year` | Industrialisation (earliest birth) (0–2000) | `1830` | Era years: gunpowder states, ocean shipping (ports, overseas colonies), industry (railways, faster growth). Each is the earliest year the era's institution can be born; a nation enters the era when most of its provinces have embraced the institution. |
 | `overseas_km` | Colony range (km) (500–20000) | `9000.0` | Farthest a colony can lie from its nation's coast (km), with ocean shipping. |
 | `railway_cities` | Cities linked by rail per nation (2–40) | `8` | Largest cities each nation links by rail. |
 | `railway_every_years` | Years between railway projects (1–100) | `8` | Years between a nation's railway projects. |
@@ -209,9 +216,9 @@ Every parameter of the twelve steps, with its default and meaning. This file is 
 | `war_devastation` | War devastation (0–1) | `0.25` | Attraction lost by a conquered province (devastation: people leave). |
 | `recovery` | Recovery per year (0–0.2) | `0.03` | Share of devastation that heals each year. |
 | `migration` | Migration to cities per year (0–0.05) | `0.002` | Share of a nation's people that move each year toward its attractive provinces (capitals, stations, city pins), more from devastated land. |
-| `fertilizer_year` | Synthetic fertilizer (technology year) (0–2100) | `1909` | Technology years at which synthetic fertilizer, the motor age (highways) and the air age (airports) begin. Like the other era years, a nation reaches them when its own technology does: rich, large and well-connected nations first, others as ideas spread to them. |
-| `motor_year` | Motor age (technology year) (0–2100) | `1920` | Technology years at which synthetic fertilizer, the motor age (highways) and the air age (airports) begin. Like the other era years, a nation reaches them when its own technology does: rich, large and well-connected nations first, others as ideas spread to them. |
-| `air_year` | Air age (technology year) (0–2100) | `1935` | Technology years at which synthetic fertilizer, the motor age (highways) and the air age (airports) begin. Like the other era years, a nation reaches them when its own technology does: rich, large and well-connected nations first, others as ideas spread to them. |
+| `fertilizer_year` | Synthetic fertilizer (earliest birth) (0–2100) | `1909` | Earliest birth years of the institutions of synthetic fertilizer, the motor age (highways) and the air age (airports). As with the other eras, a nation enters them once most of its provinces have embraced the institution, which spreads from its birthplace over land, roads, railways, ports and airports. |
+| `motor_year` | Motorisation (earliest birth) (0–2100) | `1920` | Earliest birth years of the institutions of synthetic fertilizer, the motor age (highways) and the air age (airports). As with the other eras, a nation enters them once most of its provinces have embraced the institution, which spreads from its birthplace over land, roads, railways, ports and airports. |
+| `air_year` | Aviation (earliest birth) (0–2100) | `1935` | Earliest birth years of the institutions of synthetic fertilizer, the motor age (highways) and the air age (airports). As with the other eras, a nation enters them once most of its provinces have embraced the institution, which spreads from its birthplace over land, roads, railways, ports and airports. |
 | `tech_spread` | Technology catch-up (0–0.2) | `0.02` | How much faster a nation catches up per year of technology gap to the level its wealth, size and neighbours allow (0.02: a century behind, three years of progress per year). |
 | `tech_lead_years` | Technology lead (years) (0–100) | `10.0` | How far ahead of the calendar the most advanced nation can get (years). |
 | `tax` | Tax share (0–0.5) | `0.08` | Share of output collected as taxes (pays the army, roads, railways and airports). |
@@ -220,3 +227,8 @@ Every parameter of the twelve steps, with its default and meaning. This file is 
 | `transfer_km` | Line change penalty (km) (0–2000) | `150.0` | Time lost changing trains at a junction (km of travel on foot). |
 | `fertilizer_boost` | Fertilizer boost (1–4) | `1.6` | How many more people farmland holds once a nation uses synthetic fertilizer. |
 | `road_every_years` | Years between road projects (1–100) | `10` | Years between a nation's road projects (and airport projects in the air age). |
+| `port_quality` | Harbour needed for a port (0–1) | `0.62` | Harbour quality (0–1: calm winds, deep water, shelter, a river mouth, no winter ice) a coastal province needs to become a port, and the people it needs (with its neighbours) for trade to start there. |
+| `port_people` | People for a port (0–2000000) | `80_000.0` | Harbour quality (0–1: calm winds, deep water, shelter, a river mouth, no winter ice) a coastal province needs to become a port, and the people it needs (with its neighbours) for trade to start there. |
+| `institution_spread` | Institution spread (0–5) | `1.0` | Institutions: how fast they spread from province to province (per year, at full contact), and the share of a nation's provinces that must embrace one before the nation enters its era. The era years above are the earliest years each institution can be born. |
+| `institution_share` | Share of provinces for an era (0.05–1) | `0.5` | Institutions: how fast they spread from province to province (per year, at full contact), and the share of a nation's provinces that must embrace one before the nation enters its era. The era years above are the earliest years each institution can be born. |
+| `institution_candidates` | Birthplace candidates (1–30) | `8` | How many candidate birthplaces are offered when an institution emerges. |

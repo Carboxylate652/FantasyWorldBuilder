@@ -41,7 +41,7 @@ USAGE:
                 [--strength S] [--hardness H] [--name NAME] [--run]
                                              add one override stroke (tools as in the app:
                                              province_merge, fertility_paint, band_pin, ...)
-  worldgen directive <project-dir> --stage cultures|nations --at N --action NAME [--args JSON] [--note TEXT] [--run]
+  worldgen directive <project-dir> --stage cultures|nations --at N [--month 1-12] --action NAME [--args JSON] [--note TEXT] [--run]
                                              add a directive by hand (applies before generation N or
                                              year N); `worldgen directive --list` shows the actions
   worldgen guide <project-dir> --goal TEXT [--stage nations|cultures] [--years 50] [--max-turns 60]
@@ -395,13 +395,14 @@ fn main() {
             let d = worldcore::directives::Directive {
                 stage: args.get("stage").unwrap_or_else(|| die("missing --stage")).to_string(),
                 at: args.num("at", i64::MIN).max(i64::MIN + 1),
+                month: args.num("month", 0u8),
                 action: args.get("action").unwrap_or_else(|| die("missing --action")).to_string(),
                 args: serde_json::from_str(args.get("args").unwrap_or("{}")).unwrap_or_else(|e| die(&format!("--args: {e}"))),
                 note: args.get("note").unwrap_or("").to_string(),
                 by: "user".into(),
             };
             if args.get("at").is_none() {
-                die("missing --at (generation for cultures, year for nations)");
+                die("missing --at (generation for cultures, year for nations; --month 1–12 for a month of that year)");
             }
             worldcore::directives::validate(&d).unwrap_or_else(|e| die(&e));
             w.edits.overrides.directives.push(d);

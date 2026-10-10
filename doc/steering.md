@@ -10,7 +10,7 @@ A live run is a `CultureSim` or `NationSim` held in memory by the session (`core
 | --- | --- | --- |
 | `sim_actions` | `stage` | The directive catalogue for a stage (name, description, JSON schema) |
 | `sim_start` | `stage` (`cultures` \| `nations`) | Brings earlier steps up to date, starts a live run (replaying the directives already saved) |
-| `sim_step` | `steps?`, `years?`, `to?` (`era` \| `end`) | Advances one step (a generation, or `years_per_step` years), N steps, a number of years, to the next era (the label changes) or to the end |
+| `sim_step` | `steps?`, `years?`, `months?`, `to?` (`era` \| `end`), `stop_at_choice?` | Advances one step (a generation, or the current step length), N steps, a number of years and months (the Stage 4 clock counts whole months), to the next era (the label changes) or to the end. With `stop_at_choice`, Stage 4 stops before an institution is born until its birthplace is chosen |
 | `sim_state` | — | The world summary (below) and the map fields of the current position |
 | `sim_directive` | `action`, `args`, `note?`, `by?` | Validates and queues a directive at the current position, and saves it in the `directives` override layer (undoable) |
 | `sim_commit` | — | Runs to the end and keeps the result as the step's output. If the inputs are unchanged since the start, the live result is stored; otherwise the stage is replayed from scratch with the same directives (`replayed: true`) |
@@ -18,13 +18,15 @@ A live run is a `CultureSim` or `NationSim` held in memory by the session (`core
 
 In the UI this is the panel that opens with the Cultures or Nations card: *Start step by step*, *Step*, *+N years*, *Next era*, *Play*, *To the end*, *Finish and keep*, *Restart*, *Stop*, with *World*, *Steer* and *AI guide* tabs. Undo ends a live run.
 
-**The replay guarantee.** A directive records when it was issued (a generation for cultures, a year for nations). A run applies it at the start of the step whose time span contains that moment, ordered by time and then by issue order. Because the step-by-step run and the full run are the same code, a kept live run equals a fresh run with the same directives — this is tested (`live_steps_and_directives_match_a_fresh_run`).
+**The replay guarantee.** A directive records when it was issued (a generation for cultures; a year and month for nations, whose clock counts whole months). A run applies it at the start of the step whose time span contains that moment, ordered by time and then by issue order. Because the step-by-step run and the full run are the same code, a kept live run equals a fresh run with the same directives — this is tested (`live_steps_and_directives_match_a_fresh_run`).
 
-**The world summary** (`sim_state`, also the guide's input) for Stage 4 contains: year, start and end, world era and leading nation, nations per era, population, ruled provinces, living nations (id, name, government, capital, culture, provinces, people, era, technology, treasury, income, integration, roads, railways, airports, regions), regions (population, main province, top owners), active effects, transport totals, city pins, the 20 largest cities, ruins, the last 20 events, applied directives and the queue. Stage 3's summary lists cultures, groups, settled provinces and events.
+**Choosing where institutions are born.** When the next institution's time has come, the Stage 4 summary carries `pending_institution` with its candidates. With *Ask me where institutions are born* checked (the default), the panel stops there, shows the candidates (gold stars on the map) with *Here* buttons and *Let chance decide*, and issues an `institution_birth` directive; stepping on, the institution is born there. Unchecked (and in full runs, the CLI and the guide's turns), chance picks among the candidates unless a choice was made earlier — `next_institution` in the summary lists the coming institution's candidates, so the guide can choose ahead.
+
+**The world summary** (`sim_state`, also the guide's input) for Stage 4 contains: time and step length, start and end, world era and leading nation, nations per era, institutions, the next and any pending institution with candidates, empires, tags, population, ruled provinces, living nations (id, name, government, capital, culture, provinces, people, era, technology, treasury, income, integration, roads, railways, airports, regions), regions (population, main province, top owners), active effects, transport totals, city pins, the 20 largest cities, ruins, the last 20 events, applied directives and the queue. Stage 3's summary lists cultures, groups, settled provinces and events.
 
 ## Directives
 
-Every directive has strict arguments (all listed, optional ones nullable, no extra keys). `worldgen directive --list` prints the full schemas. Places are any mix of province, state and region ids. Effects with `years` last that long from the moment they apply.
+Every directive has strict arguments (all listed, optional ones nullable, no extra keys; string choices are enumerated, and the Steer tab shows them as drop-down lists). `worldgen directive --list` prints the full schemas. Places are any mix of province, state and region ids. Effects with `years` last that long from the moment they apply.
 
 ### Stage 3 (cultures)
 
@@ -53,10 +55,15 @@ Every directive has strict arguments (all listed, optional ones nullable, no ext
 | `transfer` | places, `nation` | A treaty hands the places over |
 | `rename` | `nation`, `name` | New name |
 | `railway` | `nation`, `from`, `to` | A railway line over its own land, paid from the treasury (debt allowed); needs the nation's industrial era |
+| `port` | `nation`, `province` | A port in one of its coastal provinces (shipping era), paid from the treasury |
+| `institution_birth` | `institution` 0–5, `province`? | Where an institution is born when it emerges (null: chance among the candidates) |
+| `reform` | `nation`, `years` | Westernizing reforms: institutions spread three times as fast; costs a year's income and stability |
+| `feudal_empire` | `nation`, `on`, `name`?, places | Makes the nation a feudal empire of kings and dukes over the places (or all its land), or dissolves it |
+| `tag` | `scope` (world, state, nation), `id`?, `tag`, `on` | Sets or clears a tag (see [nations.md](nations.md#tags-and-feudal-empires)) |
 | `build_road` | `nation`, `from`, `to`, `quality` 1–3 | Builds or upgrades a road (3 = highway, motor age only), debt allowed |
 | `airport` | `nation`, `province` | An airport (air age only), paid from the treasury |
 | `subsidy` | `nation`, `years` 0.1–100 | Adds that many years of income to the treasury |
-| `tech` | `nation`, `years` −500…500 | Technology leaps ahead or falls back; the era follows |
+| `tech` | `nation`, `years` −500…500 | Technology leaps ahead or falls back; its provinces embrace the institutions it passes (born in its capital if not yet born) |
 | `pin_add` | `province`, `value` −1…1, `years`?, `label`? | A city pin: a boom town / metropolis (+) or an abandoned city (−) |
 | `pin_move` | `pin`, `province` | Moves a pin |
 | `pin_remove` | `pin` | Removes a pin |

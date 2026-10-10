@@ -21,8 +21,10 @@ The biggest gap against the proposal.
 ## 3. Deeper Stage 4
 
 - **Resources in the economy:** coal and iron raise industrial productivity and speed railways; oil matters from the motor age; cash crops and trade goods add income in colonies. The data already exists per province (`trade_good`, `resources`).
-- **Trade and ports:** ports as built infrastructure (coastal provinces, upkeep), shipping lanes between nations, trade income along roads, rails and sea lanes; canals as rare projects through narrow isthmuses.
-- **Diplomacy:** alliances and vassals (wars drag in allies), personal unions, peace treaties with province transfers; directives for each.
+- **Trade:** trade routes between nations along roads, rails and port lanes (ports exist; port levels and capacity would come with them), trade goods as income; canals as rare projects through narrow isthmuses.
+- **Diplomacy:** alliances (wars drag in allies), vassals outside feudal empires, personal unions, peace treaties with province transfers; directives for each.
+- **Feudal depth:** vassals that change liege, rebel, inherit or are elected; empires that form by themselves (a dominant nation of a culture group); counties and baronies held by their own lords; a feudal-titles editor.
+- **More institutions:** ideas without an era of their own (printing press, enlightenment, global trade) that raise productivity, stability or assimilation; random delays and events at birth.
 - **Era events for a 1949 start:** optional world-war phases (industrial great powers at war over a span of years, with devastation and border changes), decolonisation after the air age (overseas provinces of other cultures gain independence), revolutions in bankrupt or unstable nations.
 - **Technology tracks:** split technology into agriculture, industry and military so a nation can be rich but weak, or the reverse; make *Tech* directives target a track.
 - **Government types** by era, size and stability (tribe, kingdom, empire, republic, colony, protectorate), exported in `nations.csv`.

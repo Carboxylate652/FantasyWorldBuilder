@@ -38,6 +38,7 @@ pub mod stream {
     pub const COMMUNITIES: u64 = 17;
     // 18: resources (stages/resources.rs)
     pub const NATIONS: u64 = 19;
+    pub const OLD_MOUNTAINS: u64 = 20;
 }
 
 #[derive(Clone, Debug)]
