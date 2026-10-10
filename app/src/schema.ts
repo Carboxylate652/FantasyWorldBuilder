@@ -17,7 +17,7 @@ export type Param = {
 
 export type ToolId =
   | 'navigate' | 'land' | 'sea' | 'mountain' | 'erase_hint' | 'scatter_land' | 'scatter_sea' | 'scatter_mountain' | 'pin' | 'arrow' | 'plate_paint'
-  | 'raise' | 'lower' | 'smooth' | 'flatten' | 'biome_paint' | 'biome_erase'
+  | 'raise' | 'lower' | 'smooth' | 'flatten' | 'old_mountain' | 'scatter_old_mountain' | 'old_mountain_erase' | 'biome_paint' | 'biome_erase'
   | 'barrier_paint' | 'barrier_erase' | 'site_pin' | 'state_paint' | 'province_paint'
   | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase'
   | 'attraction' | 'attraction_erase'
@@ -56,6 +56,9 @@ export const TOOLS: ToolDef[] = [
   { id: 'lower', label: 'Lower', step: 'relief', value: 'metres', defaultValue: 600, hint: 'Lower elevation (override layer).' },
   { id: 'smooth', label: 'Smooth', step: 'relief', hint: 'Smooth elevation (override layer).' },
   { id: 'flatten', label: 'Flatten', step: 'relief', value: 'metres', defaultValue: 200, hint: 'Flatten toward a target elevation (override layer).' },
+  { id: 'old_mountain', label: 'Old mountains', key: 'w', step: 'relief', defaultValue: 1, hint: 'Add worn, rounded mountains from noise (not from plates): hills and old ranges like the Appalachians or the Urals. Strength sets how much.' },
+  { id: 'scatter_old_mountain', label: 'Scatter old mountains', step: 'relief', rust: 'old_mountain', scatter: true, defaultValue: 1, hint: 'Old mountains in broken, patchy clusters.' },
+  { id: 'old_mountain_erase', label: 'Flatten old mountains', step: 'relief', hint: 'Remove the old (noise) mountains under the brush. Ranges raised by plates stay.' },
   { id: 'biome_paint', label: 'Biome paint', key: 'b', step: 'biomes', value: 'terrain', defaultValue: 5, hint: 'Force a game terrain (override layer).' },
   { id: 'biome_erase', label: 'Biome erase', step: 'biomes', hint: 'Remove biome paint.' },
   { id: 'barrier_paint', label: 'Add barrier', key: 'k', step: 'habitability', value: 'barrier', defaultValue: 6, hint: 'Make land costly to cross, so state and province borders follow your stroke.' },
@@ -145,8 +148,8 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'relief', title: 'Tectonic relief', layer: 'elevation', tools: ['raise', 'lower', 'smooth', 'flatten'],
-    blurb: 'Boundaries are classified by relative plate motion; each type adds its cross-section profile.',
+    key: 'relief', title: 'Tectonic relief', layer: 'elevation', tools: ['raise', 'lower', 'smooth', 'flatten', 'old_mountain', 'scatter_old_mountain', 'old_mountain_erase'],
+    blurb: 'Boundaries are classified by relative plate motion; each type adds its cross-section profile: high, sharp ranges where plates collide. Old mountains from noise add worn, rounded clusters away from the boundaries; paint or flatten them with their own brushes.',
     params: [
       p('tectonics', 'sketch_fidelity', 'Sketch fidelity', 0, 1, 0.01, '0 = pure tectonics, 1 = the sketched coastline always wins.'),
       p('tectonics', 'mountain_scale', 'Mountain height ×', 0.1, 3, 0.05),
@@ -154,6 +157,9 @@ export const STEPS: StepUI[] = [
       p('tectonics', 'hotspots', 'Hotspots', 0, 40, 1),
       p('tectonics', 'hint_height_m', 'Mountain hint height (m)', 0, 8000, 50),
       p('tectonics', 'max_influence_km', 'Boundary influence (km)', 300, 4000, 50),
+      p('tectonics', 'old_mountains', 'Old mountains (share of land)', 0, 0.5, 0.01, 'Worn, rounded mountain clusters from noise, away from plate boundaries.'),
+      p('tectonics', 'old_mountain_height_m', 'Old mountain height (m)', 0, 4000, 50),
+      p('tectonics', 'old_mountain_size_km', 'Old mountain cluster size (km)', 100, 3000, 10),
     ],
   },
   {

@@ -215,7 +215,7 @@ async function refreshLayer() {
 function stepOfLayer(id: LayerId): string {
   const m: Record<string, string> = {
     sketch: 'Continent sketch', plates: 'Plates', crust: 'Plates', boundaries: 'Tectonic relief', elevation: 'Tectonic relief',
-    stress: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', continentality: 'Climate',
+    stress: 'Tectonic relief', old_relief: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', continentality: 'Climate',
     currents: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
     habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
     resources: 'Provinces',

@@ -21,6 +21,10 @@ pub enum Tool {
     Lower,
     Smooth,
     Flatten,
+    // Old (noise) mountains, step 4: paint adds worn mountain clusters (value
+    // = strength 0–1), erase removes them. Plate-boundary relief is untouched.
+    OldMountain,
+    OldMountainErase,
     // Biome override (step 7)
     BiomePaint,
     BiomeErase,
@@ -67,7 +71,7 @@ impl Tool {
         match self {
             Tool::Land | Tool::Sea | Tool::Mountain | Tool::EraseHint => EditLayer::Sketch,
             Tool::PlatePaint => EditLayer::Plates,
-            Tool::Raise | Tool::Lower | Tool::Smooth | Tool::Flatten => EditLayer::Elevation,
+            Tool::Raise | Tool::Lower | Tool::Smooth | Tool::Flatten | Tool::OldMountain | Tool::OldMountainErase => EditLayer::Elevation,
             Tool::BiomePaint | Tool::BiomeErase => EditLayer::Biomes,
             Tool::BarrierPaint | Tool::BarrierErase => EditLayer::Barriers,
             Tool::StatePaint | Tool::StateMerge | Tool::RenameState => EditLayer::States,

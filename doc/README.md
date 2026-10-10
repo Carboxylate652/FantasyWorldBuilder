@@ -28,7 +28,7 @@ The design document this project is built from is [`Fantasy World Maker — Prop
 | 1 · Make the planet | 1 Planet parameters | Radius, tilt, day and year length, solar constant, seed |
 | | 2 Continent sketch | Land/sea mask and mountain hints from your strokes (or an automatic sketch) |
 | | 3 Plates | Plates with crust type and motion |
-| | 4 Tectonic relief | Elevation from plate boundaries, hotspots and noise; sea-floor age; stress |
+| | 4 Tectonic relief | Elevation from plate boundaries, hotspots and noise; old mountains from noise; sea-floor age; stress |
 | | 5 Climate | Monthly temperature, precipitation and winds |
 | | 6 Hydrology and erosion | Rivers with discharge and width, lakes (fresh and salt), eroded elevation |
 | | 7 Biomes | Köppen–Geiger classes and 18 game terrains |

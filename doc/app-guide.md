@@ -23,6 +23,7 @@ Changing a parameter marks that step and the later ones as stale; *Auto-update* 
 | | Scatter land (N), Scatter sea, Scatter mountains | The same with a fractal edge (*Scatter* amount, *Grain* size): ragged coasts, fjords, offshore islands |
 | Plates | Plate pin (P), Motion arrow (A), Plate paint | Force a plate seed, set a plate's motion by dragging, reassign cells |
 | Relief | Raise (R), Lower, Smooth, Flatten | Elevation brushes (override layer); *Import heightmap* in the card |
+| | Old mountains (W), Scatter old mountains, Flatten old mountains | Add worn, rounded mountains from noise, or remove them; ranges raised by plates stay |
 | Biomes | Biome paint (B), Biome erase | Force a game terrain |
 | Habitability | Add barrier (K), Remove barrier | Make land costly to cross (borders follow), or remove barriers including border rivers |
 | | Site pin (T) | A town no model explains, with a target population |
@@ -41,7 +42,7 @@ Changing a parameter marks that step and the later ones as stale; *Auto-update* 
 
 | Group | Layers |
 | --- | --- |
-| Planet | Sketch, Plates, Crust & plate motion, Plate boundaries, Elevation, Tectonic stress, Sea-floor age |
+| Planet | Sketch, Plates, Crust & plate motion, Plate boundaries, Elevation, Tectonic stress, Old mountains (height added by noise mountains), Sea-floor age |
 | Climate | Temperature, Precipitation, Wind speed (monthly), Continentality, Coastal currents |
 | Water | Rivers & lakes, Erosion / deposition |
 | Biomes | Köppen climate, Game terrain |

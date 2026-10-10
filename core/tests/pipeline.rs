@@ -992,3 +992,50 @@ fn cities_rise_and_fall() {
     let n2 = m2["table"]["nations"].as_array().unwrap().iter().find(|n| n["id"] == nation).unwrap();
     assert_eq!(n2["capital"], target);
 }
+
+/// Old mountains come from noise, away from plate boundaries; their brushes
+/// add or remove only them, never the relief raised by plates.
+#[test]
+fn old_mountains_from_noise_and_their_brushes() {
+    let mut p = small_params(7);
+    p.planet.grid_level = 6;
+    let f32_of = |w: &mut World, name: &str| match w.field(name) {
+        Some((worldcore::fields::Field::F32(v), _, _)) => v.clone(),
+        _ => panic!("{name}"),
+    };
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Relief, &|_, _, _| {});
+    let old = f32_of(&mut w, "old_relief");
+    let elev = f32_of(&mut w, "elevation");
+    let land = elev.iter().filter(|&&e| e > 0.0).count();
+    let hilly = old.iter().filter(|&&o| o > 300.0).count();
+    assert!(hilly > land / 50 && hilly < land / 3, "old mountains on {hilly} of {land} land cells");
+    assert!(old.iter().cloned().fold(0.0, f32::max) < p.tectonics.old_mountain_height_m as f32 + 1.0, "never above their height");
+
+    // Without them, the plate relief is the same elsewhere.
+    let mut flat = World::new(WorldParams { tectonics: worldcore::params::TectonicParams { old_mountains: 0.0, ..p.tectonics.clone() }, ..p.clone() });
+    flat.run_to(Step::Relief, &|_, _, _| {});
+    let elev0 = f32_of(&mut flat, "elevation");
+    assert!(f32_of(&mut flat, "old_relief").iter().all(|&o| o == 0.0));
+    for i in 0..elev.len() {
+        assert!((elev[i] - old[i] - elev0[i]).abs() < 1.0, "cell {i}: only the old mountains differ");
+    }
+
+    // Erase the highest cluster, paint a new one on a plain.
+    let grid = w.grid();
+    let ll = |i: usize| [grid.lat[i].to_degrees(), grid.lon[i].to_degrees()];
+    let top = (0..old.len()).max_by(|&a, &b| old[a].total_cmp(&old[b])).unwrap();
+    let stress = f32_of(&mut w, "stress");
+    let plain = (0..old.len()).filter(|&i| elev[i] > 50.0 && old[i] == 0.0 && stress[i] < 0.05).max_by_key(|&i| (grid.lat[i].abs() < 1.0) as u8).expect("a plain");
+    w.edits.add_stroke(Stroke { tool: Tool::OldMountainErase, radius_km: 400.0, strength: 1.0, hardness: 0.9, points: vec![ll(top)], ..Default::default() });
+    w.edits.add_stroke(Stroke { tool: Tool::OldMountain, value: 1.0, radius_km: 500.0, strength: 1.0, hardness: 0.9, points: vec![ll(plain)], ..Default::default() });
+    assert!(!w.is_fresh(Step::Relief));
+    w.run_to(Step::Relief, &|_, _, _| {});
+    let old2 = f32_of(&mut w, "old_relief");
+    let elev2 = f32_of(&mut w, "elevation");
+    assert!(old2[top] < 1.0, "erased: {}", old2[top]);
+    assert!((elev2[top] - elev0[top]).abs() < 1.0, "only the old mountains go");
+    let painted = grid.neighbors(plain).iter().map(|&j| old2[j as usize]).fold(old2[plain], f32::max);
+    assert!(painted > 150.0, "painted old mountains: {painted} m");
+    assert_eq!(f32_of(&mut w, "stress"), stress, "plate stress untouched");
+}

@@ -74,3 +74,8 @@ What was built (details in [nations.md](nations.md)):
 - **UI:** the birthplace panel with gold-starred candidates, *Ask me where institutions are born*, drop-down choices in the Steer form, the Transport layer (road fill, rail stripes, icons), the Institutions and Realms layers, step length and fractional years in the panel.
 - **Outputs:** `port`, `institutions`, `institution`, `realm`, `imperial` fields; `ports.csv`, `institutions.csv`, `titles.csv`; new columns in `nations.csv` and `province_nations.csv`; ports in `transport.png`.
 - **Tests:** the live-replay test covers tags, an empire, a birthplace choice and a directive dated to a month; a new test chooses a birthplace through the live API and checks ports, births and the step schedule.
+
+## 14. Old mountains (unreleased)
+Requested: small and minor mountain clusters from noise beside the high plate-boundary ranges (sharp and high from plates, old and blunt from noise), with brushes to add and remove only the noise mountains.
+
+What was built: an `old_mountains` pass in `stages/tectonics.rs` (low-frequency cluster noise thresholded to a share of continental land, rounded massifs with incised valleys, fading near young ranges and the coast) added on top of the plate relief and stored as `old_relief`; the `old_mountain` and `old_mountain_erase` tools (elevation override layer) and their UI brushes; the *Old mountains* layer; a test that old mountains are the only difference from a world without them and that the brushes paint and erase them while plate stress stays the same. A first try with a four-octave cluster mask gave scattered pimples; two octaves at 700 km give coherent clusters.

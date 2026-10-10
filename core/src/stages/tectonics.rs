@@ -3,7 +3,9 @@
 //! profile by distance from the boundary. Ocean floor deepens with age away
 //! from ridges, hotspots leave volcano chains, ridged noise scaled by tectonic
 //! stress adds detail, and the sketch-fidelity slider pulls the coastline back
-//! to the sketch. Elevation override strokes are applied last.
+//! to the sketch. Old mountains from noise add worn, rounded clusters away
+//! from the boundaries (painted or erased with their own brushes). Elevation
+//! override strokes are applied last.
 
 use super::plates::{plates_from_meta, PlateInfo};
 use super::{Ctx, StepOutput};
@@ -227,6 +229,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     }
 
     // ---- 4. Elevation.
+    ctx.progress(0.5, "Raising old mountains");
+    let old = old_mountains(ctx, land, crust, &d_sea);
     ctx.progress(0.55, "Raising mountains");
     let noise = Noise::new(pp.seed, stream::RELIEF_NOISE);
     let ms = tp.mountain_scale;
@@ -235,7 +239,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let f_hill = r_km / 700.0;
     let f_fine = r_km / 90.0;
     let fid = tp.sketch_fidelity.clamp(0.0, 1.0);
-    let (mut elev, rest): (Vec<f32>, Vec<(f32, f32)>) = (0..n)
+    let (mut elev, rest): (Vec<f32>, Vec<(f32, f32, f32)>) = (0..n)
         .into_par_iter()
         .map(|i| {
             let p = g.pos[i];
@@ -272,7 +276,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
 
             // Boundary profiles. Only major plates carry Tibet-style plateaus.
             let plateau = if plates[plate[i] as usize].major { 1.0 } else { 0.0 };
-            let mut uplift = 0.0;
+            let mut uplift = 0.0f64;
             // Rift flanks do not count as tectonic stress (no ridged detail on them).
             let mut add = |c: Ch, stress: bool, f: &dyn Fn(f64, f64) -> f64| {
                 let (d, it) = ch(c);
@@ -325,10 +329,20 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 let target = -25.0 - 60.0 * jitter;
                 e += fid * (target - e);
             }
-            (e as f32, (stress as f32, age as f32))
+            // Old mountains on top of the plate relief, fading where young
+            // ranges already stand (and only on land, after the sketch pull).
+            let old_e = if land[i] == 1 && e > 0.0 { (old[i] as f64 * (1.0 - smoothstep(500.0, 3000.0, uplift))) as f32 } else { 0.0 };
+            ((e as f32) + old_e, (stress as f32, age as f32, old_e))
         })
         .unzip();
-    let (stress, age): (Vec<f32>, Vec<f32>) = rest.into_iter().unzip();
+    let mut stress = Vec::with_capacity(n);
+    let mut age = Vec::with_capacity(n);
+    let mut old_relief = Vec::with_capacity(n);
+    for (s, a, o) in rest {
+        stress.push(s);
+        age.push(a);
+        old_relief.push(o);
+    }
 
     // ---- 5. Imported heightmap replaces (or blends into) the tectonic relief.
     let mut import_status = serde_json::Value::Null;
@@ -361,6 +375,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     f.put("boundary", Field::U8(boundary));
     f.put("stress", Field::F32(stress));
     f.put("ocean_age", Field::F32(age));
+    let old_km2 = old_relief.iter().filter(|&&o| o > 300.0).count() as f64 * 4.0 * std::f64::consts::PI * r_km * r_km / n as f64;
+    f.put("old_relief", Field::F32(old_relief));
     StepOutput {
         fields: f,
         meta: serde_json::json!({
@@ -374,11 +390,79 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 "transform": boundary_len[6],
             },
             "land_cells": land_now,
+            "old_mountains_km2": old_km2.round(),
             "max_elevation_m": max_e,
             "min_elevation_m": min_e,
             "import": import_status,
         }),
     }
+}
+
+/// Old mountains from noise (metres per cell): clusters where low-frequency
+/// noise is highest, covering `old_mountains` of the continental land, plus
+/// the painted ones, minus the erased ones. Their summits are rounded and
+/// their valleys cut (inverted ridged noise): long eroded, unlike the sharp
+/// crests of young ranges.
+fn old_mountains(ctx: &Ctx, land: &[u8], crust: &[u8], d_sea: &[f64]) -> Vec<f32> {
+    let g = ctx.grid;
+    let n = g.len();
+    let tp = &ctx.params.tectonics;
+    let r_km = ctx.params.planet.radius_km;
+    let noise = Noise::new(ctx.params.planet.seed, stream::OLD_MOUNTAINS);
+    let f_cluster = r_km / tp.old_mountain_size_km.max(50.0);
+    let cluster: Vec<f32> = (0..n).into_par_iter().map(|i| noise.fbm(g.pos[i], f_cluster, 2) as f32).collect();
+    // The threshold that covers the requested share of continental land.
+    let mut on_land: Vec<f32> = (0..n).filter(|&i| land[i] == 1 && crust[i] == 1).map(|i| cluster[i]).collect();
+    let share = tp.old_mountains.clamp(0.0, 1.0);
+    let mut mask = vec![0.0f32; n];
+    if share > 0.0 && !on_land.is_empty() {
+        on_land.sort_by(|a, b| b.total_cmp(a));
+        let t = on_land[((share * on_land.len() as f64) as usize).min(on_land.len() - 1)];
+        for i in 0..n {
+            if land[i] == 1 && crust[i] == 1 {
+                mask[i] = smoothstep(t as f64 - 0.04, t as f64 + 0.12, cluster[i] as f64) as f32;
+            }
+        }
+    }
+    // Brushes: paint adds old mountains (strength 0–1), erase removes them.
+    let mut scratch = Vec::new();
+    for s in &ctx.edits.overrides.elevation {
+        match s.tool {
+            Tool::OldMountain => {
+                let v = s.value.clamp(0.0, 1.0) as f32;
+                for (c, w) in stroke_coverage(g, s, r_km, &mut scratch) {
+                    let m = &mut mask[c as usize];
+                    *m += w * (v - *m).max(0.0);
+                }
+            }
+            Tool::OldMountainErase => {
+                for (c, w) in stroke_coverage(g, s, r_km, &mut scratch) {
+                    mask[c as usize] *= 1.0 - w;
+                }
+            }
+            _ => {}
+        }
+    }
+    let f_body = r_km / 160.0;
+    let f_cut = r_km / 70.0;
+    let f_var = r_km / 900.0;
+    (0..n)
+        .into_par_iter()
+        .map(|i| {
+            if mask[i] <= 0.0 || land[i] == 0 {
+                return 0.0;
+            }
+            let p = g.pos[i];
+            // Rounded massifs with incised valleys, heights varying between clusters.
+            let body = 0.5 + 0.5 * noise.fbm(p + Vec3::new(3.3, 7.1, 1.9), f_body, 4);
+            let cut = 1.0 - noise.ridged(p + Vec3::new(5.2, 0.7, 8.4), f_cut, 4);
+            let var = 0.65 + 0.35 * noise.fbm(p + Vec3::new(9.9, 4.4, 2.2), f_var, 2);
+            let shape = (0.65 * body + 0.35 * cut).clamp(0.0, 1.0);
+            // Worn down toward the coast, never cliffs at the shore.
+            let coast = smoothstep(0.0, 80.0, if d_sea[i].is_finite() { d_sea[i] } else { 3000.0 });
+            (tp.old_mountain_height_m.max(0.0) * mask[i] as f64 * shape.powf(1.2) * var * (0.4 + 0.6 * coast)) as f32
+        })
+        .collect()
 }
 
 fn apply_elevation_overrides(ctx: &Ctx, elev: &mut [f32]) {

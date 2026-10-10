@@ -97,6 +97,13 @@ pub struct TectonicParams {
     /// Strength of "mountains here" hint strokes (metres at full brush).
     pub hint_height_m: f64,
     pub max_influence_km: f64,
+    /// Old mountains from noise, away from plate boundaries: worn, rounded
+    /// clusters (Appalachians, Urals, Scottish Highlands) rather than the
+    /// high, sharp ranges of colliding plates. Share of continental land
+    /// they cover, their peak height, and the size of a cluster.
+    pub old_mountains: f64,
+    pub old_mountain_height_m: f64,
+    pub old_mountain_size_km: f64,
 }
 
 impl Default for TectonicParams {
@@ -108,6 +115,9 @@ impl Default for TectonicParams {
             hotspots: 8,
             hint_height_m: 3200.0,
             max_influence_km: 1600.0,
+            old_mountains: 0.1,
+            old_mountain_height_m: 1500.0,
+            old_mountain_size_km: 700.0,
         }
     }
 }

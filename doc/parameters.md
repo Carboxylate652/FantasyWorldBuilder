@@ -47,6 +47,9 @@ Every parameter of the twelve steps, with its default and meaning. This file is 
 | `hotspots` | Hotspots (0–40) | `8` | — |
 | `hint_height_m` | Mountain hint height (m) (0–8000) | `3200.0` | Strength of "mountains here" hint strokes (metres at full brush). |
 | `max_influence_km` | Boundary influence (km) (300–4000) | `1600.0` | — |
+| `old_mountains` | Old mountains (share of land) (0–0.5) | `0.1` | Old mountains from noise, away from plate boundaries: worn, rounded clusters (Appalachians, Urals, Scottish Highlands) rather than the high, sharp ranges of colliding plates. Share of continental land they cover, their peak height, and the size of a cluster. |
+| `old_mountain_height_m` | Old mountain height (m) (0–4000) | `1500.0` | Old mountains from noise, away from plate boundaries: worn, rounded clusters (Appalachians, Urals, Scottish Highlands) rather than the high, sharp ranges of colliding plates. Share of continental land they cover, their peak height, and the size of a cluster. |
+| `old_mountain_size_km` | Old mountain cluster size (km) (100–3000) | `700.0` | Old mountains from noise, away from plate boundaries: worn, rounded clusters (Appalachians, Urals, Scottish Highlands) rather than the high, sharp ranges of colliding plates. Share of continental land they cover, their peak height, and the size of a cluster. |
 
 ## Climate (step 5)
 
