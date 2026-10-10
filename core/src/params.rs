@@ -484,8 +484,14 @@ pub struct NationParams {
     /// second great war's era, early in the cold war's; 1910–1920 for a
     /// pre-war start).
     pub start_date: i32,
-    /// Years per simulation step.
-    pub years_per_step: u32,
+    /// Years per simulation step at first; steps get shorter toward the
+    /// present (`step_year_1`/`years_per_step_1`, then `_2`), so recent
+    /// centuries are simulated in finer detail.
+    pub years_per_step: f64,
+    pub step_year_1: i32,
+    pub years_per_step_1: f64,
+    pub step_year_2: i32,
+    pub years_per_step_2: f64,
     /// People a province needs before a polity can form there.
     pub found_population: f64,
     /// Chance per step that a province with that many people and no ruler
@@ -506,9 +512,10 @@ pub struct NationParams {
     /// Population growth per year before and during the industrial era.
     pub growth: f64,
     pub industrial_growth: f64,
-    /// Era technology years: gunpowder states, ocean shipping (overseas
-    /// colonies), industry (railways, faster growth). Each nation enters an
-    /// era when its own technology reaches the year, not the calendar.
+    /// Era years: gunpowder states, ocean shipping (ports, overseas
+    /// colonies), industry (railways, faster growth). Each is the earliest
+    /// year the era's institution can be born; a nation enters the era when
+    /// most of its provinces have embraced the institution.
     pub gunpowder_year: i32,
     pub shipping_year: i32,
     pub industrial_year: i32,
@@ -533,10 +540,11 @@ pub struct NationParams {
     /// Share of a nation's people that move each year toward its attractive
     /// provinces (capitals, stations, city pins), more from devastated land.
     pub migration: f64,
-    /// Technology years at which synthetic fertilizer, the motor age
-    /// (highways) and the air age (airports) begin. Like the other era years,
-    /// a nation reaches them when its own technology does: rich, large and
-    /// well-connected nations first, others as ideas spread to them.
+    /// Earliest birth years of the institutions of synthetic fertilizer, the
+    /// motor age (highways) and the air age (airports). As with the other
+    /// eras, a nation enters them once most of its provinces have embraced
+    /// the institution, which spreads from its birthplace over land, roads,
+    /// railways, ports and airports.
     pub fertilizer_year: i32,
     pub motor_year: i32,
     pub air_year: i32,
@@ -557,6 +565,19 @@ pub struct NationParams {
     pub fertilizer_boost: f64,
     /// Years between a nation's road projects (and airport projects in the air age).
     pub road_every_years: u32,
+    /// Harbour quality (0–1: calm winds, deep water, shelter, a river mouth,
+    /// no winter ice) a coastal province needs to become a port, and the
+    /// people it needs (with its neighbours) for trade to start there.
+    pub port_quality: f64,
+    pub port_people: f64,
+    /// Institutions: how fast they spread from province to province (per
+    /// year, at full contact), and the share of a nation's provinces that
+    /// must embrace one before the nation enters its era. The era years
+    /// above are the earliest years each institution can be born.
+    pub institution_spread: f64,
+    pub institution_share: f64,
+    /// How many candidate birthplaces are offered when an institution emerges.
+    pub institution_candidates: u32,
 }
 
 impl Default for NationParams {
@@ -564,7 +585,11 @@ impl Default for NationParams {
         NationParams {
             start_year: 800,
             start_date: 1949,
-            years_per_step: 2,
+            years_per_step: 2.0,
+            step_year_1: 1400,
+            years_per_step_1: 1.0,
+            step_year_2: 1800,
+            years_per_step_2: 0.5,
             found_population: 60_000.0,
             found_rate: 0.0015,
             expansion_rate: 0.8,
@@ -599,6 +624,11 @@ impl Default for NationParams {
             transfer_km: 150.0,
             fertilizer_boost: 1.6,
             road_every_years: 10,
+            port_quality: 0.62,
+            port_people: 80_000.0,
+            institution_spread: 1.0,
+            institution_share: 0.5,
+            institution_candidates: 8,
         }
     }
 }

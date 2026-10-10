@@ -129,10 +129,10 @@ impl Live {
     }
 
     /// Where the run stands: the next generation (Stage 3) or year (Stage 4).
-    pub fn position(&self) -> i64 {
+    pub fn position(&self) -> f64 {
         match &self.sim {
-            LiveSim::Cultures(c) => c.t as i64,
-            LiveSim::Nations(n) => n.year as i64,
+            LiveSim::Cultures(c) => c.t as f64,
+            LiveSim::Nations(n) => n.time(),
         }
     }
 
@@ -169,8 +169,8 @@ impl Live {
 
     fn info(&self) -> Value {
         let (pos, end, unit) = match &self.sim {
-            LiveSim::Cultures(c) => (c.t as i64, c.ticks() as i64, "generation"),
-            LiveSim::Nations(n) => (n.year as i64, n.end_year() as i64, "year"),
+            LiveSim::Cultures(c) => (c.t as f64, c.ticks() as f64, "generation"),
+            LiveSim::Nations(n) => (n.time(), n.end_year() as f64, "year"),
         };
         json!({ "stage": self.stage(), "position": pos, "end": end, "unit": unit, "done": self.done() })
     }
@@ -752,18 +752,25 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             sim_state(s)
         }
         "sim_step" => {
-            // { steps?, years?, to?: "era" | "end" } — one step (a generation or
-            // years_per_step years) by default.
+            // { steps?, years?, to?: "era" | "end", stop_at_choice? } — one
+            // step (a generation, or the current step length in years) by
+            // default. With stop_at_choice, Stage 4 stops before an
+            // institution is born so the user can choose its birthplace.
             let live = s.live.as_mut().ok_or("no live simulation; start one first")?;
             let years: Option<f64> = arg(&args, "years")?;
             let to: Option<String> = arg(&args, "to")?;
-            let per_step = match &live.sim {
-                LiveSim::Cultures(c) => c.years_per_tick(),
-                LiveSim::Nations(n) => n.years_per_step() as f64,
-            };
+            let stop_at_choice = arg::<Option<bool>>(&args, "stop_at_choice")?.unwrap_or(false);
             let mut steps: u64 = arg::<Option<u64>>(&args, "steps")?.unwrap_or(1);
+            // Stage 4 steps vary in length: step until the time is reached.
+            let mut target: Option<f64> = None;
             if let Some(y) = years {
-                steps = (y / per_step.max(1e-9)).ceil().max(1.0) as u64;
+                match &live.sim {
+                    LiveSim::Cultures(c) => steps = (y / c.years_per_tick().max(1e-9)).ceil().max(1.0) as u64,
+                    LiveSim::Nations(n) => {
+                        target = Some(n.time() + y);
+                        steps = u64::MAX;
+                    }
+                }
             }
             set_progress(progress, |p| *p = ProgressState { running: true, task: "sim".into(), step: live.stage().into(), ..Default::default() });
             let era0 = live.era();
@@ -771,11 +778,15 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             let pr = progress.clone();
             let report = move |_f: f32, m: &str| set_progress(&pr, |p| p.msg = m.to_string());
             while !live.done() {
+                if stop_at_choice && matches!(&live.sim, LiveSim::Nations(n) if n.pending_institution().is_some()) {
+                    break;
+                }
                 match to.as_deref() {
                     Some("end") => {}
                     Some("era") if live.era() != era0 => break,
                     Some("era") => {}
                     _ if k >= steps => break,
+                    _ if target.is_some_and(|t| live.position() + 1e-9 >= t) => break,
                     _ => {}
                 }
                 live.step_once(&report);
@@ -784,7 +795,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                     let pos = live.position();
                     set_progress(progress, |p| {
                         p.frac = 0.0;
-                        p.msg = format!("{} {}", if live_unit_is_year(&live.sim) { "Year" } else { "Generation" }, pos);
+                        p.msg = format!("{} {}", if live_unit_is_year(&live.sim) { "Year" } else { "Generation" }, (pos * 10.0).round() / 10.0);
                     });
                 }
             }

@@ -11,7 +11,7 @@ Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.
 | **M2 Climate, hydrology, biomes** | Implemented | The acceptance check ("Earth's real elevation in, Köppen map broadly matches") needs an Earth heightmap, which is not shipped; import one with `worldgen import-heightmap … --encoding linear --min -11000 --max 8500` and compare `biomes.png` |
 | **M3 States, provinces, export/import** | Implemented | Habitability and barriers, states/regions/continents, provinces with wasteland, lakes and sea zones, the neutral CK3/Vic3-style package, re-import with validation (round trip tested) |
 | **M4 Culture simulation** | Implemented, one item open | Cultures, groups, family tree, names, springs, site pins, resources and trade goods, era-gated caravan/mining/irrigation towns; 5,000 bands × 400 generations in ~10 s; desert towns on seeds 1–3. Open: saving the band state so Stage 4 continues the same agents |
-| **M5 Nations and history** | Implemented, one check open | Formation, expansion, war, colonies, exclaves, breakups, assimilation, per-nation technology and eras to the air age, treasuries, roads, railway lines with junctions, airports, fertilizer, cities rising and falling, city pins; step-by-step runs with directives and the AI guide; exact replay (tested). Open: "re-running Stage 4 never changes a locked culture" waits for culture locks |
+| **M5 Nations and history** | Implemented, one check open | Formation, expansion, war, colonies, exclaves, breakups, assimilation, per-nation technology, institutions (chosen or random birthplaces, spread over land, roads, railways, ports and airports) gating eras to the air age, reforms, treasuries, roads, railway lines with junctions, ports, airports, fertilizer, tags, feudal empires, cities rising and falling, city pins, time steps shortening toward the present; step-by-step runs with directives and the AI guide; exact replay (tested). Open: "re-running Stage 4 never changes a locked culture" waits for culture locks |
 | **M6 World editor and polish** | Started | Map editor (merge provinces/states, province → state, grow, rename, goods paint), fertility, founding-band and attraction paint, stage buttons, undo/redo. See below for what is missing |
 
 ## Not implemented
@@ -20,17 +20,19 @@ Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.
 - **Provinces:** split by a line; mark as wasteland / lake / sea zone.
 - **States and regions:** split, regroup states into regions and continents, recolour.
 - **Cultures:** merge, split (automatic or by line/lasso/pick), paint, re-parent in the family tree, rename or regenerate names, **lock**.
-- **Nations:** paint ownership, merge, release a nation, recolour, lock. (Founding, unions, treaties, renames and capital moves exist as directives in a live run.)
+- **Nations:** paint ownership, merge, release a nation, recolour, lock. (Founding, unions, treaties, renames, capital moves, feudal empires and tags exist as directives in a live run.)
 - **Railways:** add/move/delete stations, draw/reroute/delete lines, set opening years, lock lines. (A `railway` directive builds a line in a live run.) Roads and airports have no editor either (directives only).
 - **Continue sim** from an edited state, and an inspector panel for the hovered province.
 
 ### Simulation
 - Stage 3 band state is not carried into Stage 4; nations work on province populations and culture shares.
 - **Religions** (suggested addition) are not modelled.
-- **Resources and trade goods do not affect Stage 4** — the economy uses people, integration and technology only; coal, iron and oil play no role in industry or the motor age, and there is no trade.
-- **Diplomacy** is minimal: no alliances, vassals, personal unions or trade agreements; wars are per-province attempts weighted by strength. There are no explicit world wars, revolutions or decolonisation, although the default start date is 1949.
+- **Resources and trade goods barely affect Stage 4** — coal, iron and oil only favour institutions' birthplaces; the economy uses people, integration, technology and port trade, and there are no trade routes between nations.
+- **Diplomacy** is minimal: no alliances, personal unions or trade agreements (feudal vassals exist only inside feudal empires); wars are per-province attempts weighted by strength. There are no explicit world wars, revolutions or decolonisation, although the default start date is 1949.
+- **Institutions are one per era** (no printing press, enlightenment or other institutions without an era), are born as soon as their earliest year comes (no random delay), and spread by contact only (no events).
 - Technology is a single number per nation (no separate military, industrial or agricultural tracks). Government type is only by size (city-state, kingdom, empire).
-- Transport is per province: a road or station "in a province" is not a path inside it; there are no ports or shipping lanes as built infrastructure (sea lanes are implicit), no canals, no tunnels, no trams or metro.
+- Transport is per province: a road, station or port "in a province" is not a place inside it; ports have no levels or capacity, there are no canals, tunnels, trams or metro.
+- **Feudal empires** are made only by directive, and their titles below dukes (counties, baronies) are names only; vassals cannot change liege, rebel or be inherited.
 - No migration between nations (refugees, colonists of other cultures).
 - A time-stepped plate-drift mode (supercontinent break-up) is not implemented; the tectonic model is static.
 
@@ -45,7 +47,7 @@ Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.
 - **Plates** move randomly unless pinned with arrows, so some seeds have few collision ranges.
 - **Grid level 7** gives fertile provinces only a few cells; use level 8 (default) or 9 for province maps.
 - **Export** takes about 28 s and ~800 MB peak at 8192 × 4096 with the province clean-up; a handful of island provinces stay in several pieces (cut by a channel in the heightmap).
-- **Stage 4 takes ~3 s** (was 0.3 s before access, roads and rails were added); one step in a live run is a few milliseconds.
+- **Stage 4 takes ~5 s** on the default world (about 1,000 steps with the finer steps after 1400 and 1800, and institutions spreading); one step in a live run is a few milliseconds.
 - **Stage 4 economy and technology constants are judgement calls** (see [nations.md](nations.md#tuning-notes)), tuned on one world (seed 3, level 6); other worlds may need different *Tax share*, cost or technology settings.
 - **Changing the Stage 4 model changes histories:** the same seed gives a different history after this update.
 
@@ -57,4 +59,4 @@ Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.
 
 ## Releases
 
-The Stage 4 work (`6a48fc2`, `47d346d`, `a63f795`) and this documentation were merged into `main` by PR #6 and released as 0.2.0-beta.1.
+The Stage 4 work (`6a48fc2`, `47d346d`, `a63f795`) and this documentation were merged into `main` by PR #6 and released as 0.2.0-beta.1; 0.2.0-beta.2 added core performance and persistence work. Institutions, ports, tags, feudal empires and the step schedule are unreleased.

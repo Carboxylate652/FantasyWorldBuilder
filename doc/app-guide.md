@@ -8,8 +8,8 @@ The desktop app (Tauri) and the browser UI (`worldgen serve --static app/dist`, 
 - **Second row:** overlays — Rivers, Borders, Wind, Plate motion, Pins — and globe relief exaggeration.
 - **Left panel:** the twelve step cards in four stages. Each card has its parameters, a *Run to step N* button and a status (done, stale, not run) with its run time. Opening a card switches to its map layer and its tools.
 - **Tool box** (over the map): the open step's tools, the brush size and the tool's value.
-- **Step-by-step panel** (over the map, Cultures and Nations cards): see [steering.md](steering.md).
-- **Status line** (bottom): what is under the cursor — position, elevation, plate, climate, biome, province, state, region, continent (with ids), culture, nation, railway, road, airport, era.
+- **Step-by-step panel** (over the map, Cultures and Nations cards): see [steering.md](steering.md). In Stage 4 it shows the current time and step length, stops before an institution is born to let you pick its birthplace among the gold-starred candidates (or *Let chance decide*; uncheck *Ask me where institutions are born* to let chance always decide), and lists institutions, empires and tags in the World tab.
+- **Status line** (bottom): what is under the cursor — position, elevation, plate, climate, biome, province, state, region, continent (with ids), culture, nation, railway, road, port or good harbour, airport, era, embraced institutions, and the realm and imperial territory of feudal empires.
 
 Changing a parameter marks that step and the later ones as stale; *Auto-update* re-runs the edited step after each stroke.
 
@@ -47,7 +47,7 @@ Changing a parameter marks that step and the later ones as stale; *Auto-update* 
 | Biomes | Köppen climate, Game terrain |
 | Political | Habitability, Groundwater & springs, Barriers, States, Regions & continents, Provinces, Trade goods |
 | Cultures | Cultures, Culture groups, Attraction, Population density |
-| Nations | Nations, Railways (track, station, junction), Roads, rail & air (best road, railway, airport per province), Eras (each nation's era), City growth (Stage 4 attraction) |
+| Nations | Nations, Railways (track, station, junction), Transport (roads fill each province by quality, railways are grey stripes over them, and stations ■, junctions ◆, ports ⚓ and airports ✈ are icons over the map; good harbours without a port are tinted), Eras (each nation's era), Institutions (institutions embraced, the newest one spreading), Realms & empires (feudal empires in their emperor's colour, imperial territory tinted, borders between realms), City growth (Stage 4 attraction) |
 
 ## Overrides panel
 

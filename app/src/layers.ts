@@ -148,7 +148,7 @@ export type LayerId =
   | 'sketch' | 'plates' | 'crust' | 'boundaries' | 'elevation' | 'temperature' | 'precipitation'
   | 'continentality' | 'currents' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress'
   | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population' | 'attraction'
-  | 'nations' | 'railways' | 'transport' | 'eras' | 'city_growth';
+  | 'nations' | 'railways' | 'transport' | 'eras' | 'institutions' | 'realms' | 'city_growth';
 
 export type LayerDef = {
   id: LayerId;
@@ -189,13 +189,17 @@ export const LAYERS: LayerDef[] = [
   { id: 'population', label: 'Population density', fields: ['population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'nations', label: 'Nations', fields: ['owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
   { id: 'railways', label: 'Railways', fields: ['railway', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
-  { id: 'transport', label: 'Roads, rail & air', fields: ['road', 'railway', 'airport', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'transport', label: 'Transport', fields: ['road', 'railway', 'port', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
   { id: 'eras', label: 'Eras', fields: ['nation_era', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'institutions', label: 'Institutions', fields: ['institutions', 'institution', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'realms', label: 'Realms & empires', fields: ['realm', 'imperial', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
   { id: 'city_growth', label: 'City growth', fields: ['nation_attraction', 'nation_population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
 ];
 
 /** Stage 4 eras (core/src/stages/nations.rs ERA_NAMES), early to late. */
 export const ERA_NAMES = ['Early', 'Gunpowder', 'Ocean shipping', 'Industry', 'Fertilizer', 'Motor age', 'Air age'];
+/** Stage 4 institutions (core/src/stages/nations/institutions.rs), one per era after the first. */
+export const INSTITUTION_NAMES = ['Gunpowder', 'Navigation', 'Industrialisation', 'Synthetic fertilizer', 'Motorisation', 'Aviation'];
 const ERA_COLORS: RGB[] = [[120, 95, 70], [160, 120, 70], [70, 120, 160], [175, 60, 45], [90, 160, 70], [230, 150, 30], [190, 60, 170]];
 
 /** Same colours as states.png (core/src/export.rs state_color). */
@@ -526,27 +530,73 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       break;
     }
     case 'transport': {
-      const ow = f['owner'], rd = f['road'], rw = f['railway'], ap = f['airport'], pk = f['province_kind'];
+      // Roads fill the province by quality; railways are grey stripes over
+      // them; stations, junctions, ports and airports are icons over the map
+      // (drawn as an overlay).
+      const ow = f['owner'], rd = f['road'], rw = f['railway'], pt = f['port'], pk = f['province_kind'];
+      const pos = g.pos;
+      // Stripes about three cells apart, whatever the grid resolution.
+      const period = 3 * Math.sqrt(41253 / n);
       for (let i = 0; i < n; i++) {
         const k = pk ? pk[i] : isSea(i) ? 3 : 0;
         if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
         const o = ow ? ow[i] : 0;
         let c: RGB = mix(o ? nationColor(o) : [150, 146, 138], [205, 200, 190], 0.75);
         const q = rd ? rd[i] : 0;
-        if (q === 3) c = [235, 130, 20];
-        else if (q === 2) c = mix(c, [125, 85, 50], 0.75);
-        else if (q === 1) c = mix(c, [175, 150, 115], 0.6);
-        const r = rw ? rw[i] : 0;
-        if (r === 3) c = [30, 90, 220];
-        else if (r === 2) c = [200, 30, 30];
-        else if (r === 1) c = mix(c, [35, 35, 35], 0.55);
-        if (ap && ap[i]) c = [140, 40, 170];
+        if (q === 3) c = [235, 140, 30];
+        else if (q === 2) c = [130, 90, 55];
+        else if (q === 1) c = mix(c, [180, 150, 110], 0.7);
+        if (pt && pt[i] === 1) c = mix(c, [90, 150, 200], 0.25);
+        if (rw && rw[i] > 0) {
+          // Diagonal stripes in geographic coordinates.
+          const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+          const lat = Math.asin(Math.max(-1, Math.min(1, z))) * 57.2958, lon = Math.atan2(y, x) * 57.2958;
+          if (((Math.floor((lat + lon) / (period / 2)) % 2) + 2) % 2 === 0) c = [95, 95, 100];
+        }
         put(i, c, 0.88 + 0.12 * sh(i));
       }
-      legend = { title: 'Roads, railways & airports (best in each province)', items: [
-        { color: [175, 150, 115], label: 'Track' }, { color: [125, 85, 50], label: 'Paved road' }, { color: [235, 130, 20], label: 'Highway (motor age)' },
-        { color: [60, 60, 60], label: 'Railway' }, { color: [200, 30, 30], label: 'Station' }, { color: [30, 90, 220], label: 'Junction' }, { color: [140, 40, 170], label: 'Airport (air age)' },
+      legend = { title: 'Transport: roads fill, railways striped, icons for stations, ports and airports', items: [
+        { color: [180, 150, 110], label: 'Track' }, { color: [130, 90, 55], label: 'Paved road' }, { color: [235, 140, 30], label: 'Highway (motor age)' },
+        { color: [95, 95, 100], label: 'Railway (stripes)' }, { color: [200, 30, 30], label: '■ Station' }, { color: [30, 90, 220], label: '◆ Junction' },
+        { color: [20, 90, 170], label: '⚓ Port' }, { color: [140, 40, 170], label: '✈ Airport' }, { color: [150, 185, 205], label: 'Good harbour, no port yet' },
       ] };
+      break;
+    }
+    case 'institutions': {
+      // Institutions embraced in order (each era's idea), with the newest
+      // born institution's presence brightening the frontier.
+      const im = f['institutions'], pr = f['institution'], pk = f['province_kind'];
+      let newest = 0;
+      if (im) for (let i = 0; i < n; i++) newest = Math.max(newest, im[i]);
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const m = im ? im[i] : 0;
+        let cnt = 0;
+        while (cnt < 6 && (m >> cnt) & 1) cnt++;
+        let c: RGB = cnt ? ERA_COLORS[cnt] : [150, 146, 138];
+        const p = pr ? pr[i] : 0;
+        if (p > 0.05 && p < 0.9) c = mix(c, [255, 240, 150], 0.25 + 0.5 * p);
+        put(i, c, 0.88 + 0.12 * sh(i));
+      }
+      legend = { title: 'Institutions embraced (each opens an era); light: the newest spreading', items: [
+        ...INSTITUTION_NAMES.map((name, k) => ({ color: ERA_COLORS[k + 1], label: name })), { color: [255, 240, 150] as RGB, label: 'Newest, spreading' }, { color: [150, 146, 138] as RGB, label: 'None yet' },
+      ] };
+      break;
+    }
+    case 'realms': {
+      // Feudal realms: every member of an empire takes its emperor's colour;
+      // imperial territory is brighter, land outside it darker.
+      const rl = f['realm'], imp = f['imperial'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const r = rl ? rl[i] : 0;
+        let c: RGB = r ? nationColor(r) : [150, 146, 138];
+        if (imp && imp[i]) c = mix(c, [255, 235, 160], 0.2);
+        put(i, c, 0.88 + 0.12 * sh(i));
+      }
+      legend = { title: 'Realms (feudal empires take the emperor\'s colour)', items: [{ color: [255, 235, 160], label: 'Tint: imperial territory' }, { color: [20, 20, 20], label: 'Border between realms' }, { color: [150, 146, 138], label: 'No ruler' }] };
       break;
     }
     case 'eras': {

@@ -597,7 +597,7 @@ impl CultureSim {
         let before = self.effects.len();
         self.effects.retain(|(_, until)| t < *until);
         let mut changed = self.effects.len() != before;
-        while self.next_directive < self.directives.len() && self.directives[self.next_directive].at <= t as i64 {
+        while self.next_directive < self.directives.len() && self.directives[self.next_directive].at <= t as f64 {
             let d = self.directives[self.next_directive].clone();
             self.next_directive += 1;
             let a = &d.args;

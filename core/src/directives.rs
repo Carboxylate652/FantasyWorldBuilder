@@ -18,8 +18,9 @@ pub struct Directive {
     /// "cultures" (Stage 3) or "nations" (Stage 4).
     pub stage: String,
     /// When it applies: before this generation (cultures, counted from 0) or
-    /// this year (nations) runs.
-    pub at: i64,
+    /// at this time in years (nations; fractional when steps are shorter than
+    /// a year).
+    pub at: f64,
     pub action: String,
     #[serde(default)]
     pub args: Value,
@@ -209,8 +210,43 @@ pub fn actions() -> Vec<ActionSpec> {
         ActionSpec {
             stage: "nations",
             name: "tech",
-            description: "A nation's technology jumps ahead (a scientific revolution, foreign experts, a reform) by the given years now; a negative value sets it back (a dark age). Eras (gunpowder, shipping, industry, fertilizer, motor age, air age) follow each nation's own technology.",
+            description: "A nation's technology jumps ahead (a scientific revolution, foreign experts) by the given years now; a negative value sets it back (a dark age). Its provinces embrace every born institution whose era year the new technology passes, so it can enter later eras at once; an institution not yet born whose year it passes is born in its capital.",
             schema: object(json!({ "nation": { "type": "integer" }, "years": num("Technology years gained (negative: lost)", -500.0, 500.0) })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "port",
+            description: "A nation builds a port in one of its coastal provinces now (ocean shipping era), whatever its harbour: sea lanes, colonies and the spread of institutions run through ports.",
+            schema: object(json!({ "nation": { "type": "integer" }, "province": { "type": "integer" } })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "institution_birth",
+            description: "Choose where an institution is born (0 gunpowder, 1 navigation, 2 industrialisation, 3 synthetic fertilizer, 4 motorisation, 5 aviation): a province, or null to let chance pick among the candidates. It applies when the institution emerges (at once if it is due). Institutions spread province by province over land, roads, railways, ports and airports; a nation enters the matching era once most of its provinces have embraced it.",
+            schema: object(json!({ "institution": num("Institution index (0–5)", 0.0, 5.0), "province": { "type": ["integer", "null"], "description": "Birthplace province id, or null for chance" } })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "reform",
+            description: "A nation reforms on the model of more advanced nations (westernization) for some years: institutions spread through its provinces three times as fast, at the cost of a year's income and of stability while it lasts.",
+            schema: object(json!({ "nation": { "type": "integer" }, "years": years() })),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "feudal_empire",
+            description: "Make a nation a feudal empire (on: true): its emperor enfeoffs kings over the regions of the imperial territory (the given places, or all its land if none), the kings enfeoff dukes over states, and counties (provinces) and baronies complete the hierarchy. Members never fight each other, never break apart and defend each other; the empire lasts, whatever the era, until dissolved (on: false), and the title passes by election if the emperor's own land is lost. Land of the emperor outside the given places stays outside the empire.",
+            schema: with_place(map(json!({ "nation": { "type": "integer" }, "on": { "type": "boolean" }, "name": { "type": ["string", "null"], "description": "Name of the empire, or null for one from the nation's" } }))),
+        },
+        ActionSpec {
+            stage: "nations",
+            name: "tag",
+            description: "Add (on: true) or remove a special tag. Nation tags: isolationist (no colonies, institutions arrive slowly, never reforms), expansionist (aggression ×1.5), merchant_republic (ports anywhere passable, double trade from ports, more colonies), eternal (never breaks apart, defends ×1.5). State tags: holy_land (everyone covets it), free_state (its provinces can't change hands by war or settlement), institution_cradle (institutions prefer to be born here). World tags (id null): no_overseas_colonies, slow_institutions, fast_institutions, frequent_wars, stable_realms.",
+            schema: object(json!({
+                "scope": { "type": "string", "enum": ["world", "state", "nation"] },
+                "id": { "type": ["integer", "null"], "description": "State or nation id; null for world tags" },
+                "tag": { "type": "string", "enum": ["isolationist", "expansionist", "merchant_republic", "eternal", "holy_land", "free_state", "institution_cradle", "no_overseas_colonies", "slow_institutions", "fast_institutions", "frequent_wars", "stable_realms"] },
+                "on": { "type": "boolean" },
+            })),
         },
         ActionSpec {
             stage: "nations",
@@ -283,11 +319,17 @@ pub fn validate(d: &Directive) -> Result<(), String> {
             "integer" => v.as_i64().is_some() || v.as_f64().is_some_and(|x| x.fract() == 0.0),
             "number" => v.is_number(),
             "string" => v.is_string(),
+            "boolean" => v.is_boolean(),
             "array" => v.as_array().is_some_and(|a| a.iter().all(|x| x.as_i64().is_some() || x.as_f64().is_some_and(|f| f.fract() == 0.0))),
             _ => false,
         });
         if !ok {
             return Err(format!("{}: `{k}` should be {}", d.action, types.join(" or ")));
+        }
+        if let (Some(allowed), Some(v)) = (s["enum"].as_array(), v.as_str()) {
+            if !allowed.iter().any(|a| a.as_str() == Some(v)) {
+                return Err(format!("{}: `{k}` must be one of {}", d.action, allowed.iter().filter_map(|a| a.as_str()).collect::<Vec<_>>().join(", ")));
+            }
         }
         if let Some(x) = v.as_f64() {
             if let Some(min) = s["minimum"].as_f64() {
@@ -321,7 +363,7 @@ pub fn arg_f64(args: &Value, key: &str, default: f64) -> f64 {
 /// Directives of one stage in the order they apply (by time, then as issued).
 pub fn of_stage<'a>(all: &'a [Directive], stage: &str) -> Vec<&'a Directive> {
     let mut v: Vec<(usize, &Directive)> = all.iter().enumerate().filter(|(_, d)| d.stage == stage).collect();
-    v.sort_by_key(|(k, d)| (d.at, *k));
+    v.sort_by(|(ka, a), (kb, b)| a.at.total_cmp(&b.at).then(ka.cmp(kb)));
     v.into_iter().map(|x| x.1).collect()
 }
 
@@ -330,7 +372,7 @@ mod tests {
     use super::*;
 
     fn d(stage: &str, action: &str, args: Value) -> Directive {
-        Directive { stage: stage.into(), at: 0, action: action.into(), args, note: String::new(), by: String::new() }
+        Directive { stage: stage.into(), at: 0.0, action: action.into(), args, note: String::new(), by: String::new() }
     }
 
     #[test]

@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Fantasy World Maker simulation core: a deterministic, headless pipeline that
 //! builds a planet on a geodesic sphere grid in ten checkpointed steps: seven
 //! for the planet (Stage 1) and three for states and provinces (Stage 2).

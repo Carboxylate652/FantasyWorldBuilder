@@ -394,7 +394,7 @@ fn main() {
             let mut w = World::load(&dir).unwrap_or_else(|e| die(&e));
             let d = worldcore::directives::Directive {
                 stage: args.get("stage").unwrap_or_else(|| die("missing --stage")).to_string(),
-                at: args.num("at", i64::MIN).max(i64::MIN + 1),
+                at: args.num("at", f64::MIN),
                 action: args.get("action").unwrap_or_else(|| die("missing --action")).to_string(),
                 args: serde_json::from_str(args.get("args").unwrap_or("{}")).unwrap_or_else(|e| die(&format!("--args: {e}"))),
                 note: args.get("note").unwrap_or("").to_string(),

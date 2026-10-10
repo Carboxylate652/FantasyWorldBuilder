@@ -481,16 +481,19 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
             "province_cultures.csv": "province;population;culture (majority);shares (culture:share, shares ≥ 5%)",
             "nations.png": "reference map at the start date: provinces coloured by owner, borders between nations dark, unruled land grey; railways dark with white stations",
             "railways.png": "reference map: land grey, railways black, stations red, junctions (where lines meet and travellers change) blue",
-            "transport.png": "reference map: land grey with nation borders, roads (track light brown, paved road dark brown, highway orange), railways black with stations red and junctions blue, airports purple",
-            "nations.csv": "id;name;government (city-state, kingdom, empire);color;capital_province;capital_name;primary_culture;culture_name;provinces;population;overseas_provinces;founded;ended;fate;fate_other;parent;era (early, gunpowder, ocean shipping, industry, fertilizer, motor age, air age);tech (technology year);treasury;income (per year);integration (0–1, people-weighted);track_km;paved_km;highway_km;rail_km;stations;airports — every nation that ever existed (infrastructure at the start date, or when it ended)",
+            "transport.png": "reference map: land grey with nation borders, roads (track light brown, paved road dark brown, highway orange), railways black with stations red and junctions blue, ports dark blue, airports purple",
+            "nations.csv": "id;name;government (city-state, kingdom, empire);color;capital_province;capital_name;primary_culture;culture_name;provinces;population;overseas_provinces;founded;ended;fate;fate_other;parent;era (early, gunpowder, ocean shipping, industry, fertilizer, motor age, air age);tech (technology year);treasury;income (per year);integration (0–1, people-weighted);track_km;paved_km;highway_km;rail_km;stations;airports;ports;liege (feudal liege, 0 = independent);rank (emperor, king, duke);realm (top of its feudal chain);empire;institutions (share of provinces that embraced each of the six institutions) — every nation that ever existed (infrastructure at the start date, or when it ended)",
             "nation_events.csv": "year;event (founded, independence, conquest of a capital, war summary, colony, union, renamed, era, railway, highway, airport, bankruptcy, metropolis, ruined, capital, ended);nation;other;province;text",
             "railways.csv": "id;name;owner (nation that built it);opened;closed (empty while open);km;stations (province ids);provinces (province ids along the line, in order)",
+            "ports.csv": "province;name;owner;opened;harbour (0–1: calm winds, deep water, shelter, river mouth, no winter ice)",
+            "titles.csv": "empire;level (empire, king, duke, count, baron);title;holder (nation id);liege (nation id);province (counties and baronies) — the feudal titles of the empires at the start date",
+            "institutions.csv": "index;institution;era (it opens);earliest (birth year);born;province (birthplace);province_name;embraced_provinces;nations_in_era",
             "stations.csv": "province;name;owner;junction (two or more open lines stop here: travellers can change lines, at a time cost);lines (line ids)",
             "roads.csv": "from;to (neighbouring province ids);quality (1 track, 2 paved road, 3 highway);kind;built (year of the last upgrade);km",
             "airports.csv": "province;name;owner;opened",
             "cities.csv": "rank;province;name;owner;population;capital;station;attraction (−1 to +1 at the start date);peak_population;peak_year — the 100 largest cities",
             "ruins.csv": "province;name;population;peak_population;peak_year — cities that lost three quarters of their people (war, devastation, abandonment) and never recovered",
-            "province_nations.csv": "province;owner (nation, 0 = none);culture (majority at the start date, after assimilation);shares;population;railway (0 none, 1 track, 2 station, 3 junction);road (best road touching it: 0 none, 1 track, 2 paved, 3 highway);airport;integration (0–1: how well its owner's capital reaches it)",
+            "province_nations.csv": "province;owner (nation, 0 = none);culture (majority at the start date, after assimilation);shares;population;railway (0 none, 1 track, 2 station, 3 junction);road (best road touching it: 0 none, 1 track, 2 paved, 3 highway);airport;integration (0–1: how well its owner's capital reaches it);port;harbour;institutions (embraced);realm",
             "trade_goods.csv": "good;kind (trade good, deposit, sea zone);category (staple, cash crop, livestock, forest, mineral, energy, sea);provinces;area_km2 — how much of the world has each good",
             "province_adjacency.csv": "from;to;type;border_km;barrier;crossing_km — every border between two provinces; type: land, river (along a border river), impassable (wasteland), coast (land–sea), lake, sea, strait (crossing_km = width); barrier = mean crossing cost of the border (0 = open)",
         },
@@ -978,10 +981,13 @@ fn write_nations_png(
         let q = r["quality"].as_u64().unwrap_or(1).clamp(1, 3) as u8;
         seg(&mut roads, r["from"].as_u64().unwrap_or(0), r["to"].as_u64().unwrap_or(0), q, if q == 3 { thick + 1 } else { thick });
     }
+    // Airports (1) and ports (2) as squares at their province's centre.
     let mut air_mask = vec![0u8; wpx * hpx];
-    for a in t["airports"].as_array().into_iter().flatten() {
-        if let Some((x, y)) = to_px(a["province"].as_u64().unwrap_or(0)) {
-            plot(&mut air_mask, x, y, 1, thick + 3);
+    for (key, v) in [("ports", 2u8), ("airports", 1u8)] {
+        for a in t[key].as_array().into_iter().flatten() {
+            if let Some((x, y)) = to_px(a["province"].as_u64().unwrap_or(0)) {
+                plot(&mut air_mask, x, y, v, thick + 3);
+            }
         }
     }
     let enc = |name: &str| -> Result<png::StreamWriter<'static, BufWriter<File>>, String> {
@@ -1041,8 +1047,10 @@ fn write_nations_png(
             };
             // transport.png: roads by quality under the railways, airports on top.
             let base_t = if border && water.is_none() { [165, 160, 150] } else { base_r };
-            let tc = if air_mask[i] > 0 {
+            let tc = if air_mask[i] == 1 {
                 [140, 40, 170]
+            } else if air_mask[i] == 2 {
+                [20, 90, 170]
             } else if let Some((_, b)) = rail_rgb {
                 b
             } else {
@@ -1076,14 +1084,16 @@ fn write_nation_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>,
     let hexc = |c: &serde_json::Value| format!("x{:02X}{:02X}{:02X}", c[0].as_u64().unwrap_or(0), c[1].as_u64().unwrap_or(0), c[2].as_u64().unwrap_or(0));
     let opt = |v: &serde_json::Value| if v.is_null() { String::new() } else { csv_text(v) };
     let ids = |v: &serde_json::Value| v.as_array().map(|a| a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
-    let mut na = String::from("id;name;government;color;capital_province;capital_name;primary_culture;culture_name;provinces;population;overseas_provinces;founded;ended;fate;fate_other;parent;era;tech;treasury;income;integration;track_km;paved_km;highway_km;rail_km;stations;airports\n");
+    let mut na = String::from("id;name;government;color;capital_province;capital_name;primary_culture;culture_name;provinces;population;overseas_provinces;founded;ended;fate;fate_other;parent;era;tech;treasury;income;integration;track_km;paved_km;highway_km;rail_km;stations;airports;ports;liege;rank;realm;empire;institutions\n");
     for n in arr("nations") {
         let rk = &n["road_km"];
+        let inst = n["institutions"].as_array().map(|a| a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
         na += &format!(
-            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
+            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
             n["id"], csv_text(&n["name"]), csv_text(&n["government"]), hexc(&n["color"]), n["capital"], csv_text(&n["capital_name"]), n["primary_culture"], csv_text(&n["culture_name"]),
             n["provinces"], n["population"], n["overseas_provinces"], n["founded"], opt(&n["ended"]), opt(&n["fate"]), n["fate_other"], n["parent"],
             csv_text(&n["era"]), n["tech"], n["treasury"], n["income"], n["integration"], rk["track"], rk["paved"], rk["highway"], n["rail_km"], n["stations"], n["airports"],
+            n["ports"], n["liege"], csv_text(&n["rank"]), n["realm"], opt(&n["empire"]), inst,
         );
     }
     write("nations.csv", na)?;
@@ -1112,10 +1122,24 @@ fn write_nation_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>,
         ai += &format!("{};{};{};{}\n", a["province"], csv_text(&a["name"]), a["owner"], a["opened"]);
     }
     write("airports.csv", ai)?;
-    let mut pn = String::from("province;owner;culture;shares;population;railway;road;airport;integration\n");
+    let mut po = String::from("province;name;owner;opened;harbour\n");
+    for a in arr("ports") {
+        po += &format!("{};{};{};{};{}\n", a["province"], csv_text(&a["name"]), a["owner"], a["opened"], a["harbour"]);
+    }
+    write("ports.csv", po)?;
+    let mut ti = String::from("empire;level;title;holder;liege;province\n");
+    for a in arr("titles") {
+        ti += &format!("{};{};{};{};{};{}\n", a["empire"], csv_text(&a["level"]), csv_text(&a["title"]), a["holder"], a["liege"], opt(&a["province"]));
+    }
+    write("titles.csv", ti)?;
+    let mut pn = String::from("province;owner;culture;shares;population;railway;road;airport;port;harbour;integration;institutions;realm\n");
     for p in arr("provinces") {
         let sh = p["shares"].as_array().map(|a| a.iter().map(|s| format!("{}:{}", s[0], s[1])).collect::<Vec<_>>().join(" ")).unwrap_or_default();
-        pn += &format!("{};{};{};{};{};{};{};{};{}\n", p["id"], p["owner"], p["culture"], sh, p["population"], p["railway"], p["road"], p["airport"], p["integration"]);
+        let inst = p["institutions"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        pn += &format!(
+            "{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
+            p["id"], p["owner"], p["culture"], sh, p["population"], p["railway"], p["road"], p["airport"], p["port"], p["harbour"], p["integration"], inst, p["realm"]
+        );
     }
     write("province_nations.csv", pn)?;
     let mut ci = String::from("rank;province;name;owner;population;capital;station;attraction;peak_population;peak_year\n");
@@ -1128,7 +1152,12 @@ fn write_nation_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>,
         ru += &format!("{};{};{};{};{}\n", r["province"], csv_text(&r["name"]), r["population"], r["peak"], r["peak_year"]);
     }
     write("ruins.csv", ru)?;
-    Ok(["nations.csv", "nation_events.csv", "railways.csv", "stations.csv", "roads.csv", "airports.csv", "province_nations.csv", "cities.csv", "ruins.csv"].map(String::from).to_vec())
+    let mut ins = String::from("index;institution;era;earliest;born;province;province_name;embraced_provinces;nations_in_era\n");
+    for a in arr("institutions") {
+        ins += &format!("{};{};{};{};{};{};{};{};{}\n", a["index"], csv_text(&a["name"]), csv_text(&a["era"]), a["earliest"], opt(&a["born"]), opt(&a["province"]), opt(&a["province_name"]), a["embraced_provinces"], a["nations_in_era"]);
+    }
+    write("institutions.csv", ins)?;
+    Ok(["nations.csv", "nation_events.csv", "railways.csv", "stations.csv", "roads.csv", "airports.csv", "ports.csv", "titles.csv", "institutions.csv", "province_nations.csv", "cities.csv", "ruins.csv"].map(String::from).to_vec())
 }
 
 /// cultures.csv, culture_groups.csv, culture_events.csv, province_cultures.csv.

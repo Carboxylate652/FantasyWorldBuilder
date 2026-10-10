@@ -1,7 +1,7 @@
 import './style.css';
 import * as api from './api';
 import { Grid, angle, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
-import { BOUNDARY, DEPOSITS, ERA_NAMES, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, stateColor, type LayerId, type Legend } from './layers';
+import { BOUNDARY, DEPOSITS, ERA_NAMES, INSTITUTION_NAMES, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
 import { EDITOR_TOOLS, LIVE_STEPS, STAGE2_START, STAGE3_START, STAGE4_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
@@ -220,7 +220,8 @@ function stepOfLayer(id: LayerId): string {
     habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
     resources: 'Provinces',
     cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures', attraction: 'Cultures',
-    nations: 'Nations & history', railways: 'Nations & history', transport: 'Nations & history', eras: 'Nations & history', city_growth: 'Nations & history',
+    nations: 'Nations & history', railways: 'Nations & history', transport: 'Nations & history', eras: 'Nations & history',
+    institutions: 'Nations & history', realms: 'Nations & history', city_growth: 'Nations & history',
   };
   return m[id];
 }
@@ -334,8 +335,8 @@ async function refreshOverlays() {
   const lay = S.layer;
   const political = lay === 'states' || lay === 'provinces' || lay === 'regions';
   const cultural = lay === 'cultures' || lay === 'culture_groups';
-  const national = lay === 'nations' || lay === 'railways' || lay === 'transport' || lay === 'eras';
-  const stf = national ? await getField('owner') : cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
+  const national = lay === 'nations' || lay === 'railways' || lay === 'transport' || lay === 'eras' || lay === 'institutions';
+  const stf = lay === 'realms' ? await getField('realm') : national ? await getField('owner') : cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
   if (stf && !stf.stale) {
     const L = new Lines();
     // Culture layers: culture borders as hairlines, group borders as ribbons.
@@ -377,6 +378,82 @@ async function refreshOverlays() {
   }
 
   drawEditMarkers();
+  await drawTransportIcons();
+}
+
+/** Icons over the map in the Transport and Railways layers (stations,
+ *  junctions, ports, airports at their province's centre), and the candidate
+ *  birthplaces of an institution waiting for the user's choice (gold stars). */
+async function drawTransportIcons() {
+  const lay = S.layer;
+  const P = S.political;
+  const L = new Lines();
+  let any = false;
+  type C4 = [number, number, number, number];
+  const icon = (c: Vec3, kind: number, slot: number, count: number) => {
+    const [e, n] = eastNorth(c);
+    const r = 0.0065;
+    const dx = (slot - (count - 1) / 2) * 2.6 * r;
+    const at = (x: number, y: number) => offset(c, e, n, dx + x, y);
+    const line = (x1: number, y1: number, x2: number, y2: number, col: C4, w = 0.0035) => L.seg(at(x1, y1), at(x2, y2), col, w);
+    if (kind === 0) {
+      // Station: a filled red square.
+      for (let k = -2; k <= 2; k++) line(-r * 0.7, (k * r) / 3, r * 0.7, (k * r) / 3, [0.8, 0.12, 0.12, 1]);
+    } else if (kind === 1) {
+      // Junction: a blue diamond, filled.
+      for (let k = -3; k <= 3; k++) { const y = (k * r) / 3; const w = r * (1 - Math.abs(k) / 3); line(-w, y, w, y, [0.12, 0.35, 0.86, 1]); }
+    } else if (kind === 2) {
+      // Port: an anchor (ring, shank, stock, flukes).
+      const col: C4 = [0.08, 0.35, 0.67, 1];
+      for (let k = 0; k < 8; k++) { const a1 = (k / 8) * 2 * Math.PI, a2 = ((k + 1) / 8) * 2 * Math.PI; line(Math.cos(a1) * r * 0.25, r * 0.75 + Math.sin(a1) * r * 0.25, Math.cos(a2) * r * 0.25, r * 0.75 + Math.sin(a2) * r * 0.25, col, 0.0025); }
+      line(0, r * 0.5, 0, -r, col); line(-r * 0.45, r * 0.25, r * 0.45, r * 0.25, col);
+      line(0, -r, -r * 0.7, -r * 0.4, col); line(0, -r, r * 0.7, -r * 0.4, col);
+    } else {
+      // Airport: a plane (fuselage, wings, tail).
+      const col: C4 = [0.55, 0.16, 0.67, 1];
+      line(0, -r, 0, r, col); line(-r, r * 0.1, r, r * 0.1, col); line(-r * 0.45, -r * 0.8, r * 0.45, -r * 0.8, col);
+    }
+  };
+  if ((lay === 'transport' || lay === 'railways') && P) {
+    const [pf, rw, pt, ap] = await Promise.all(['province', 'railway', 'port', 'airport'].map((x) => getField(x)));
+    if (pf && !pf.stale) {
+      const flags = new Map<number, number>();
+      for (let i = 0; i < pf.values.length; i++) {
+        const id = pf.values[i];
+        if (!id) continue;
+        let b = 0;
+        const r = rw ? rw.values[i] : 0;
+        if (r === 2) b |= 1;
+        if (r === 3) b |= 2;
+        if (lay === 'transport' && pt && pt.values[i] === 2) b |= 4;
+        if (lay === 'transport' && ap && ap.values[i] === 1) b |= 8;
+        if (b) flags.set(id, (flags.get(id) ?? 0) | b);
+      }
+      for (const [id, b] of flags) {
+        const p = P.byProv.get(id);
+        if (!p?.center) continue;
+        const c = fromLatLon((p.center[0] * Math.PI) / 180, (p.center[1] * Math.PI) / 180);
+        const kinds = [b & 2 ? 1 : b & 1 ? 0 : -1, b & 4 ? 2 : -1, b & 8 ? 3 : -1].filter((k) => k >= 0);
+        kinds.forEach((k, slot) => icon(c, k, slot, kinds.length));
+        any = true;
+      }
+    }
+  }
+  for (const cand of SIM.state?.pending_institution?.candidates ?? []) {
+    if (!cand.at) continue;
+    const c = fromLatLon((cand.at[0] * Math.PI) / 180, (cand.at[1] * Math.PI) / 180);
+    const [e, n] = eastNorth(c);
+    const col: C4 = [1, 0.82, 0.1, 1];
+    for (let k = 0; k < 5; k++) {
+      const a1 = (k / 5) * 2 * Math.PI + Math.PI / 2, a2 = (((k + 2) % 5) / 5) * 2 * Math.PI + Math.PI / 2;
+      L.seg(offset(c, e, n, Math.cos(a1) * 0.018, Math.sin(a1) * 0.018), offset(c, e, n, Math.cos(a2) * 0.018, Math.sin(a2) * 0.018), col, 0.004);
+    }
+    any = true;
+  }
+  if (any) {
+    const [a, b] = L.sets();
+    R.setOverlay('transport', a, b);
+  } else R.setOverlay('transport', null, null);
 }
 
 /** Cell-edge segments between neighbouring cells whose values differ (and pass `keep`):
@@ -982,6 +1059,8 @@ const SIM = {
   form: {} as Record<string, string>,
   note: '',
   advance: { cultures: 250, nations: 25 } as Record<string, number>,
+  /** Stage 4: stop before an institution is born to choose its birthplace. */
+  askBirth: true,
   /** Names of living nations and cultures of the live run, for hover text. */
   nations: new Map<number, any>(),
   cultures: new Map<number, any>(),
@@ -1060,6 +1139,16 @@ async function simCall(cmd: string, args: any = {}): Promise<any | null> {
   }
 }
 
+/** Step the live run; Stage 4 stops before an institution's birth when the user chooses birthplaces. */
+function simStep(args: Record<string, unknown>) {
+  const nations = S.status?.live?.stage === 'nations';
+  return simCall('sim_step', { ...args, stop_at_choice: nations && SIM.askBirth });
+}
+
+function fmtYear(y: number): string {
+  return Math.abs(y - Math.round(y)) < 1e-6 ? String(Math.round(y)) : y.toFixed(1);
+}
+
 async function simStart(stage: string) {
   S.layer = stage === 'cultures' ? 'cultures' : 'nations';
   SIM.guide.log = [];
@@ -1072,8 +1161,8 @@ async function simPlay() {
   SIM.playing = !SIM.playing;
   renderSim();
   while (SIM.playing && S.status?.live && !S.status.live.done) {
-    const r = await simCall('sim_step', { steps: 1 });
-    if (!r) break;
+    const r = await simStep({ steps: 1 });
+    if (!r || SIM.state?.pending_institution) break;
   }
   SIM.playing = false;
   renderSim();
@@ -1128,6 +1217,7 @@ function formArgs(schema: any): any {
     const types: string[] = Array.isArray(sp.type) ? sp.type : [sp.type];
     if (!raw) { out[k] = types.includes('null') ? null : types.includes('array') ? [] : undefined; continue; }
     if (types.includes('array')) out[k] = raw.split(/[\s,;]+/).filter(Boolean).map(Number);
+    else if (types.includes('boolean')) out[k] = raw === 'true';
     else if (types.includes('integer')) out[k] = Math.round(Number(raw));
     else if (types.includes('number')) out[k] = Number(raw);
     else out[k] = raw;
@@ -1234,7 +1324,7 @@ function renderSim() {
   }
   const st = SIM.state;
   const pos = live.unit === 'year'
-    ? `Year ${live.position} of ${st?.start_year ?? ''}–${live.end}${st?.era ? ' · ' + st.era + ' era' : ''}`
+    ? `Year ${fmtYear(live.position)} of ${st?.start_year ?? ''}–${live.end}${st?.era ? ' · ' + st.era + ' era' : ''}${st?.step_years ? ' · ' + st.step_years + ' yr steps' : ''}`
     : `Generation ${live.position} of ${live.end}${st ? ' · year ' + Math.round(st.year).toLocaleString() + ' · era ' + st.era : ''}`;
   const frac = live.unit === 'year' && st ? (live.position - st.start_year) / Math.max(1, live.end - st.start_year) : live.position / Math.max(1, live.end);
   const busy = SIM.busy || SIM.guide.running;
@@ -1243,12 +1333,12 @@ function renderSim() {
     h('div', { class: 'sim-head' }, h('b', {}, stageName), h('span', { class: 'muted' }, live.done ? 'finished' : 'live')),
     h('div', {}, pos), h('progress', { class: 'sim-prog', max: 1, value: Math.min(1, Math.max(0, frac)) }),
     h('div', { class: 'row wrap' },
-      h('button', { disabled: busy || live.done, title: live.unit === 'year' ? 'One step' : 'One generation', onclick: () => simCall('sim_step', { steps: 1 }) }, 'Step'),
+      h('button', { disabled: busy || live.done, title: live.unit === 'year' ? 'One step' : 'One generation', onclick: () => simStep({ steps: 1 }) }, 'Step'),
       h('input', { type: 'number', class: 'years', min: 1, step: 1, value: adv, title: 'Years to advance', onchange: (e: Event) => (SIM.advance[stage] = Math.max(1, Number((e.target as HTMLInputElement).value))) }),
-      h('button', { disabled: busy || live.done, onclick: () => simCall('sim_step', { years: SIM.advance[stage] }) }, `+${adv} years`),
-      h('button', { disabled: busy || live.done, onclick: () => simCall('sim_step', { to: 'era' }) }, 'Next era'),
+      h('button', { disabled: busy || live.done, onclick: () => simStep({ years: SIM.advance[stage] }) }, `+${adv} years`),
+      h('button', { disabled: busy || live.done, onclick: () => simStep({ to: 'era' }) }, 'Next era'),
       h('button', { disabled: (SIM.busy && !SIM.playing) || SIM.guide.running || live.done, class: SIM.playing ? 'on' : '', onclick: simPlay }, SIM.playing ? 'Pause' : 'Play'),
-      h('button', { disabled: busy || live.done, onclick: () => simCall('sim_step', { to: 'end' }) }, 'To the end')),
+      h('button', { disabled: busy || live.done, onclick: () => simStep({ to: 'end' }) }, 'To the end')),
     h('div', { class: 'row wrap' },
       h('button', { class: 'primary', disabled: busy, title: 'Run to the end and keep this history as the stage result', onclick: simCommit }, live.done ? 'Keep this history' : 'Finish and keep'),
       h('button', { disabled: busy, title: 'Start again from the beginning (directives so far are replayed)', onclick: () => simStart(stage) }, 'Restart'),
@@ -1259,6 +1349,23 @@ function renderSim() {
   const body = h('div', { class: 'sim-body' });
   box.append(body);
   if (!st) return;
+  if (stage === 'nations') {
+    const pend = st.pending_institution;
+    if (pend) {
+      const choose = async (province: number | null) => {
+        const r = await simCall('sim_directive', { action: 'institution_birth', args: { institution: pend.index, province }, note: province === null ? 'left to chance' : '' });
+        if (r) toast(`${pend.name} will be born ${province === null ? 'where chance takes it' : 'in ' + (pend.candidates.find((c: any) => c.province === province)?.name ?? '#' + province)}. Step on.`);
+      };
+      body.append(h('div', { class: 'callout' },
+        h('b', {}, `The institution of ${pend.name} is ready to be born (${pend.era} era).`),
+        h('div', { class: 'muted small' }, 'Choose its birthplace among the candidates (gold stars on the map), or let chance pick one weighted by their scores.'),
+        ...pend.candidates.map((c: any) => h('div', { class: 'item' },
+          h('span', { class: 'link', onclick: () => R.lookAt(fromLatLon((c.at[0] * Math.PI) / 180, (c.at[1] * Math.PI) / 180)) }, `${c.name} `, h('span', { class: 'muted' }, `#${c.province} · ${c.owner_name} · score ${c.score}`)),
+          h('button', { class: 'small', disabled: busy, onclick: () => choose(c.province) }, 'Here'))),
+        h('div', { class: 'row' }, h('button', { disabled: busy, onclick: () => choose(null) }, 'Let chance decide'))));
+    }
+    body.append(h('label', { class: 'check small' }, h('input', { type: 'checkbox', checked: SIM.askBirth, onchange: (e: Event) => { SIM.askBirth = (e.target as HTMLInputElement).checked; } }), ' Ask me where institutions are born'));
+  }
   const fmtM = (x: number) => (x >= 1e6 ? `${(x / 1e6).toFixed(1)} M` : `${Math.round(x / 1000)}k`);
   if (SIM.tab === 'world') {
     if (stage === 'cultures') {
@@ -1274,14 +1381,19 @@ function renderSim() {
       body.append(h('div', { class: 'muted' }, `${st.nations.length} nations · ${st.ruled_provinces} of ${st.land_provinces} provinces ruled · ${fmtM(st.population)} people · ${st.railways} railway lines`));
       if (st.leader) body.append(h('div', { class: 'muted small' }, `Most advanced: ${st.leader.name} (${st.leader.era}, technology ${Math.round(st.leader.tech)}) · ${Object.entries(st.eras ?? {}).map(([k, v]) => `${v} ${k}`).join(', ')}`));
       const tr = st.transport;
-      if (tr) body.append(h('div', { class: 'muted small' }, `Roads ${Math.round(tr.road_km.track).toLocaleString()} km track, ${Math.round(tr.road_km.paved).toLocaleString()} km paved, ${Math.round(tr.road_km.highway).toLocaleString()} km highway · rail ${Math.round(tr.rail_km).toLocaleString()} km, ${tr.junctions} junctions · ${tr.airports} airports`));
+      if (tr) body.append(h('div', { class: 'muted small' }, `Roads ${Math.round(tr.road_km.track).toLocaleString()} km track, ${Math.round(tr.road_km.paved).toLocaleString()} km paved, ${Math.round(tr.road_km.highway).toLocaleString()} km highway · rail ${Math.round(tr.rail_km).toLocaleString()} km, ${tr.junctions} junctions · ${tr.ports ?? 0} ports · ${tr.airports} airports`));
+      const born = (st.institutions ?? []).filter((x: any) => x.born !== null);
+      if (born.length || st.next_institution) body.append(h('div', { class: 'muted small' },
+        `Institutions: ${born.map((x: any) => `${x.name} (${x.born}, ${x.province_name}; ${x.nations_in_era} nations)`).join(' · ') || 'none yet'}${st.next_institution ? ` · next: ${st.next_institution.name}, from ${st.next_institution.earliest}${st.next_institution.chosen ? ' (birthplace chosen)' : ''}` : ''}`));
+      for (const e of (st.empires ?? []).filter((x: any) => x.dissolved === null)) body.append(h('div', { class: 'muted small' }, `${e.name}: emperor #${e.emperor}, ${e.kings} kings, ${e.dukes} dukes, ${e.territory_provinces} provinces of imperial territory`));
+      if (st.tags?.length) body.append(h('div', { class: 'muted small' }, `Tags: ${st.tags.map((t: any) => `${t.tag}${t.scope === 'world' ? '' : ' (' + t.scope + ' #' + t.id + ')'}`).join(', ')}`));
       for (const n of st.nations.slice(0, 12)) {
         const nc = nationColor(n.id).map(Math.round);
         body.append(h('div', { class: 'item link', onclick: () => {
           const p = S.political?.byProv.get(n.capital);
           if (p?.center) R.lookAt(fromLatLon((p.center[0] * Math.PI) / 180, (p.center[1] * Math.PI) / 180));
         } }, h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${nc.join(',')})` }), `${n.name} `, h('span', { class: 'muted' }, `#${n.id}`)),
-          h('span', { class: 'muted' }, `${n.era} · ${n.provinces} prov. · ${fmtM(n.population)} · treasury ${fmtM(n.treasury)}${n.bankrupt ? ' (bankrupt)' : ''}${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
+          h('span', { class: 'muted' }, `${n.rank ? n.rank + ' · ' : ''}${n.era} · ${n.provinces} prov. · ${fmtM(n.population)} · treasury ${fmtM(n.treasury)}${n.bankrupt ? ' (bankrupt)' : ''}${n.reforming ? ' (reforming)' : ''}${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
       }
       if (st.cities?.length) {
         body.append(h('h4', {}, 'Largest cities'), ...st.cities.slice(0, 8).map((c: any) => h('div', { class: 'item' },
@@ -1310,8 +1422,12 @@ function renderSim() {
       for (const [k, sp] of Object.entries<any>(a.schema.properties ?? {})) {
         const types: string[] = Array.isArray(sp.type) ? sp.type : [sp.type];
         const ph = types.includes('array') ? 'ids, e.g. 12, 40' : types.includes('null') ? 'optional' : sp.minimum !== undefined ? `${sp.minimum} to ${sp.maximum}` : '';
+        const choices: string[] | null = sp.enum ?? (types.includes('boolean') ? ['true', 'false'] : null);
+        if (choices && SIM.form[k] === undefined) SIM.form[k] = choices[0];
         form.append(h('label', { title: sp.description ?? '' }, h('span', {}, k.replace(/_/g, ' ')),
-          h('input', { type: types.includes('number') || types.includes('integer') ? 'number' : 'text', placeholder: ph, value: SIM.form[k] ?? '', step: 'any', oninput: (e: Event) => (SIM.form[k] = (e.target as HTMLInputElement).value) })));
+          choices
+            ? h('select', { onchange: (e: Event) => (SIM.form[k] = (e.target as HTMLSelectElement).value) }, ...choices.map((c) => h('option', { value: c, selected: SIM.form[k] === c }, c.replace(/_/g, ' '))))
+            : h('input', { type: types.includes('number') || types.includes('integer') ? 'number' : 'text', placeholder: ph, value: SIM.form[k] ?? '', step: 'any', oninput: (e: Event) => (SIM.form[k] = (e.target as HTMLInputElement).value) })));
       }
       form.append(h('label', { class: 'wide' }, h('span', {}, 'note'), h('input', { type: 'text', placeholder: 'why (for the chronicle)', value: SIM.note, oninput: (e: Event) => (SIM.note = (e.target as HTMLInputElement).value) })));
       sel.after(h('div', { class: 'muted small' }, a.description), form,
@@ -1323,7 +1439,7 @@ function renderSim() {
     const applied = [...(st.queued ?? []).map((d: any) => ({ ...d, queued: true })), ...(st.directives ?? []).slice(-14).reverse()];
     if (applied.length) {
       body.append(h('h4', {}, 'Directives so far'), ...applied.map((d: any) => {
-        const when = d.year !== undefined ? Math.round(d.year) : d.tick;
+        const when = d.year !== undefined ? fmtYear(d.year) : d.tick;
         const what = d.action === 'note' ? `“${d.args?.text ?? ''}”` : `${d.action.replace(/_/g, ' ')} ${JSON.stringify(Object.fromEntries(Object.entries(d.args ?? {}).filter(([, v]) => v !== null && !(Array.isArray(v) && !v.length))))}`;
         return h('div', { class: 'muted small' }, `${when}: ${what}${d.note ? ' — ' + d.note : ''}${d.by === 'guide' ? ' (guide)' : ''}${d.queued ? ' (from the next step)' : d.applied === false ? ' (no effect)' : ''}`);
       }));
@@ -2200,6 +2316,13 @@ function describe(d: any): string {
   if (d.railway) parts.push(d.railway === 3 ? 'railway junction' : d.railway === 2 ? 'railway station' : 'railway');
   if (d.road) parts.push(['', 'track', 'paved road', 'highway'][d.road] ?? 'road');
   if (d.airport) parts.push('airport');
+  if (d.port === 2) parts.push('port');
+  else if (d.port === 1) parts.push('good harbour');
+  if (d.institutions) parts.push(`institutions: ${INSTITUTION_NAMES.filter((_, k) => (d.institutions >> k) & 1).join(', ')}`);
+  if (d.realm && d.owner && d.realm !== d.owner) {
+    const r = SIM.nations.get(d.realm) ?? S.political?.byNation.get(d.realm);
+    parts.push(`realm of ${r ? r.name : '#' + d.realm}${d.imperial ? ' (imperial territory)' : ''}`);
+  }
   if (d.nation_era) parts.push(`${ERA_NAMES[d.nation_era - 1]} era`);
   if (d.culture) {
     const c = SIM.cultures.get(d.culture) ?? P?.byCulture.get(d.culture), g = c && P ? P.byGroup.get(c.group) : null;

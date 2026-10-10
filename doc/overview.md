@@ -22,7 +22,7 @@ The desktop app and the browser UI (through `worldgen serve`) call the same `wor
 | `grid.rs` | Subdivided icosahedron (N = 10·4ⁿ+2 cells), neighbours, barycentric location. Vertex order is hierarchical: a level-7 grid is a prefix of level 8 |
 | `fields.rs` | Typed per-cell arrays (`F32`, `U8`, `U16`, `U32`, …) stored one binary file per field |
 | `world.rs` | The `World`: parameters, edits, per-step outputs, cache keys, staleness, save/load |
-| `stages/` | One module per step (`sketch`, `plates`, `tectonics`, `climate` + `wind`, `hydrology`, `biomes`, `habitability`, `states` + `partition`, `provinces` + `resources`, `cultures`, `nations` + `nations/transport`) and the step registry (`mod.rs`) |
+| `stages/` | One module per step (`sketch`, `plates`, `tectonics`, `climate` + `wind`, `hydrology`, `biomes`, `habitability`, `states` + `partition`, `provinces` + `resources`, `cultures`, `nations` + `nations/transport`, `nations/ports`, `nations/institutions`, `nations/feudal`) and the step registry (`mod.rs`) |
 | `edits.rs` | Override layers and how each edit tool is applied when a step regenerates |
 | `directives.rs` | Directive type, the action catalogue with strict JSON schemas, validation |
 | `api.rs` | JSON command handler, undo/redo, live simulation sessions (`sim_*`) |
@@ -36,8 +36,8 @@ The desktop app and the browser UI (through `worldgen serve`) call the same `wor
 ## Data model
 
 - **Cells.** All simulation runs on the sphere grid (default level 8: 655,362 cells of about 780 km², ~28 km apart). Flat images exist only at export. There are no polar or seam artefacts.
-- **Fields.** A step writes named fields, one value per cell (for example `elevation`, `temp`, `province`, `owner`). Fields by step: sketch (`land`, `sketch`, `mountain_hint`), plates (`plate`, `crust`, `vel_e`, `vel_n`), tectonics (`elevation`, `boundary`, `ocean_age`, `stress`), climate (`temp`, `precip`, `wind_u`, `wind_v`, `t_mean`, `t_warm`, `t_cold`, `p_ann`, `continentality`, `current_offset`), hydrology (`elevation`, `water`, `lake`, `water_level`, `discharge`, `drainage_area`, `river`, `river_rank`, `river_width`, `receiver`, `erosion`, `temp_adjust`), biomes (`koppen`, `terrain`, `relief`), habitability (`habitability`, `barrier`, `river_role`, `groundwater`, `site`, `site_kind`, `fertility`), states (`state`, `region`, `continent`), provinces (`province`, `province_kind`, `state`, `trade_good`), cultures (`culture`, `culture_group`, `population`, `attraction`), nations (`owner`, `nation_culture`, `nation_population`, `nation_attraction`, `railway`, `road`, `airport`, `nation_era`).
-- **Meta.** Each step also returns a JSON summary (`meta`) with its tables: Stage 2 has the province, state, region and adjacency tables; Stage 3 the cultures, groups, events and province shares; Stage 4 the nations, events, railways, stations, roads, airports, cities, ruins and pins.
+- **Fields.** A step writes named fields, one value per cell (for example `elevation`, `temp`, `province`, `owner`). Fields by step: sketch (`land`, `sketch`, `mountain_hint`), plates (`plate`, `crust`, `vel_e`, `vel_n`), tectonics (`elevation`, `boundary`, `ocean_age`, `stress`), climate (`temp`, `precip`, `wind_u`, `wind_v`, `t_mean`, `t_warm`, `t_cold`, `p_ann`, `continentality`, `current_offset`), hydrology (`elevation`, `water`, `lake`, `water_level`, `discharge`, `drainage_area`, `river`, `river_rank`, `river_width`, `receiver`, `erosion`, `temp_adjust`), biomes (`koppen`, `terrain`, `relief`), habitability (`habitability`, `barrier`, `river_role`, `groundwater`, `site`, `site_kind`, `fertility`), states (`state`, `region`, `continent`), provinces (`province`, `province_kind`, `state`, `trade_good`), cultures (`culture`, `culture_group`, `population`, `attraction`), nations (`owner`, `nation_culture`, `nation_population`, `nation_attraction`, `railway`, `road`, `airport`, `port`, `nation_era`, `institutions`, `institution`, `realm`, `imperial`).
+- **Meta.** Each step also returns a JSON summary (`meta`) with its tables: Stage 2 has the province, state, region and adjacency tables; Stage 3 the cultures, groups, events and province shares; Stage 4 the nations, events, railways, stations, roads, airports, ports, institutions, empires and feudal titles, cities, ruins and pins.
 - **Province graph.** From Stage 2 on, most work happens on the province graph (a few thousand nodes) rather than on cells. Borders carry a type (land, river, impassable, coast, lake, sea, strait), a length and a barrier cost.
 
 ## Steps, staleness and caching
@@ -82,5 +82,5 @@ The same seed, parameters, edits and directives always give the same world. Rand
 | --- | --- |
 | Level-8 world, Stages 1–2 | about 7 s on a desktop (about 22 s in the container) |
 | Cultures, 5,000 bands × 400 generations | about 10 s |
-| Nations, 800–1949 in 2-year steps (level 6) | about 3 s |
+| Nations, 800–1949 in 2-, 1- and ½-year steps (level 6) | about 5 s |
 | Export 8192 × 4096 | about 28 s with the province clean-up |
