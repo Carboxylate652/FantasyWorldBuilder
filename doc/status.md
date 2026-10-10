@@ -59,4 +59,4 @@ Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.
 
 ## Releases
 
-The Stage 4 work (`6a48fc2`, `47d346d`, `a63f795`) and this documentation were merged into `main` by PR #6 and released as 0.2.0-beta.1; 0.2.0-beta.2 added core performance and persistence work. Institutions, ports, tags, feudal empires and the step schedule are unreleased.
+The Stage 4 work (`6a48fc2`, `47d346d`, `a63f795`) and this documentation were merged into `main` by PR #6 and released as 0.2.0-beta.1; 0.2.0-beta.2 added core performance and persistence work. 0.3.0-beta.1 (PR #9) added institutions, ports, tags, feudal empires, the month clock with its step schedule, the transport display and old mountains.

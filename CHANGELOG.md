@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0-beta.1
 
 Institutions, ports, feudal empires and finer time steps for Stage 4; old mountains in Stage 1.
 
