@@ -138,18 +138,43 @@ code { background: #0d1015; padding: 1px 5px; border-radius: 4px; }
 #brushbar b { font-weight: 500; font-variant-numeric: tabular-nums; min-width: 52px; }
 #brushbar input[type=range] { width: 110px; }
 #brushbar .hint { font-size: 11.5px; }
+/* Right column over the map: the step-by-step panel on top, the legend at the bottom. They share
+   the column's height and each scrolls on its own, so neither covers the other. */
+#side {
+  position: absolute; right: 12px; top: 12px; bottom: 12px; width: 370px; max-width: calc(100% - 200px);
+  display: flex; flex-direction: column; align-items: flex-end; gap: 8px; pointer-events: none; z-index: 3;
+}
+#side > * { pointer-events: auto; }
 #legend {
-  position: absolute; right: 12px; bottom: 12px; max-width: 300px; max-height: 60%; overflow-y: auto;
+  margin-top: auto; flex: 0 1 auto; min-height: 48px; max-width: 300px; overflow-y: auto;
   background: rgba(20,24,31,.9); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
 }
-#legend:empty { display: none; }
+#legend:empty, #legend.hidden { display: none; }
+/* Cursor readout: one line per info tag, wrapping instead of being cut off. */
+#hover {
+  display: none; position: absolute; left: 12px; bottom: 12px; max-width: min(520px, max(240px, calc(100% - 340px))); max-height: 45%;
+  overflow-y: auto; background: rgba(20,24,31,.92); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
+  font-size: 12px; font-variant-numeric: tabular-nums; pointer-events: none; z-index: 2;
+}
+#hover.show { display: grid; gap: 2px; }
+.hv-row { display: grid; grid-template-columns: 116px 1fr; gap: 8px; }
+.hv-tag { color: var(--muted); }
+#infotags {
+  display: none; position: fixed; left: 12px; bottom: 34px; width: min(420px, calc(100vw - 24px)); z-index: 6;
+  flex-direction: column; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.4);
+}
+#infotags.show { display: flex; }
+#infotags .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+#infotags .chip { border-radius: 12px; padding: 2px 10px; font-size: 12px; color: var(--muted); }
+#infotags .chip.on { background: rgba(217,164,65,.16); border-color: var(--accent); color: var(--text); }
 .lg-title { font-weight: 600; margin-bottom: 6px; }
 .grad { height: 10px; border-radius: 3px; width: 240px; }
 .grad-l { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 2px; }
 .items { display: grid; gap: 2px; font-size: 11.5px; }
 .items i { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
 #toast {
-  position: absolute; left: 50%; bottom: 16px; transform: translate(-50%, 20px); opacity: 0; pointer-events: none;
+  position: absolute; left: 50%; bottom: 16px; transform: translate(-50%, 20px); opacity: 0; pointer-events: none; z-index: 5;
   background: #232a36; border: 1px solid #3a4456; padding: 7px 14px; border-radius: 8px; transition: all .2s; max-width: 70%;
 }
 #toast.show { opacity: 1; transform: translate(-50%, 0); }
@@ -160,7 +185,6 @@ code { background: #0d1015; padding: 1px 5px; border-radius: 4px; }
   display: flex; justify-content: space-between; gap: 16px; padding: 5px 12px; background: var(--panel); border-top: 1px solid var(--line);
   color: #b8c0cc; font-variant-numeric: tabular-nums; min-height: 28px; white-space: nowrap; overflow: hidden;
 }
-#hover { overflow: hidden; text-overflow: ellipsis; }
 #progress { display: flex; align-items: center; gap: 8px; }
 #progress progress { width: 160px; accent-color: var(--accent); }
 
@@ -207,8 +231,8 @@ table.ovr tr.muted td { color: var(--muted); }
 /* Live simulation panel (Stages 3 and 4) */
 #simpanel { display: none; }
 #simpanel.show {
-  display: flex; flex-direction: column; gap: 6px; position: absolute; right: 12px; top: 12px; width: 370px; max-width: calc(100% - 200px);
-  max-height: calc(100% - 140px); overflow-y: auto; background: rgba(20,24,31,.94); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; z-index: 3;
+  display: flex; flex-direction: column; gap: 6px; width: 100%; flex: 0 4 auto; min-height: 120px;
+  overflow-y: auto; background: rgba(20,24,31,.94); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
 }
 #simpanel .sim-head { display: flex; justify-content: space-between; align-items: baseline; }
 #simpanel .row { display: flex; gap: 6px; align-items: center; }
