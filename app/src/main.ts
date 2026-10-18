@@ -100,7 +100,7 @@ async function boot() {
         h('div', { id: 'toast' }),
       ),
     ),
-    h('footer', { id: 'statusbar' }, h('span', { id: 'hover' }, 'Hover the planet for cell details.'), h('span', { id: 'progress' })),
+    h('footer', { id: 'statusbar' }, h('span', { id: 'infotags' }), h('span', { id: 'hover' }, 'Hover the planet for cell details.'), h('span', { id: 'progress' })),
   );
   try {
     R = new Renderer($('#canvas') as HTMLCanvasElement);
@@ -110,6 +110,7 @@ async function boot() {
   }
   bindCanvas();
   bindKeys();
+  renderInfoTags();
   // Handle for debugging from the devtools console.
   (window as any).fwm = { R, S };
   try {
@@ -2002,12 +2003,24 @@ function renderToolbar() {
   bb.append(h('span', { class: 'muted hint' }, t.hint));
 }
 
+let legendCollapsed = (() => { try { return localStorage.getItem('fwm.legend.collapsed') === '1'; } catch { return false; } })();
+
 function renderLegend(stale: boolean) {
   const lg = $('#legend');
   lg.innerHTML = '';
   const L = S.legend;
   if (!L) return;
-  lg.append(h('div', { class: 'lg-title' }, L.title, stale ? h('span', { class: 'pill stale' }, 'stale') : null));
+  const n = L.items?.length ?? 0;
+  lg.classList.toggle('collapsed', legendCollapsed);
+  lg.classList.toggle('wide', n > 10);
+  lg.append(h('div', { class: 'lg-title', title: legendCollapsed ? 'Show the legend' : 'Hide the legend', onclick: () => {
+    legendCollapsed = !legendCollapsed;
+    try { localStorage.setItem('fwm.legend.collapsed', legendCollapsed ? '1' : '0'); } catch { /* ignore */ }
+    renderLegend(stale);
+  } }, h('span', { class: 'lg-caret' }, legendCollapsed ? '▸' : '▾'), h('span', { class: 'lg-name' }, L.title),
+    legendCollapsed && n ? h('span', { class: 'muted' }, ` (${n})`) : null, stale ? h('span', { class: 'pill stale' }, 'stale') : null));
+  renderHover();
+  if (legendCollapsed) return;
   if (L.gradient) {
     const st = L.gradient.stops;
     const lo = st[0][0], hi = st[st.length - 1][0];
@@ -2017,7 +2030,7 @@ function renderLegend(stale: boolean) {
   }
   if (L.items) {
     const box = h('div', { class: 'items' });
-    for (const it of L.items.slice(0, 24)) box.append(h('div', {}, h('i', { style: `background: rgb(${it.color.map(Math.round).join(',')})` }), it.label));
+    for (const it of L.items) box.append(h('div', { title: it.label }, h('i', { style: `background: rgb(${it.color.map(Math.round).join(',')})` }), it.label));
     lg.append(box);
   }
 }
@@ -2275,7 +2288,8 @@ function hover(p: Vec3 | null) {
       const d = await api.json('probe', { cell: c, month: S.month });
       if (d.state !== undefined) await political();
       if (c !== hoverCell) return;
-      $('#hover').textContent = describe(d);
+      lastProbe = d;
+      renderHover();
     } catch { /* ignore */ }
   }, 60);
 }
@@ -2284,13 +2298,98 @@ function riverClass(w: number): string {
   return w >= 1000 ? 'great river' : w >= 400 ? 'major river' : w >= 150 ? 'river' : 'stream';
 }
 
-function describe(d: any): string {
-  const parts: string[] = [];
+// ------------------------------------------------------------------ info tags (status bar)
+
+/** Kinds of cell information in the status bar; the tags choose which are shown. */
+const INFO_TAGS = [
+  ['relief', 'Relief', 'Elevation, plate and boundary'],
+  ['climate', 'Climate', 'Temperature, rain and Köppen class'],
+  ['water', 'Water', 'Rivers and lakes'],
+  ['land', 'Land', 'Terrain, habitability and springs'],
+  ['province', 'Province', 'Province, goods, state, region and continent'],
+  ['culture', 'Culture', 'Culture and population density'],
+  ['nation', 'Nation', 'Owner, era, realm and institutions'],
+  ['transport', 'Transport', 'Railways, roads, ports and airports'],
+] as const;
+type InfoTag = (typeof INFO_TAGS)[number][0];
+
+/** The tags Auto shows for each layer group. */
+const AUTO_TAGS: Record<string, InfoTag[]> = {
+  Planet: ['relief'],
+  Climate: ['climate', 'relief'],
+  Water: ['water', 'relief'],
+  Biomes: ['climate', 'land'],
+  Political: ['land', 'province'],
+  Cultures: ['culture', 'province'],
+  Nations: ['nation', 'transport'],
+};
+
+const infoTags: { auto: boolean; on: InfoTag[] } = (() => {
+  try {
+    const v = JSON.parse(localStorage.getItem('fwm.infotags') ?? '');
+    if (typeof v?.auto === 'boolean' && Array.isArray(v.on)) return { auto: v.auto, on: v.on.filter((t: string) => INFO_TAGS.some((x) => x[0] === t)) };
+  } catch { /* ignore */ }
+  return { auto: true, on: ['relief', 'climate', 'province', 'nation'] };
+})();
+let lastProbe: any = null;
+
+function activeTags(): Set<InfoTag> {
+  if (!infoTags.auto) return new Set(infoTags.on);
+  const group = LAYERS.find((l) => l.id === S.layer)?.group ?? 'Planet';
+  const tags = new Set<InfoTag>(AUTO_TAGS[group] ?? ['relief']);
+  if (S.layer === 'transport' || S.layer === 'railways') tags.add('transport');
+  return tags;
+}
+
+function renderInfoTags() {
+  const box = $('#infotags');
+  box.innerHTML = '';
+  const active = activeTags();
+  const save = () => {
+    try { localStorage.setItem('fwm.infotags', JSON.stringify(infoTags)); } catch { /* ignore */ }
+    renderInfoTags();
+    renderHover();
+  };
+  box.append(h('button', { class: infoTags.auto ? 'tag on' : 'tag', title: 'Show what fits the current map layer', onclick: () => {
+    infoTags.auto = !infoTags.auto;
+    if (!infoTags.auto) infoTags.on = [...active];
+    save();
+  } }, 'Auto'));
+  for (const [id, label, tip] of INFO_TAGS) {
+    box.append(h('button', { class: active.has(id) ? (infoTags.auto ? 'tag auto' : 'tag on') : 'tag', title: tip, onclick: () => {
+      const on = new Set(active);
+      if (on.has(id)) on.delete(id); else on.add(id);
+      infoTags.auto = false;
+      infoTags.on = INFO_TAGS.map((t) => t[0]).filter((t) => on.has(t));
+      save();
+    } }, label));
+  }
+}
+
+/** The status-bar text for the last probed cell, limited to the active tags; the tooltip holds everything. */
+function renderHover() {
+  const el = $('#hover');
+  if (infoTags.auto) renderInfoTags();
+  if (!lastProbe) return;
+  const parts = describe(lastProbe);
+  const active = activeTags();
+  const shown = parts.filter(([tag]) => tag === 'place' || active.has(tag as InfoTag));
+  el.textContent = shown.map((x) => x[1]).join('  ·  ');
+  el.title = INFO_TAGS.map(([id, label]) => [label, parts.filter(([t]) => t === id).map((x) => x[1]).join(' · ')])
+    .filter(([, v]) => v).map(([l, v]) => `${l}: ${v}`).join('\n');
+}
+
+function describe(d: any): [string, string][] {
+  const out: [string, string][] = [];
+  let tag = 'place';
+  const parts = { push: (s: string) => out.push([tag, s]) };
   const ns = d.lat >= 0 ? 'N' : 'S', ew = d.lon >= 0 ? 'E' : 'W';
   parts.push(`${Math.abs(d.lat).toFixed(1)}°${ns} ${Math.abs(d.lon).toFixed(1)}°${ew}`);
+  tag = 'relief';
   if (d.elevation !== undefined) parts.push(`${Math.round(d.elevation).toLocaleString()} m`);
   if (d.plate !== undefined) parts.push(`plate #${d.plate}${d.crust === 1 ? ' (continental)' : d.crust === 0 ? ' (oceanic)' : ''}`);
   if (d.boundary) parts.push(BOUNDARY[d.boundary][0]);
+  tag = 'climate';
   const adj = d.temp_adjust ?? 0;
   if (Array.isArray(d.temp)) {
     const mean = d.temp.reduce((a: number, b: number) => a + b, 0) / 12 + adj;
@@ -2298,11 +2397,16 @@ function describe(d: any): string {
   } else if (typeof d.temp === 'number') parts.push(`${(d.temp + adj).toFixed(1)} °C in ${MONTHS[S.month ?? 0]}`);
   if (d.p_ann !== undefined) parts.push(`${Math.round(d.p_ann).toLocaleString()} mm/yr`);
   if (d.koppen) parts.push(`${KOPPEN[d.koppen][0]} ${KOPPEN[d.koppen][2]}`);
+  tag = 'land';
   if (d.terrain !== undefined) parts.push(TERRAIN[d.terrain][0]);
+  tag = 'water';
   if (d.river) parts.push(`${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, ${Math.round(d.discharge).toLocaleString()} m³/s, order ${d.river}`);
   if (d.lake) parts.push(['', 'fresh lake', 'salt lake', 'dry lake'][d.lake]);
+  tag = 'land';
+  if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
   if (d.habitability !== undefined && d.water === 0) parts.push(`habitability ${d.habitability.toFixed(2)}${d.river_role === 1 ? ', border river' : d.river_role === 2 ? ', backbone river' : ''}`);
   const P = S.political;
+  tag = 'province';
   if (P && d.province) {
     const p = P.byProv.get(d.province);
     if (p) {
@@ -2317,28 +2421,31 @@ function describe(d: any): string {
     const ct = s ? P.byCont.get(s.continent) : null;
     if (s) parts.push(`state ${s.name} (#${s.id})${r ? ', ' + r.name + ' (region #' + r.id + ')' : ''}${ct ? ', ' + ct.name : ''}`);
   }
+  tag = 'nation';
   if (d.owner) {
     const n = SIM.nations.get(d.owner) ?? P?.byNation.get(d.owner);
     parts.push(n ? `${n.name} (nation #${n.id}, ${n.government})` : `nation #${d.owner}`);
   } else if (d.owner === 0 && d.water === 0) parts.push('no ruler');
+  tag = 'transport';
   if (d.railway) parts.push(d.railway === 3 ? 'railway junction' : d.railway === 2 ? 'railway station' : 'railway');
   if (d.road) parts.push(['', 'track', 'paved road', 'highway'][d.road] ?? 'road');
   if (d.airport) parts.push('airport');
   if (d.port === 2) parts.push('port');
   else if (d.port === 1) parts.push('good harbour');
+  tag = 'nation';
   if (d.institutions) parts.push(`institutions: ${INSTITUTION_NAMES.filter((_, k) => (d.institutions >> k) & 1).join(', ')}`);
   if (d.realm && d.owner && d.realm !== d.owner) {
     const r = SIM.nations.get(d.realm) ?? S.political?.byNation.get(d.realm);
     parts.push(`realm of ${r ? r.name : '#' + d.realm}${d.imperial ? ' (imperial territory)' : ''}`);
   }
   if (d.nation_era) parts.push(`${ERA_NAMES[d.nation_era - 1]} era`);
+  tag = 'culture';
   if (d.culture) {
     const c = SIM.cultures.get(d.culture) ?? P?.byCulture.get(d.culture), g = c && P ? P.byGroup.get(c.group) : null;
     if (c) parts.push(`${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}`);
   }
   if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
-  if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
-  return parts.join('  ·  ');
+  return out;
 }
 
 function bindKeys() {

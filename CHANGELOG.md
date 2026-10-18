@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Info tags in the status line:** choose which kinds of cell information are shown (relief, climate, water, land, province, culture, nation, transport), or let *Auto* pick what fits the current map layer; hover the status line for everything. The line no longer runs off the screen.
+- **Legend:** long lists use two columns and are no longer cut off after 24 entries; click the title to fold the legend away.
+
 ## 0.3.0-beta.1
 
 Institutions, ports, feudal empires and finer time steps for Stage 4; old mountains in Stage 1.
