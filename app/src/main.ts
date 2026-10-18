@@ -95,13 +95,24 @@ async function boot() {
         h('canvas', { id: 'canvas' }),
         h('div', { id: 'toolbar' }),
         h('div', { id: 'brushbar' }),
-        h('div', { id: 'legend' }),
-        h('div', { id: 'simpanel' }),
+        h('div', { id: 'side' }, h('div', { id: 'simpanel' }), h('div', { id: 'legend' })),
+        h('div', { id: 'hover' }),
         h('div', { id: 'toast' }),
       ),
     ),
-    h('footer', { id: 'statusbar' }, h('span', { id: 'hover' }, 'Hover the planet for cell details.'), h('span', { id: 'progress' })),
+    h('footer', { id: 'statusbar' },
+      h('span', { class: 'row' },
+        h('button', { id: 'infotags-btn', class: 'small', title: 'Choose which information the cursor readout shows', onclick: () => $('#infotags').classList.toggle('show') }),
+        h('span', { class: 'muted' }, 'Hover the planet for cell details.')),
+      h('span', { id: 'progress' })),
+    h('div', { id: 'infotags' }),
   );
+  $('#legend').classList.toggle('hidden', !INFO.legend);
+  renderInfoTags();
+  document.addEventListener('pointerdown', (e) => {
+    const t = e.target as Node;
+    if (!$('#infotags').contains(t) && !$('#infotags-btn').contains(t)) $('#infotags').classList.remove('show');
+  });
   try {
     R = new Renderer($('#canvas') as HTMLCanvasElement);
   } catch (e) {
@@ -2018,6 +2029,7 @@ function renderLegend(stale: boolean) {
   if (L.items) {
     const box = h('div', { class: 'items' });
     for (const it of L.items.slice(0, 24)) box.append(h('div', {}, h('i', { style: `background: rgb(${it.color.map(Math.round).join(',')})` }), it.label));
+    if (L.items.length > 24) box.append(h('div', { class: 'muted' }, `and ${L.items.length - 24} more`));
     lg.append(box);
   }
 }
@@ -2196,7 +2208,12 @@ function bindCanvas() {
   };
   cv.addEventListener('pointerup', end);
   cv.addEventListener('pointercancel', end);
-  cv.addEventListener('pointerleave', () => { if (!drag) drawBrush(null); });
+  cv.addEventListener('pointerleave', () => {
+    if (!drag) drawBrush(null);
+    hoverCell = -1;
+    clearTimeout(hoverTimer);
+    $('#hover').classList.remove('show');
+  });
 
   cv.addEventListener('wheel', (e) => {
     e.preventDefault();
@@ -2263,6 +2280,76 @@ function paintPreview(d: Extract<Drag, { kind: 'stroke' }>, p: Vec3) {
 
 let hoverTimer: number | undefined;
 let hoverCell = -1;
+/** Readout of the last hovered cell, kept so changing the info tags redraws it at once. */
+let hoverInfo: [InfoTag, string][] | null = null;
+
+/** Kinds of information the hover readout can show; the info tags pick which. */
+const INFO_TAGS = [
+  ['place', 'Position'],
+  ['relief', 'Relief and plates'],
+  ['climate', 'Climate'],
+  ['terrain', 'Terrain'],
+  ['water', 'Rivers, lakes, springs'],
+  ['habitability', 'Habitability'],
+  ['province', 'Province and goods'],
+  ['state', 'State and region'],
+  ['culture', 'Culture'],
+  ['population', 'Population'],
+  ['nation', 'Nation and realm'],
+  ['transport', 'Transport and ports'],
+  ['institutions', 'Institutions'],
+] as const;
+type InfoTag = (typeof INFO_TAGS)[number][0];
+
+/** Info tags turned off, and whether the map legend is hidden; remembered between sessions. */
+const INFO = loadInfoPrefs();
+function loadInfoPrefs(): { off: Set<InfoTag>; legend: boolean } {
+  try {
+    const p = JSON.parse(localStorage.getItem('fwm.info') ?? '{}');
+    return { off: new Set(Array.isArray(p.off) ? p.off : []), legend: p.legend !== false };
+  } catch {
+    return { off: new Set(), legend: true };
+  }
+}
+function saveInfoPrefs() {
+  try {
+    localStorage.setItem('fwm.info', JSON.stringify({ off: [...INFO.off], legend: INFO.legend }));
+  } catch { /* ignore */ }
+}
+
+function renderHover() {
+  const box = $('#hover');
+  box.innerHTML = '';
+  const shown = (hoverInfo ?? []).filter(([t]) => !INFO.off.has(t));
+  box.className = shown.length ? 'show' : '';
+  for (const [t, text] of shown) {
+    box.append(h('div', { class: 'hv-row' }, h('span', { class: 'hv-tag' }, INFO_TAGS.find(([k]) => k === t)![1]), h('span', {}, text)));
+  }
+}
+
+function renderInfoTags() {
+  const btn = $('#infotags-btn');
+  const on = INFO_TAGS.length - INFO.off.size;
+  btn.textContent = `Info tags ${on}/${INFO_TAGS.length}`;
+  const menu = $('#infotags');
+  menu.innerHTML = '';
+  const set = (off: InfoTag[]) => { INFO.off = new Set(off); saveInfoPrefs(); renderInfoTags(); renderHover(); };
+  menu.append(h('div', { class: 'row' }, h('b', {}, 'Show under the cursor'), h('span', { class: 'spacer' }),
+    h('button', { class: 'small', onclick: () => set([]) }, 'All'),
+    h('button', { class: 'small', onclick: () => set(INFO_TAGS.map(([k]) => k)) }, 'None')));
+  const chips = h('div', { class: 'chips' });
+  for (const [k, label] of INFO_TAGS) {
+    chips.append(h('button', { class: INFO.off.has(k) ? 'chip' : 'chip on', 'aria-pressed': String(!INFO.off.has(k)), onclick: () => {
+      if (INFO.off.has(k)) INFO.off.delete(k); else INFO.off.add(k);
+      saveInfoPrefs(); renderInfoTags(); renderHover();
+    } }, label));
+  }
+  menu.append(chips, h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: INFO.legend, onchange: (e: Event) => {
+    INFO.legend = (e.target as HTMLInputElement).checked;
+    saveInfoPrefs();
+    $('#legend').classList.toggle('hidden', !INFO.legend);
+  } }), 'Show the map legend'));
+}
 function hover(p: Vec3 | null) {
   if (!p || !S.grid) return;
   const c = S.grid.nearest(p, hoverCell >= 0 ? hoverCell : undefined);
@@ -2275,7 +2362,8 @@ function hover(p: Vec3 | null) {
       const d = await api.json('probe', { cell: c, month: S.month });
       if (d.state !== undefined) await political();
       if (c !== hoverCell) return;
-      $('#hover').textContent = describe(d);
+      hoverInfo = describe(d);
+      renderHover();
     } catch { /* ignore */ }
   }, 60);
 }
@@ -2284,61 +2372,69 @@ function riverClass(w: number): string {
   return w >= 1000 ? 'great river' : w >= 400 ? 'major river' : w >= 150 ? 'river' : 'stream';
 }
 
-function describe(d: any): string {
-  const parts: string[] = [];
+/** The hover readout of a probed cell: one entry per kind of information, in display order. */
+function describe(d: any): [InfoTag, string][] {
+  const parts: [InfoTag, string][] = [];
+  const add = (tag: InfoTag, text: string) => {
+    const same = parts.find(([t]) => t === tag);
+    if (same) same[1] += '  ·  ' + text;
+    else parts.push([tag, text]);
+  };
   const ns = d.lat >= 0 ? 'N' : 'S', ew = d.lon >= 0 ? 'E' : 'W';
-  parts.push(`${Math.abs(d.lat).toFixed(1)}°${ns} ${Math.abs(d.lon).toFixed(1)}°${ew}`);
-  if (d.elevation !== undefined) parts.push(`${Math.round(d.elevation).toLocaleString()} m`);
-  if (d.plate !== undefined) parts.push(`plate #${d.plate}${d.crust === 1 ? ' (continental)' : d.crust === 0 ? ' (oceanic)' : ''}`);
-  if (d.boundary) parts.push(BOUNDARY[d.boundary][0]);
+  add('place', `${Math.abs(d.lat).toFixed(1)}°${ns} ${Math.abs(d.lon).toFixed(1)}°${ew}`);
+  if (d.elevation !== undefined) add('relief', `${Math.round(d.elevation).toLocaleString()} m`);
+  if (d.plate !== undefined) add('relief', `plate #${d.plate}${d.crust === 1 ? ' (continental)' : d.crust === 0 ? ' (oceanic)' : ''}`);
+  if (d.boundary) add('relief', BOUNDARY[d.boundary][0]);
   const adj = d.temp_adjust ?? 0;
   if (Array.isArray(d.temp)) {
     const mean = d.temp.reduce((a: number, b: number) => a + b, 0) / 12 + adj;
-    parts.push(`${mean.toFixed(1)} °C (${(Math.min(...d.temp) + adj).toFixed(0)} to ${(Math.max(...d.temp) + adj).toFixed(0)})`);
-  } else if (typeof d.temp === 'number') parts.push(`${(d.temp + adj).toFixed(1)} °C in ${MONTHS[S.month ?? 0]}`);
-  if (d.p_ann !== undefined) parts.push(`${Math.round(d.p_ann).toLocaleString()} mm/yr`);
-  if (d.koppen) parts.push(`${KOPPEN[d.koppen][0]} ${KOPPEN[d.koppen][2]}`);
-  if (d.terrain !== undefined) parts.push(TERRAIN[d.terrain][0]);
-  if (d.river) parts.push(`${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, ${Math.round(d.discharge).toLocaleString()} m³/s, order ${d.river}`);
-  if (d.lake) parts.push(['', 'fresh lake', 'salt lake', 'dry lake'][d.lake]);
-  if (d.habitability !== undefined && d.water === 0) parts.push(`habitability ${d.habitability.toFixed(2)}${d.river_role === 1 ? ', border river' : d.river_role === 2 ? ', backbone river' : ''}`);
+    add('climate', `${mean.toFixed(1)} °C (${(Math.min(...d.temp) + adj).toFixed(0)} to ${(Math.max(...d.temp) + adj).toFixed(0)})`);
+  } else if (typeof d.temp === 'number') add('climate', `${(d.temp + adj).toFixed(1)} °C in ${MONTHS[S.month ?? 0]}`);
+  if (d.p_ann !== undefined) add('climate', `${Math.round(d.p_ann).toLocaleString()} mm/yr`);
+  if (d.koppen) add('climate', `${KOPPEN[d.koppen][0]} ${KOPPEN[d.koppen][2]}`);
+  if (d.terrain !== undefined) add('terrain', TERRAIN[d.terrain][0]);
+  if (d.river) add('water', `${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, ${Math.round(d.discharge).toLocaleString()} m³/s, order ${d.river}`);
+  if (d.lake) add('water', ['', 'fresh lake', 'salt lake', 'dry lake'][d.lake]);
+  if (d.habitability !== undefined && d.water === 0) add('habitability', `${d.habitability.toFixed(2)}${d.river_role === 1 ? ', border river' : d.river_role === 2 ? ', backbone river' : ''}`);
   const P = S.political;
   if (P && d.province) {
     const p = P.byProv.get(d.province);
     if (p) {
-      parts.push(`${p.name} (province ${p.id}, ${p.kind}${p.band ? ' ' + p.band : ''}, ${Math.round(p.area_km2 / 1000)}k km²)`);
+      add('province', `${p.name} (province ${p.id}, ${p.kind}${p.band ? ' ' + p.band : ''}, ${Math.round(p.area_km2 / 1000)}k km²)`);
       const goods = [p.trade_good && p.trade_good !== 'none' ? p.trade_good : null, ...(p.resources ?? [])].filter(Boolean);
-      if (goods.length) parts.push(goods.join(', '));
+      if (goods.length) add('province', goods.join(', '));
     }
   }
   if (P && d.state) {
     const s = P.byState.get(d.state);
     const r = s ? P.byRegion.get(s.region) : null;
     const ct = s ? P.byCont.get(s.continent) : null;
-    if (s) parts.push(`state ${s.name} (#${s.id})${r ? ', ' + r.name + ' (region #' + r.id + ')' : ''}${ct ? ', ' + ct.name : ''}`);
+    if (s) add('state', `state ${s.name} (#${s.id})${r ? ', ' + r.name + ' (region #' + r.id + ')' : ''}${ct ? ', ' + ct.name : ''}`);
   }
   if (d.owner) {
     const n = SIM.nations.get(d.owner) ?? P?.byNation.get(d.owner);
-    parts.push(n ? `${n.name} (nation #${n.id}, ${n.government})` : `nation #${d.owner}`);
-  } else if (d.owner === 0 && d.water === 0) parts.push('no ruler');
-  if (d.railway) parts.push(d.railway === 3 ? 'railway junction' : d.railway === 2 ? 'railway station' : 'railway');
-  if (d.road) parts.push(['', 'track', 'paved road', 'highway'][d.road] ?? 'road');
-  if (d.airport) parts.push('airport');
-  if (d.port === 2) parts.push('port');
-  else if (d.port === 1) parts.push('good harbour');
-  if (d.institutions) parts.push(`institutions: ${INSTITUTION_NAMES.filter((_, k) => (d.institutions >> k) & 1).join(', ')}`);
+    add('nation', n ? `${n.name} (nation #${n.id}, ${n.government})` : `nation #${d.owner}`);
+  } else if (d.owner === 0 && d.water === 0) add('nation', 'no ruler');
+  if (d.railway) add('transport', d.railway === 3 ? 'railway junction' : d.railway === 2 ? 'railway station' : 'railway');
+  if (d.road) add('transport', ['', 'track', 'paved road', 'highway'][d.road] ?? 'road');
+  if (d.airport) add('transport', 'airport');
+  if (d.port === 2) add('transport', 'port');
+  else if (d.port === 1) add('transport', 'good harbour');
+  if (d.institutions) add('institutions', INSTITUTION_NAMES.filter((_, k) => (d.institutions >> k) & 1).join(', '));
   if (d.realm && d.owner && d.realm !== d.owner) {
     const r = SIM.nations.get(d.realm) ?? S.political?.byNation.get(d.realm);
-    parts.push(`realm of ${r ? r.name : '#' + d.realm}${d.imperial ? ' (imperial territory)' : ''}`);
+    add('nation', `realm of ${r ? r.name : '#' + d.realm}${d.imperial ? ' (imperial territory)' : ''}`);
   }
-  if (d.nation_era) parts.push(`${ERA_NAMES[d.nation_era - 1]} era`);
+  if (d.nation_era) add('nation', `${ERA_NAMES[d.nation_era - 1]} era`);
   if (d.culture) {
     const c = SIM.cultures.get(d.culture) ?? P?.byCulture.get(d.culture), g = c && P ? P.byGroup.get(c.group) : null;
-    if (c) parts.push(`${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}`);
+    if (c) add('culture', `${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}`);
   }
-  if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
-  if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
-  return parts.join('  ·  ');
+  if (d.population) add('population', `${d.population.toFixed(1)} people/km²`);
+  if (d.site_kind === 3) add('culture', 'site pin');
+  else if (d.site_kind) add('water', `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
+  const order = INFO_TAGS.map(([k]) => k as InfoTag);
+  return parts.sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]));
 }
 
 function bindKeys() {

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Info tags:** the cursor readout is now a panel over the bottom-left of the map with one line per kind of information (position, relief, climate, terrain, water, habitability, province, state, culture, population, nation, transport, institutions), so long readouts wrap instead of being cut off at the edge of the status line. *Info tags* in the status bar picks which kinds are shown and can hide the map legend; the choice is remembered.
+- **No more overlapping panels:** the step-by-step panel and the legend share the right side of the map and each scroll on their own instead of covering each other. A legend with more than 24 entries says how many are not listed.
+
 ## 0.3.0-beta.1
 
 Institutions, ports, feudal empires and finer time steps for Stage 4; old mountains in Stage 1.
