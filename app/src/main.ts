@@ -720,10 +720,27 @@ function renderTopbar() {
 function stageButtons(st: Status): HTMLElement {
   const done = (step: string) => st.steps.find((s) => s.key === step)?.state === 'done';
   const next = STAGE_ENDS.find((s) => !done(s.step));
+  const stale = st.steps.filter((s) => s.state === 'stale').length;
   return h('div', { class: 'group' },
     next ? h('button', { class: 'primary', disabled: S.busy, title: `Generate everything up to the end of Stage ${next.stage}`, onclick: () => run(next.step) }, `Next: Stage ${next.stage}`) : null,
     ...STAGE_ENDS.map((s) => h('button', { disabled: S.busy, class: done(s.step) ? 'done' : '', title: `Generate up to the end of Stage ${s.stage}`, onclick: () => run(s.step) }, done(s.step) ? `Stage ${s.stage} ✓` : `Stage ${s.stage}`)),
-    h('button', { class: next ? '' : 'primary', disabled: S.busy, onclick: () => run(STAGE_ENDS[STAGE_ENDS.length - 1].step) }, 'Generate all'));
+    h('button', { class: next ? '' : 'primary', disabled: S.busy, onclick: () => run(STAGE_ENDS[STAGE_ENDS.length - 1].step) }, 'Generate all'),
+    stale ? h('button', { class: 'warn', disabled: S.busy, title: 'Remove the results whose inputs changed since they ran (they no longer match your sketch, edits or parameters); your edits stay', onclick: () => clearResults(null, stale) }, `Clear stale (${stale})`) : null);
+}
+
+/** Remove results from a step on (or every stale result); edits stay, the next run rebuilds them. */
+async function clearResults(from: string | null, count: number) {
+  const what = from ? `the results of "${STEPS.find((s) => s.key === from)?.title}" and every later step (${count})` : `${count} stale result${count > 1 ? 's' : ''} (steps whose inputs changed since they ran)`;
+  if (!confirm(`Remove ${what}? Your sketch, edits and parameters stay; run again to rebuild.`)) return;
+  try {
+    const st = await api.json<Status & { cleared: number }>('clear_results', from ? { from } : {});
+    invalidate();
+    if (!st.live) SIM.state = null;
+    toast(`Removed ${st.cleared} result${st.cleared === 1 ? '' : 's'}`);
+    await refreshStatus(st);
+  } catch (e) {
+    toast(String(e), true);
+  }
 }
 
 function undoTarget(): string | undefined {
@@ -1656,7 +1673,10 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
       h('button', { class: 'small', disabled: !e.province_strokes, onclick: () => mutate('clear_layer', { layer: 'provinces' }) }, 'Clear paint')));
   }
 
+  const later = S.status!.steps.slice(idx).filter((x) => x.state !== 'empty').length;
   body.append(h('div', { class: 'actions' },
+    idx > 0 && later ? h('button', { class: 'small', disabled: S.busy, title: `Remove the results of this step and the ${later > 1 ? 'later ones' : 'next'} (your edits stay); run again to rebuild them`,
+      onclick: () => clearResults(ui.key, later) }, 'Clear from here') : null,
     h('button', { class: 'primary', disabled: S.busy || ss.state === 'done', onclick: () => run(ui.key) },
       S.busy ? 'Working…' : ss.state === 'done' ? 'Up to date' : idx === 0 ? 'Build grid' : `Run to step ${idx + 1}`)));
   if (ss.meta && ss.state !== 'empty') body.append(summary(ui.key, ss.meta));

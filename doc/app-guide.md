@@ -12,7 +12,7 @@ The desktop app (Tauri) and the browser UI (`worldgen serve --static app/dist`, 
 - **Status line** (bottom): what is under the cursor — position, elevation, plate, climate, biome, province, state, region, continent (with ids), culture, nation, railway, road, port or good harbour, airport, era, embraced institutions, and the realm and imperial territory of feudal empires. The **info tags** at its left choose which kinds are shown: *Relief*, *Climate*, *Water*, *Land*, *Province*, *Culture*, *Nation*, *Transport*. *Auto* (the default) shows what fits the current map layer (outlined tags); clicking a tag turns Auto off and shows exactly the filled tags. Hover the status line for everything about the cell. The choice is remembered.
 - **Legend** (bottom right): long lists use two columns; click its title to fold it away (remembered).
 
-Changing a parameter marks that step and the later ones as stale; *Auto-update* re-runs the edited step after each stroke.
+Changing a parameter marks that step and the later ones as stale; *Auto-update* re-runs the edited step after each stroke. Map layers show the newest result that is up to date: once you re-run an early step, a stale later result (say the old eroded elevation of Hydrology after a new sketch) no longer hides it. Layers that still need a stale step's fields show a *stale* badge. To remove old results, use *Clear stale (N)* in the top bar (every result whose inputs changed) or *Clear from here* in a step card (that step and every later one). Your sketch, edits and parameters stay, and the next run rebuilds the results.
 
 ## Tools
 

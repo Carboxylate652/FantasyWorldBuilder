@@ -42,7 +42,7 @@ The desktop app and the browser UI (through `worldgen serve`) call the same `wor
 
 ## Steps, staleness and caching
 
-Each step reads the outputs of earlier steps, its own parameters and the override layers that feed it. Its cache key is a hash of exactly those inputs plus a per-step model version (`MODEL_VERSION` in `core/src/stages/mod.rs`). Changing a parameter marks that step and everything after it as stale; nothing earlier is recomputed. When an algorithm changes, bump that step's entry in `MODEL_VERSION` so results saved by older builds are recomputed. A field file changed outside the app fails its content hash on load and the step is recomputed.
+Each step reads the outputs of earlier steps, its own parameters and the override layers that feed it. Its cache key is a hash of exactly those inputs plus a per-step model version (`MODEL_VERSION` in `core/src/stages/mod.rs`). Changing a parameter marks that step and everything after it as stale; nothing earlier is recomputed. Stale results are kept until they are re-run or cleared (`clear_results`), but they never shadow a fresh result: a field is read from the newest step that is up to date, and from a stale step only when no fresh step has it. When an algorithm changes, bump that step's entry in `MODEL_VERSION` so results saved by older builds are recomputed. A field file changed outside the app fails its content hash on load and the step is recomputed.
 
 ## Override layers ("user edits win")
 

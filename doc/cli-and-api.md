@@ -62,6 +62,7 @@ The desktop shell (Tauri command `api`) and `worldgen serve` (POST `/api/<cmd>` 
 | `set_params` | Change parameters (marks steps stale) |
 | `add_stroke`, `add_pin`, `add_arrow` | Add an edit to an override layer |
 | `clear_layer`, `overrides`, `remove_edits` | Manage override layers; list unapplied edits |
+| `clear_results` | `{ from? }`: drop the results of a step and every later one, or (without `from`) every stale result; edits and parameters stay |
 | `export_overrides`, `import_overrides` | Override bundles |
 | `set_auto_base` | Base for the automatic sketch |
 | `import_heightmap`, `import_provinces`, `validate_provinces` | Imports |

@@ -247,3 +247,4 @@ table.ovr tr.muted td { color: var(--muted); }
 #simpanel .callout { border: 1px solid #c9a227; background: rgba(201, 162, 39, 0.12); border-radius: 6px; padding: 6px 8px; display: flex; flex-direction: column; gap: 3px; }
 #simpanel .callout .item { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
 #simpanel .callout .link { cursor: pointer; }
+#topbar button.warn { border-color: #b8873a; color: #f0d29a; }
