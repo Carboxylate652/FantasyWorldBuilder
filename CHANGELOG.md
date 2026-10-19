@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.0-beta.4
+
+Edits to early steps show at once: stale results no longer hide fresh ones, and old results can be cleared.
 
 - **Old results no longer hide new ones:** after changing the sketch, plates or seed and re-running only the early steps, the map showed the old eroded elevation (and lakes, rivers) of the stale Hydrology step, so edits seemed to have no effect. Map layers and the status line now read from the newest step that is up to date.
 - **Clearing results:** *Clear stale (N)* in the top bar removes every result whose inputs changed; *Clear from here* in a step card removes that step's result and every later one. Edits and parameters stay; the next run rebuilds them. API: `clear_results`.
