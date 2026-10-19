@@ -33,7 +33,8 @@ Changing a parameter marks that step and the later ones as stale; *Auto-update* 
 | Provinces | Grow province (O) | The same inside one state; *Import…* for an edited provinces.png |
 | Cultures | Founding band (J), Remove founder | Place founding peoples (number of bands); drag to move; *Pin these* turns random founders into pins |
 | | Attraction (H), Erase attraction | Ghost town (−1) … metropolis (+1) during the culture simulation |
-| Nations | City pin (Y), Remove city pin | In a live Stage 4 run: a boom town or an abandoned city; drag to move |
+| Nations | Nation seed (X), Remove seed | A nation that already exists in the first year: click a province, give a name (or none for its capital's) and a size in provinces (0: the default); drag a seed to move it. The Nations card lists the seeds and the nations placed by chance |
+| | City pin (Y), Remove city pin | In a live Stage 4 run: a boom town or an abandoned city; drag to move |
 
 **Map editor** (*Edit map*, any step): Merge provinces (U), Merge states (drag from the one absorbed onto the absorber, even across a strait), Province → state, Grow province / Grow state, Rename province / Rename state, Paint goods (Q: a trade good, cash crop or deposit, before the culture simulation).
 

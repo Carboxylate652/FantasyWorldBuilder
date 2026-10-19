@@ -27,6 +27,7 @@ type Status = {
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
     site_pins: number; sites: { lat: number; lon: number; population: number }[];
     fertility_strokes: number; attraction_strokes: number; band_pins: { lat: number; lon: number; bands: number }[];
+    nation_seeds?: { lat: number; lon: number; size: number; name: string }[];
   };
   grid: { level: number; cells: number; spacing_km: number };
   path: string | null;
@@ -520,6 +521,13 @@ function drawEditMarkers() {
       if (fill) L.seg(p, offset(p, e, n, Math.cos(a1) * r, Math.sin(a1) * r), col, 0.004);
     }
   };
+  // Nation seeds: red discs with a white rim, larger for larger realms.
+  for (const sd of st.edits.nation_seeds ?? []) {
+    const p = fromLatLon((sd.lat * Math.PI) / 180, (sd.lon * Math.PI) / 180);
+    const r = 0.012 + 0.003 * Math.sqrt(sd.size || 6);
+    ring(p, r * 1.25, [1, 1, 1, 1], false);
+    ring(p, r, [0.85, 0.15, 0.2, 1], true);
+  }
   for (const b of st.edits.band_pins ?? []) ring(fromLatLon((b.lat * Math.PI) / 180, (b.lon * Math.PI) / 180), 0.01 + 0.004 * Math.sqrt(b.bands), [1, 0.85, 0.2, 1], true);
   if (!(st.edits.band_pins ?? []).length) {
     const founders = st.steps.find((s) => s.key === 'cultures')?.meta?.founders ?? [];
@@ -1626,6 +1634,15 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
       h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, `${e.attraction_strokes} attraction strokes`),
         h('button', { class: 'small', disabled: !e.attraction_strokes, onclick: () => mutate('clear_layer', { layer: 'attraction' }, 'cultures') }, 'Clear attraction')));
   }
+  if (ui.key === 'nations') {
+    const seeds = e.nation_seeds ?? [];
+    const n0 = S.status!.params.nations.initial_nations ?? 0;
+    body.append(h('h4', {}, 'Nations at the start'),
+      h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, seeds.length
+        ? `${seeds.length} nation seed${seeds.length > 1 ? 's' : ''} (${seeds.map((x) => x.name || 'unnamed').join(', ')}), then ${n0} more by chance.`
+        : `${n0} nations by chance. Place nation seeds (X) to choose where they are.`),
+        h('button', { class: 'small', disabled: !seeds.length, onclick: () => mutate('clear_layer', { layer: 'nation_seeds' }, 'nations') }, 'Clear seeds')));
+  }
   if (ui.key === 'provinces') {
     const imp = e.province_import;
     body.append(h('h4', {}, 'Imported provinces'),
@@ -1971,6 +1988,7 @@ function renderToolbar() {
       out.textContent = (v > 0 ? '+' : '') + v.toFixed(2);
     } }), out));
   }
+  if (t.value === 'provinces') bb.append(h('label', {}, h('span', {}, 'Provinces (0: default)'), h('input', { type: 'number', step: 1, min: 0, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'bands') bb.append(h('label', {}, h('span', {}, 'Bands'), h('input', { type: 'number', step: 1, min: 1, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'goods') {
     const goods = TRADE_GOODS.map(([g], i) => [g, i + 1] as const).filter(([g]) => g !== 'none');
@@ -2174,7 +2192,7 @@ function bindCanvas() {
         await cityPinGesture(t.id, d.start, d.end, moved);
         return;
       }
-      if (t.gesture === 'link' && !moved && t.id !== 'band_pin') {
+      if (t.gesture === 'link' && !moved && t.id !== 'band_pin' && t.id !== 'nation_seed') {
         toast('Drag from the first place to the second.');
         return;
       }
@@ -2182,6 +2200,11 @@ function bindCanvas() {
       if (t.rename) {
         name = window.prompt(t.id === 'rename_state' ? 'New state name' : 'New province name')?.trim() ?? '';
         if (!name) return;
+      }
+      if (t.id === 'nation_seed' && !moved) {
+        const v = window.prompt('Name of the nation (leave empty for its capital\'s name)', '');
+        if (v === null) return;
+        name = v.trim();
       }
       const stroke = {
         tool: t.rust ?? S.tool,

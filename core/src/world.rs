@@ -194,6 +194,7 @@ impl World {
         write_json(&dir.join("overrides").join("fertility.json"), &self.edits.overrides.fertility)?;
         write_json(&dir.join("overrides").join("bands.json"), &self.edits.overrides.bands)?;
         write_json(&dir.join("overrides").join("attraction.json"), &self.edits.overrides.attraction)?;
+        write_json(&dir.join("overrides").join("nation_seeds.json"), &self.edits.overrides.nation_seeds)?;
         write_json(&dir.join("overrides").join("directives.json"), &self.edits.overrides.directives)?;
         write_json(&dir.join("imports.json"), &self.edits.imports)?;
         write_json(&dir.join("world.json"), &world)?;
@@ -218,6 +219,7 @@ impl World {
             fertility: read_json_optional(&dir.join("overrides").join("fertility.json"))?,
             bands: read_json_optional(&dir.join("overrides").join("bands.json"))?,
             attraction: read_json_optional(&dir.join("overrides").join("attraction.json"))?,
+            nation_seeds: read_json_optional(&dir.join("overrides").join("nation_seeds.json"))?,
             directives: read_json_optional(&dir.join("overrides").join("directives.json"))?,
         };
         let mut w = World::new(params);

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Nations at the start:** some polities already exist in the first year. Place **nation seeds** (Nations card, *Nation seed*, X) with a name and a size in provinces to choose where they are; *Nations at the start* (12) more are placed by chance in the most populous provinces, spaced apart, each of *Their size* (6) provinces. Seeds are a new override layer, `nation_seeds`, that feeds Stage 4 only.
+
 ## 0.3.0-beta.2
 
 A tidier status line and legend.

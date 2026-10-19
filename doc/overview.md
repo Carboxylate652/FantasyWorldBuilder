@@ -55,6 +55,7 @@ Hand edits are stored as override layers, never baked into results:
 | `barriers`, `sites`, `fertility` | Barrier paint, site pins, fertility paint | 8 |
 | `states`, `provinces` | Grow, merge, move, rename, goods paint | 9, 10 |
 | `bands`, `attraction` | Founding-band pins, attraction paint | 11 |
+| `nation_seeds` | Nation-seed pins (nations that exist in the first year) | 12 |
 | `directives` | Step-by-step steering, by hand or by the AI guide | 11, 12 |
 
 Edits are stored in latitude/longitude (strokes, points), not by cell or id, so they replay on any seed or grid level. The price is that an edit can stop applying after a big change (a merge whose end is now sea); such edits are reported (Overrides panel, `worldgen overrides`) and can be pruned. Layers can be exported to an override bundle (`*.fwm-overrides.json`) and imported into another world.

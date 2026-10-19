@@ -76,6 +76,7 @@ impl LayerState {
             (EditLayer::Fertility, LayerState::Strokes(v)) => edits.overrides.fertility = v,
             (EditLayer::Bands, LayerState::Strokes(v)) => edits.overrides.bands = v,
             (EditLayer::Attraction, LayerState::Strokes(v)) => edits.overrides.attraction = v,
+            (EditLayer::NationSeeds, LayerState::Strokes(v)) => edits.overrides.nation_seeds = v,
             _ => unreachable!("history state does not match edit layer"),
         }
     }
@@ -199,7 +200,7 @@ impl Live {
 fn live_inputs(w: &World, step: Step) -> Value {
     match step {
         Step::Cultures => json!([w.params.cultures, w.edits.overrides.bands, w.edits.overrides.attraction]),
-        _ => json!([w.params.nations]),
+        _ => json!([w.params.nations, w.edits.overrides.nation_seeds]),
     }
 }
 
@@ -252,6 +253,7 @@ impl Session {
                 "site_pins": e.overrides.sites.len(),
                 "fertility_strokes": e.overrides.fertility.len(),
                 "attraction_strokes": e.overrides.attraction.len(),
+                "nation_seeds": e.overrides.nation_seeds.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "size": s.value, "name": s.name }))).collect::<Vec<_>>(),
                 "band_pins": e.overrides.bands.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "bands": s.value }))).collect::<Vec<_>>(),
                 "sites": e.overrides.sites.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "population": s.value }))).collect::<Vec<_>>(),
                 "elevation_import": e.imports.elevation,
