@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+The 0.3.0 line out of beta: everything from 0.3.0-beta.1 to 0.3.0-beta.4, with no changes since 0.3.0-beta.4. For those updating from 0.2.0-beta.2:
+
+- **Stage 4 history:** EU4-style institutions that open each era and spread over roads, railways, ports and airports; ports; tags on the world, nations and states; feudal empires; nations that already exist in the first year, with nation seeds to place them.
+- **Finer time:** the Stage 4 clock counts whole months, with steps of 24, 12 and 6 months as the present nears (adjustable).
+- **Stage 1 relief:** old, worn mountain clusters from noise, with brushes to add or flatten them.
+- **Maps and editing:** a transport map with railway stripes and icons; info tags that choose what the status line shows; a two-column, foldable legend; fresh results no longer hidden by stale ones, and *Clear stale* / *Clear from here* to drop old results.
+
+See the beta entries below for details.
+
 ## 0.3.0-beta.4
 
 Edits to early steps show at once: stale results no longer hide fresh ones, and old results can be cleared.
