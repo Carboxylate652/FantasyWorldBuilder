@@ -469,7 +469,7 @@ impl NationSim {
             })
             .filter(|x: &(usize, Vec<usize>)| !x.1.is_empty())
             .collect();
-        Some(NationSim {
+        let mut sim = NationSim {
             year: np.start_year,
             t: np.start_year as i64 * MONTHS,
             next_flush: (np.start_year as i64 + 50) * MONTHS,
@@ -525,7 +525,78 @@ impl NationSim {
             ruined: vec![false; n],
             metropolis: vec![false; n],
             provs,
-        })
+        };
+        sim.seed_nations(ctx);
+        Some(sim)
+    }
+
+    /// Polities that already exist at the start year: the user's nation
+    /// seeds first, then `initial_nations` more in the most populous free
+    /// provinces, spaced apart. Each takes up to its size in provinces
+    /// around its capital, the most populous neighbours first, over land.
+    fn seed_nations(&mut self, ctx: &Ctx) {
+        let size = self.np.initial_size.max(1) as usize;
+        let mut capitals: Vec<usize> = Vec::new();
+        for s in &ctx.edits.overrides.nation_seeds {
+            let Some(&[lat, lon]) = s.points.first() else { continue };
+            let cell = ctx.grid.nearest(Vec3::from_lat_lon_deg(lat, lon), None);
+            let Some(&p) = self.prov_field.get(cell).and_then(|id| self.index.get(id)) else { continue };
+            if !self.provs[p].land || self.owner[p] != 0 {
+                continue;
+            }
+            let id = self.found(p, Some(s.name.clone()), 0);
+            self.grow_seed(id, if s.value >= 1.0 { s.value.round() as usize } else { size });
+            capitals.push(p);
+        }
+        let want = self.np.initial_nations as usize;
+        if want == 0 {
+            return;
+        }
+        // Spacing: about two realms' widths apart (a realm of `size`
+        // provinces spans about √size neighbour steps).
+        let mut steps: Vec<f64> = self.adj.iter().flatten().filter(|e| e.ty == edge::LAND).map(|e| e.km).collect();
+        steps.sort_by(|a, b| a.total_cmp(b));
+        let step = steps.get(steps.len() / 2).copied().unwrap_or(200.0);
+        let spacing = 2.0 * step * (size as f64).sqrt();
+        let mut order: Vec<usize> = (0..self.provs.len()).filter(|&p| self.provs[p].land && self.pop[p] >= self.np.found_population).collect();
+        order.sort_by(|&a, &b| self.pop[b].total_cmp(&self.pop[a]).then(a.cmp(&b)));
+        let mut placed = 0;
+        for p in order {
+            if placed >= want {
+                break;
+            }
+            if self.owner[p] != 0 || capitals.iter().any(|&c| self.km(c, p) < spacing) {
+                continue;
+            }
+            let id = self.found(p, None, 0);
+            self.grow_seed(id, size);
+            capitals.push(p);
+            placed += 1;
+        }
+    }
+
+    /// A seeded polity takes free land around its capital up to `size` provinces.
+    fn grow_seed(&mut self, n: u32, size: usize) {
+        let mut frontier: BTreeSet<usize> = BTreeSet::new();
+        let cap = self.nation(n).capital;
+        let push = |s: &NationSim, frontier: &mut BTreeSet<usize>, p: usize| {
+            for e in &s.adj[p] {
+                let q = e.to as usize;
+                if e.ty == edge::LAND && s.provs[q].land && s.owner[q] == 0 {
+                    frontier.insert(q);
+                }
+            }
+        };
+        push(self, &mut frontier, cap);
+        while self.members[n as usize].len() < size {
+            let Some(q) = frontier.iter().copied().max_by(|&a, &b| self.pop[a].total_cmp(&self.pop[b]).then(b.cmp(&a))) else { break };
+            frontier.remove(&q);
+            if self.owner[q] != 0 {
+                continue;
+            }
+            self.take(q, n);
+            push(self, &mut frontier, q);
+        }
     }
 
     pub fn done(&self) -> bool {

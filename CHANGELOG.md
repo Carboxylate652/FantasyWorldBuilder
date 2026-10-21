@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.0-beta.4
+
+Edits to early steps show at once: stale results no longer hide fresh ones, and old results can be cleared.
+
+- **Old results no longer hide new ones:** after changing the sketch, plates or seed and re-running only the early steps, the map showed the old eroded elevation (and lakes, rivers) of the stale Hydrology step, so edits seemed to have no effect. Map layers and the status line now read from the newest step that is up to date.
+- **Clearing results:** *Clear stale (N)* in the top bar removes every result whose inputs changed; *Clear from here* in a step card removes that step's result and every later one. Edits and parameters stay; the next run rebuilds them. API: `clear_results`.
+
+## 0.3.0-beta.3
+
+Nations that already exist in the first year, and nation seeds to choose them.
+
+- **Nations at the start:** some polities already exist in the first year. Place **nation seeds** (Nations card, *Nation seed*, X) with a name and a size in provinces to choose where they are; *Nations at the start* (12) more are placed by chance in the most populous provinces, spaced apart, each of *Their size* (6) provinces. Seeds are a new override layer, `nation_seeds`, that feeds Stage 4 only.
+
+## 0.3.0-beta.2
+
+A tidier status line and legend.
+
+- **Info tags in the status line:** choose which kinds of cell information are shown (relief, climate, water, land, province, culture, nation, transport), or let *Auto* pick what fits the current map layer; hover the status line for everything. The line no longer runs off the screen.
+- **Legend:** long lists use two columns and are no longer cut off after 24 entries; click the title to fold the legend away.
+
 ## 0.3.0-beta.1
 
 Institutions, ports, feudal empires and finer time steps for Stage 4; old mountains in Stage 1.

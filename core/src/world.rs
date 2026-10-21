@@ -132,19 +132,51 @@ impl World {
 
     /// Latest available version of a field (later steps shadow earlier ones).
     /// Returns the field, the step that produced it, and whether that step is stale.
+    /// The current value of a field: from the latest step that is up to
+    /// date, so a stale later result (hydrology's eroded `elevation` after
+    /// the sketch changed) never hides a fresh earlier one (relief's). Only
+    /// when no fresh step has the field is the latest stale one returned,
+    /// flagged stale.
     pub fn field(&self, name: &str) -> Option<(&Field, Step, bool)> {
         let n = self.grid.as_ref().map(|g| g.len())?;
         let h = self.expected_hashes();
+        let mut stale_hit = None;
         for &s in STEPS.iter().rev() {
             if let Some(d) = &self.steps[s.index()] {
                 if let Some(f) = d.fields.get(name) {
                     if f.len() == n || f.len() == 12 * n {
-                        return Some((f, s, d.hash != h[s.index()]));
+                        if d.hash == h[s.index()] {
+                            return Some((f, s, false));
+                        }
+                        stale_hit.get_or_insert((f, s, true));
                     }
                 }
             }
         }
-        None
+        stale_hit
+    }
+
+    /// Drop the results of `from` and every later step (they are recomputed
+    /// on the next run). Returns how many results were dropped.
+    pub fn clear_from(&mut self, from: Step) -> usize {
+        let mut n = 0;
+        for &s in &STEPS[from.index()..] {
+            n += usize::from(self.steps[s.index()].take().is_some());
+        }
+        n
+    }
+
+    /// Drop every stale result (a step whose inputs changed since it ran).
+    pub fn clear_stale(&mut self) -> usize {
+        let h = self.expected_hashes();
+        let mut n = 0;
+        for &s in STEPS.iter() {
+            if matches!(&self.steps[s.index()], Some(d) if d.hash != h[s.index()]) {
+                self.steps[s.index()] = None;
+                n += 1;
+            }
+        }
+        n
     }
 
     pub fn meta(&self, step: Step) -> Option<&serde_json::Value> {
@@ -194,6 +226,7 @@ impl World {
         write_json(&dir.join("overrides").join("fertility.json"), &self.edits.overrides.fertility)?;
         write_json(&dir.join("overrides").join("bands.json"), &self.edits.overrides.bands)?;
         write_json(&dir.join("overrides").join("attraction.json"), &self.edits.overrides.attraction)?;
+        write_json(&dir.join("overrides").join("nation_seeds.json"), &self.edits.overrides.nation_seeds)?;
         write_json(&dir.join("overrides").join("directives.json"), &self.edits.overrides.directives)?;
         write_json(&dir.join("imports.json"), &self.edits.imports)?;
         write_json(&dir.join("world.json"), &world)?;
@@ -218,6 +251,7 @@ impl World {
             fertility: read_json_optional(&dir.join("overrides").join("fertility.json"))?,
             bands: read_json_optional(&dir.join("overrides").join("bands.json"))?,
             attraction: read_json_optional(&dir.join("overrides").join("attraction.json"))?,
+            nation_seeds: read_json_optional(&dir.join("overrides").join("nation_seeds.json"))?,
             directives: read_json_optional(&dir.join("overrides").join("directives.json"))?,
         };
         let mut w = World::new(params);

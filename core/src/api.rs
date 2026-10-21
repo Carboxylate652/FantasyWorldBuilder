@@ -76,6 +76,7 @@ impl LayerState {
             (EditLayer::Fertility, LayerState::Strokes(v)) => edits.overrides.fertility = v,
             (EditLayer::Bands, LayerState::Strokes(v)) => edits.overrides.bands = v,
             (EditLayer::Attraction, LayerState::Strokes(v)) => edits.overrides.attraction = v,
+            (EditLayer::NationSeeds, LayerState::Strokes(v)) => edits.overrides.nation_seeds = v,
             _ => unreachable!("history state does not match edit layer"),
         }
     }
@@ -199,7 +200,7 @@ impl Live {
 fn live_inputs(w: &World, step: Step) -> Value {
     match step {
         Step::Cultures => json!([w.params.cultures, w.edits.overrides.bands, w.edits.overrides.attraction]),
-        _ => json!([w.params.nations]),
+        _ => json!([w.params.nations, w.edits.overrides.nation_seeds]),
     }
 }
 
@@ -252,6 +253,7 @@ impl Session {
                 "site_pins": e.overrides.sites.len(),
                 "fertility_strokes": e.overrides.fertility.len(),
                 "attraction_strokes": e.overrides.attraction.len(),
+                "nation_seeds": e.overrides.nation_seeds.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "size": s.value, "name": s.name }))).collect::<Vec<_>>(),
                 "band_pins": e.overrides.bands.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "bands": s.value }))).collect::<Vec<_>>(),
                 "sites": e.overrides.sites.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "population": s.value }))).collect::<Vec<_>>(),
                 "elevation_import": e.imports.elevation,
@@ -463,9 +465,16 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             out.insert("cell".into(), json!(cell));
             out.insert("lat".into(), json!(g.lat[cell].to_degrees()));
             out.insert("lon".into(), json!(g.lon[cell].to_degrees()));
+            // Later steps shadow earlier ones, but a stale result never hides
+            // a fresh one: stale steps only fill in names not yet known.
+            let hashes = s.world.expected_hashes();
             for &st in STEPS.iter() {
                 let Some(d) = &s.world.steps[st.index()] else { continue };
+                let stale = d.hash != hashes[st.index()];
                 for (name, f) in &d.fields.0 {
+                    if stale && out.contains_key(name) {
+                        continue;
+                    }
                     let v = match f {
                         Field::F32(v) if v.len() == 12 * n => match month {
                             Some(m) => json!(v[m * n + cell]),
@@ -893,6 +902,33 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             let mut st = s.status();
             st["committed"] = json!(step.key());
             st["replayed"] = json!(!same);
+            Ok(Reply::Json(st))
+        }
+        "clear_results" => {
+            // { from?: step } drops that step's result and every later one;
+            // without `from`, every stale result. Edits are kept.
+            let from: Option<String> = arg(&args, "from")?;
+            let cleared = match from {
+                Some(k) => {
+                    let step = Step::from_key(&k).ok_or_else(|| format!("unknown step `{k}`"))?;
+                    if s.live.as_ref().is_some_and(|l| l.step.index() >= step.index()) {
+                        s.live = None;
+                    }
+                    s.world.clear_from(step)
+                }
+                None => {
+                    let fresh: Vec<bool> = STEPS.iter().map(|&st| s.world.is_fresh(st)).collect();
+                    if s.live.as_ref().is_some_and(|l| !fresh[l.step.index() - 1]) {
+                        s.live = None;
+                    }
+                    s.world.clear_stale()
+                }
+            };
+            if cleared > 0 {
+                s.dirty = true;
+            }
+            let mut st = s.status();
+            st["cleared"] = json!(cleared);
             Ok(Reply::Json(st))
         }
         "sim_cancel" => {

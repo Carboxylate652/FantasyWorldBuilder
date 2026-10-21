@@ -19,7 +19,7 @@ export type ToolId =
   | 'navigate' | 'land' | 'sea' | 'mountain' | 'erase_hint' | 'scatter_land' | 'scatter_sea' | 'scatter_mountain' | 'pin' | 'arrow' | 'plate_paint'
   | 'raise' | 'lower' | 'smooth' | 'flatten' | 'old_mountain' | 'scatter_old_mountain' | 'old_mountain_erase' | 'biome_paint' | 'biome_erase'
   | 'barrier_paint' | 'barrier_erase' | 'site_pin' | 'state_paint' | 'province_paint'
-  | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase'
+  | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase' | 'nation_seed' | 'nation_seed_erase'
   | 'attraction' | 'attraction_erase'
   | 'goods_paint' | 'province_merge' | 'state_merge' | 'province_to_state' | 'rename_province' | 'rename_state'
   | 'city_pin' | 'city_unpin';
@@ -31,7 +31,7 @@ export type ToolDef = {
   step: string; // step the edit belongs to (auto-run target)
   rust?: string; // core Tool name when it differs from the id
   scatter?: boolean; // noisy natural edge (scatter brush)
-  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people' | 'fertility' | 'bands' | 'goods' | 'attraction';
+  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people' | 'fertility' | 'bands' | 'goods' | 'attraction' | 'provinces';
   /** Click (or drag from a start to an end point) instead of painting with a brush. */
   gesture?: 'point' | 'link';
   /** Asks for a name when used. */
@@ -70,6 +70,8 @@ export const TOOLS: ToolDef[] = [
   { id: 'band_erase', label: 'Remove founder', step: 'cultures', gesture: 'point', hint: 'Click near a founding-band pin to remove it.' },
   { id: 'attraction', label: 'Attraction', key: 'h', step: 'cultures', value: 'attraction', defaultValue: 0.8, hint: 'Paint where people are drawn (+, up to 5× as many: a metropolis) or driven away (−, down to none: a ghost town) during the culture simulation. States and provinces stay as they are.' },
   { id: 'attraction_erase', label: 'Erase attraction', step: 'cultures', hint: 'Remove attraction paint under the brush.' },
+  { id: 'nation_seed', label: 'Nation seed', key: 'x', step: 'nations', gesture: 'link', value: 'provinces', defaultValue: 0, hint: 'Click a province to found a nation there at the start year, with the name you give (empty: its capital\'s name) and this many provinces around its capital (0: the default size). Drag from a seed to move it. Seeds come before the initial nations placed by chance.' },
+  { id: 'nation_seed_erase', label: 'Remove seed', step: 'nations', gesture: 'point', hint: 'Click near a nation seed to remove it.' },
   { id: 'city_pin', label: 'City pin', key: 'y', step: 'nations', gesture: 'link', value: 'attraction', defaultValue: 0.8, hint: 'In a live Stage 4 run: click a province to make it draw people (+, a boom town or metropolis) or lose them (−, an abandoned city) from now on. Drag from a pin to move it.' },
   { id: 'city_unpin', label: 'Remove city pin', step: 'nations', gesture: 'point', hint: 'In a live Stage 4 run: click near a city pin to remove it.' },
   { id: 'goods_paint', label: 'Paint goods', key: 'q', step: 'provinces', value: 'goods', defaultValue: 1, hint: 'Provinces under the brush get this trade good, or gain or lose a deposit.' },
@@ -291,11 +293,13 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'nations', title: 'Nations & history', layer: 'nations', tools: ['city_pin', 'city_unpin'],
+    key: 'nations', title: 'Nations & history', layer: 'nations', tools: ['nation_seed', 'nation_seed_erase', 'city_pin', 'city_unpin'],
     blurb: 'Polities form where people are many, then grow over the culture map: they settle empty land, fight over borders, colonise overseas and break apart along culture lines. Borders can cut through states, and colonies and exclaves are allowed. Each era opens with an institution (gunpowder, navigation, industrialisation, synthetic fertilizer, motorisation, aviation) born in a province you choose or chance picks, spreading over land, roads, railways, ports and airports; nations enter the era as most of their provinces embrace it, the rich first. Good harbours become ports in the shipping era. Tags and feudal empires shape the story. Nations tax their people to pay for armies, roads (track, paved, highway), railway lines with junctions, and airports, which bind their land together. Run it in one go, step by step with your own directives, or let an AI guide steer it toward the history you describe.',
     params: [
       p('nations', 'start_year', 'First polities (year)', -5000, 1800, 10),
       p('nations', 'start_date', 'Start date (year)', 1800, 2000, 1, 'The year the map shows: 1949 (default) for late in the second great war\'s era, 1910–1920 for an early-20th-century start.'),
+      p('nations', 'initial_nations', 'Nations at the start', 0, 100, 1, 'Polities that already exist in the first year, besides your nation seeds: in the most populous free provinces, spaced apart.'),
+      p('nations', 'initial_size', 'Their size (provinces)', 1, 50, 1),
       p('nations', 'months_per_step', 'Months per step (at first)', 1, 300, 1, 'Time is counted in whole months. Steps get shorter toward the present: finer detail where history is denser.'),
       p('nations', 'step_year_1', 'Shorter steps from (year)', -5000, 2100, 10),
       p('nations', 'months_per_step_1', 'Months per step then', 1, 300, 1),

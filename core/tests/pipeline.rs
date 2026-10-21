@@ -1039,3 +1039,122 @@ fn old_mountains_from_noise_and_their_brushes() {
     assert!(painted > 150.0, "painted old mountains: {painted} m");
     assert_eq!(f32_of(&mut w, "stress"), stress, "plate stress untouched");
 }
+
+/// Nation seeds: polities you place exist at the start year with their name
+/// and size; `initial_nations` more are placed automatically; seeds on the
+/// sea are ignored and the erase tool removes the nearest seed.
+#[test]
+fn nation_seeds_and_initial_nations() {
+    let mut p = small_params(29);
+    p.cultures.ticks = 60;
+    p.nations.start_year = 1300;
+    p.nations.start_date = 1320;
+    p.nations.initial_nations = 3;
+    p.nations.initial_size = 4;
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Cultures, &|_, _, _| {});
+    let provs = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().clone();
+    let ll = |q: &serde_json::Value| [q["center"][0].as_f64().unwrap(), q["center"][1].as_f64().unwrap()];
+    let land: Vec<&serde_json::Value> = provs.iter().filter(|q| q["kind"] == "land").collect();
+    let a = land[0];
+    let far = |x: [f64; 2], y: [f64; 2]| Vec3::from_lat_lon_deg(x[0], x[1]).angle_to(Vec3::from_lat_lon_deg(y[0], y[1]));
+    let b = *land.iter().max_by(|x, y| far(ll(x), ll(a)).total_cmp(&far(ll(y), ll(a)))).unwrap();
+    let sea = provs.iter().find(|q| q["kind"] == "sea").unwrap();
+    let seed = |at: [f64; 2], size: f64, name: &str| Stroke { tool: Tool::NationSeed, value: size, radius_km: 100.0, name: name.into(), points: vec![at], ..Default::default() };
+    w.edits.add_stroke(seed(ll(a), 3.0, "Avalon"));
+    w.edits.add_stroke(seed(ll(b), 0.0, ""));
+    w.edits.add_stroke(seed(ll(sea), 2.0, "Atlantis"));
+    assert_eq!(w.edits.overrides.nation_seeds.len(), 3);
+    assert!(!w.is_fresh(Step::Nations) && w.is_fresh(Step::Cultures), "seeds feed Stage 4 only");
+    // Erase the sea seed.
+    w.edits.add_stroke(Stroke { tool: Tool::NationSeedErase, points: vec![ll(sea)], ..Default::default() });
+    assert_eq!(w.edits.overrides.nation_seeds.len(), 2);
+    w.edits.add_stroke(seed(ll(sea), 2.0, "Atlantis"));
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let events = w.meta(Step::Nations).unwrap()["table"]["events"].as_array().unwrap().clone();
+    let founded: Vec<&serde_json::Value> = events.iter().filter(|e| e["event"] == "founded" && e["year"] == 1300).collect();
+    assert!(founded.iter().any(|e| e["province"] == a["id"] && e["text"].as_str().unwrap().starts_with("Avalon")), "the named seed: {founded:?}");
+    assert!(founded.iter().any(|e| e["province"] == b["id"]), "the unnamed seed takes its capital's name");
+    assert!(!events.iter().any(|e| e["text"].as_str().unwrap_or("").contains("Atlantis")), "a seed on the sea founds nothing");
+    // Seeds are nations 1 and 2, the initial nations 3–5; later ones come from the first step.
+    let first: Vec<u64> = founded.iter().filter_map(|e| e["nation"].as_u64()).filter(|&n| n <= 5).collect();
+    assert_eq!(first, vec![1, 2, 3, 4, 5], "two seeds and three initial nations: {founded:?}");
+    assert!(founded.iter().any(|e| e["nation"] == 1 && e["province"] == a["id"]));
+    // The live run starts with the same polities.
+    let session = std::sync::Mutex::new(worldcore::api::Session::new(p));
+    session.lock().unwrap().world = w;
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(worldcore::api::ProgressState::default()));
+    let st = match worldcore::api::handle(&session, &progress, "sim_start", serde_json::json!({ "stage": "nations" })).unwrap() {
+        worldcore::api::Reply::Json(v) => v,
+        _ => panic!(),
+    };
+    let names: Vec<&str> = st["sim"]["nations"].as_array().unwrap().iter().filter_map(|n| n["name"].as_str()).collect();
+    assert_eq!(names.len(), 5, "the live run starts with the seeded polities only: {names:?}");
+    assert!(names.contains(&"Avalon"));
+    let avalon = st["sim"]["nations"].as_array().unwrap().iter().find(|n| n["name"] == "Avalon").unwrap();
+    assert!(avalon["provinces"].as_u64().unwrap() <= 3 && avalon["provinces"].as_u64().unwrap() >= 1, "{avalon}");
+}
+
+/// A stale later result never hides a fresh earlier one: after a change to
+/// Stage 1 inputs and a run to the relief step only, the elevation shown is
+/// the new relief, not the old (stale) eroded elevation of hydrology. Stale
+/// and later results can be cleared.
+#[test]
+fn stale_results_do_not_shadow_fresh_ones_and_can_be_cleared() {
+    use worldcore::api::{handle, ProgressState, Reply, Session};
+    let p = small_params(31);
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Hydrology, &|_, _, _| {});
+    let old = match w.field("elevation") {
+        Some((worldcore::fields::Field::F32(v), step, stale)) => {
+            assert_eq!(step, Step::Hydrology);
+            assert!(!stale);
+            v.clone()
+        }
+        _ => panic!(),
+    };
+    // A new seed changes everything from the sketch on; run to relief only.
+    w.params.planet.seed = 32;
+    w.run_to(Step::Relief, &|_, _, _| {});
+    assert!(w.is_fresh(Step::Relief) && !w.is_fresh(Step::Hydrology));
+    match w.field("elevation") {
+        Some((worldcore::fields::Field::F32(v), step, stale)) => {
+            assert_eq!(step, Step::Relief, "the fresh relief, not the stale hydrology");
+            assert!(!stale);
+            assert!(v.iter().zip(&old).any(|(a, b)| (a - b).abs() > 1.0));
+        }
+        _ => panic!(),
+    }
+    // A land stroke in deep sea shows as land at once, with the old
+    // hydrology still on disk (the user's case: sketch edits seemed ignored).
+    let grid = w.grid();
+    let elev_now = |w: &World| match w.field("elevation") {
+        Some((worldcore::fields::Field::F32(v), _, _)) => v.clone(),
+        _ => panic!(),
+    };
+    let e1 = elev_now(&w);
+    let deep = (0..e1.len()).find(|&i| e1[i] < -3000.0 && grid.lat[i].abs() < 0.6).expect("deep sea");
+    let at = [grid.lat[deep].to_degrees(), grid.lon[deep].to_degrees()];
+    w.edits.add_stroke(Stroke { tool: Tool::Land, radius_km: 900.0, strength: 1.0, hardness: 0.8, points: vec![at], ..Default::default() });
+    w.run_to(Step::Relief, &|_, _, _| {});
+    let e2 = elev_now(&w);
+    assert!(e2[deep] > 0.0, "painted land is land in the shown elevation: {} m", e2[deep]);
+    // Clearing through the API: stale results first, then from a step on.
+    let session = std::sync::Mutex::new(Session::new(p));
+    session.lock().unwrap().world = w;
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(ProgressState::default()));
+    let call = |cmd: &str, args: serde_json::Value| match handle(&session, &progress, cmd, args).unwrap() {
+        Reply::Json(v) => v,
+        _ => panic!(),
+    };
+    let st = call("clear_results", serde_json::json!({}));
+    let states: Vec<&str> = st["steps"].as_array().unwrap().iter().map(|x| x["state"].as_str().unwrap()).collect();
+    assert!(st["cleared"].as_u64().unwrap() >= 2, "climate and hydrology were stale: {states:?}");
+    assert!(!states.contains(&"stale"), "{states:?}");
+    assert_eq!(states[Step::Relief.index()], "done");
+    let st = call("clear_results", serde_json::json!({ "from": "plates" }));
+    let states: Vec<&str> = st["steps"].as_array().unwrap().iter().map(|x| x["state"].as_str().unwrap()).collect();
+    assert_eq!(st["cleared"], 2, "plates and relief");
+    assert_eq!(states[Step::Sketch.index()], "done");
+    assert!(states[Step::Plates.index()..].iter().all(|&s| s == "empty"), "{states:?}");
+}

@@ -27,6 +27,7 @@ type Status = {
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
     site_pins: number; sites: { lat: number; lon: number; population: number }[];
     fertility_strokes: number; attraction_strokes: number; band_pins: { lat: number; lon: number; bands: number }[];
+    nation_seeds?: { lat: number; lon: number; size: number; name: string }[];
   };
   grid: { level: number; cells: number; spacing_km: number };
   path: string | null;
@@ -100,7 +101,7 @@ async function boot() {
         h('div', { id: 'toast' }),
       ),
     ),
-    h('footer', { id: 'statusbar' }, h('span', { id: 'hover' }, 'Hover the planet for cell details.'), h('span', { id: 'progress' })),
+    h('footer', { id: 'statusbar' }, h('span', { id: 'infotags' }), h('span', { id: 'hover' }, 'Hover the planet for cell details.'), h('span', { id: 'progress' })),
   );
   try {
     R = new Renderer($('#canvas') as HTMLCanvasElement);
@@ -110,6 +111,7 @@ async function boot() {
   }
   bindCanvas();
   bindKeys();
+  renderInfoTags();
   // Handle for debugging from the devtools console.
   (window as any).fwm = { R, S };
   try {
@@ -519,6 +521,13 @@ function drawEditMarkers() {
       if (fill) L.seg(p, offset(p, e, n, Math.cos(a1) * r, Math.sin(a1) * r), col, 0.004);
     }
   };
+  // Nation seeds: red discs with a white rim, larger for larger realms.
+  for (const sd of st.edits.nation_seeds ?? []) {
+    const p = fromLatLon((sd.lat * Math.PI) / 180, (sd.lon * Math.PI) / 180);
+    const r = 0.012 + 0.003 * Math.sqrt(sd.size || 6);
+    ring(p, r * 1.25, [1, 1, 1, 1], false);
+    ring(p, r, [0.85, 0.15, 0.2, 1], true);
+  }
   for (const b of st.edits.band_pins ?? []) ring(fromLatLon((b.lat * Math.PI) / 180, (b.lon * Math.PI) / 180), 0.01 + 0.004 * Math.sqrt(b.bands), [1, 0.85, 0.2, 1], true);
   if (!(st.edits.band_pins ?? []).length) {
     const founders = st.steps.find((s) => s.key === 'cultures')?.meta?.founders ?? [];
@@ -711,10 +720,27 @@ function renderTopbar() {
 function stageButtons(st: Status): HTMLElement {
   const done = (step: string) => st.steps.find((s) => s.key === step)?.state === 'done';
   const next = STAGE_ENDS.find((s) => !done(s.step));
+  const stale = st.steps.filter((s) => s.state === 'stale').length;
   return h('div', { class: 'group' },
     next ? h('button', { class: 'primary', disabled: S.busy, title: `Generate everything up to the end of Stage ${next.stage}`, onclick: () => run(next.step) }, `Next: Stage ${next.stage}`) : null,
     ...STAGE_ENDS.map((s) => h('button', { disabled: S.busy, class: done(s.step) ? 'done' : '', title: `Generate up to the end of Stage ${s.stage}`, onclick: () => run(s.step) }, done(s.step) ? `Stage ${s.stage} ✓` : `Stage ${s.stage}`)),
-    h('button', { class: next ? '' : 'primary', disabled: S.busy, onclick: () => run(STAGE_ENDS[STAGE_ENDS.length - 1].step) }, 'Generate all'));
+    h('button', { class: next ? '' : 'primary', disabled: S.busy, onclick: () => run(STAGE_ENDS[STAGE_ENDS.length - 1].step) }, 'Generate all'),
+    stale ? h('button', { class: 'warn', disabled: S.busy, title: 'Remove the results whose inputs changed since they ran (they no longer match your sketch, edits or parameters); your edits stay', onclick: () => clearResults(null, stale) }, `Clear stale (${stale})`) : null);
+}
+
+/** Remove results from a step on (or every stale result); edits stay, the next run rebuilds them. */
+async function clearResults(from: string | null, count: number) {
+  const what = from ? `the results of "${STEPS.find((s) => s.key === from)?.title}" and every later step (${count})` : `${count} stale result${count > 1 ? 's' : ''} (steps whose inputs changed since they ran)`;
+  if (!confirm(`Remove ${what}? Your sketch, edits and parameters stay; run again to rebuild.`)) return;
+  try {
+    const st = await api.json<Status & { cleared: number }>('clear_results', from ? { from } : {});
+    invalidate();
+    if (!st.live) SIM.state = null;
+    toast(`Removed ${st.cleared} result${st.cleared === 1 ? '' : 's'}`);
+    await refreshStatus(st);
+  } catch (e) {
+    toast(String(e), true);
+  }
 }
 
 function undoTarget(): string | undefined {
@@ -1625,6 +1651,15 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
       h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, `${e.attraction_strokes} attraction strokes`),
         h('button', { class: 'small', disabled: !e.attraction_strokes, onclick: () => mutate('clear_layer', { layer: 'attraction' }, 'cultures') }, 'Clear attraction')));
   }
+  if (ui.key === 'nations') {
+    const seeds = e.nation_seeds ?? [];
+    const n0 = S.status!.params.nations.initial_nations ?? 0;
+    body.append(h('h4', {}, 'Nations at the start'),
+      h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, seeds.length
+        ? `${seeds.length} nation seed${seeds.length > 1 ? 's' : ''} (${seeds.map((x) => x.name || 'unnamed').join(', ')}), then ${n0} more by chance.`
+        : `${n0} nations by chance. Place nation seeds (X) to choose where they are.`),
+        h('button', { class: 'small', disabled: !seeds.length, onclick: () => mutate('clear_layer', { layer: 'nation_seeds' }, 'nations') }, 'Clear seeds')));
+  }
   if (ui.key === 'provinces') {
     const imp = e.province_import;
     body.append(h('h4', {}, 'Imported provinces'),
@@ -1638,7 +1673,10 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
       h('button', { class: 'small', disabled: !e.province_strokes, onclick: () => mutate('clear_layer', { layer: 'provinces' }) }, 'Clear paint')));
   }
 
+  const later = S.status!.steps.slice(idx).filter((x) => x.state !== 'empty').length;
   body.append(h('div', { class: 'actions' },
+    idx > 0 && later ? h('button', { class: 'small', disabled: S.busy, title: `Remove the results of this step and the ${later > 1 ? 'later ones' : 'next'} (your edits stay); run again to rebuild them`,
+      onclick: () => clearResults(ui.key, later) }, 'Clear from here') : null,
     h('button', { class: 'primary', disabled: S.busy || ss.state === 'done', onclick: () => run(ui.key) },
       S.busy ? 'Working…' : ss.state === 'done' ? 'Up to date' : idx === 0 ? 'Build grid' : `Run to step ${idx + 1}`)));
   if (ss.meta && ss.state !== 'empty') body.append(summary(ui.key, ss.meta));
@@ -1970,6 +2008,7 @@ function renderToolbar() {
       out.textContent = (v > 0 ? '+' : '') + v.toFixed(2);
     } }), out));
   }
+  if (t.value === 'provinces') bb.append(h('label', {}, h('span', {}, 'Provinces (0: default)'), h('input', { type: 'number', step: 1, min: 0, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'bands') bb.append(h('label', {}, h('span', {}, 'Bands'), h('input', { type: 'number', step: 1, min: 1, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'goods') {
     const goods = TRADE_GOODS.map(([g], i) => [g, i + 1] as const).filter(([g]) => g !== 'none');
@@ -2002,12 +2041,24 @@ function renderToolbar() {
   bb.append(h('span', { class: 'muted hint' }, t.hint));
 }
 
+let legendCollapsed = (() => { try { return localStorage.getItem('fwm.legend.collapsed') === '1'; } catch { return false; } })();
+
 function renderLegend(stale: boolean) {
   const lg = $('#legend');
   lg.innerHTML = '';
   const L = S.legend;
   if (!L) return;
-  lg.append(h('div', { class: 'lg-title' }, L.title, stale ? h('span', { class: 'pill stale' }, 'stale') : null));
+  const n = L.items?.length ?? 0;
+  lg.classList.toggle('collapsed', legendCollapsed);
+  lg.classList.toggle('wide', n > 10);
+  lg.append(h('div', { class: 'lg-title', title: legendCollapsed ? 'Show the legend' : 'Hide the legend', onclick: () => {
+    legendCollapsed = !legendCollapsed;
+    try { localStorage.setItem('fwm.legend.collapsed', legendCollapsed ? '1' : '0'); } catch { /* ignore */ }
+    renderLegend(stale);
+  } }, h('span', { class: 'lg-caret' }, legendCollapsed ? '▸' : '▾'), h('span', { class: 'lg-name' }, L.title),
+    legendCollapsed && n ? h('span', { class: 'muted' }, ` (${n})`) : null, stale ? h('span', { class: 'pill stale' }, 'stale') : null));
+  renderHover();
+  if (legendCollapsed) return;
   if (L.gradient) {
     const st = L.gradient.stops;
     const lo = st[0][0], hi = st[st.length - 1][0];
@@ -2017,7 +2068,7 @@ function renderLegend(stale: boolean) {
   }
   if (L.items) {
     const box = h('div', { class: 'items' });
-    for (const it of L.items.slice(0, 24)) box.append(h('div', {}, h('i', { style: `background: rgb(${it.color.map(Math.round).join(',')})` }), it.label));
+    for (const it of L.items) box.append(h('div', { title: it.label }, h('i', { style: `background: rgb(${it.color.map(Math.round).join(',')})` }), it.label));
     lg.append(box);
   }
 }
@@ -2161,7 +2212,7 @@ function bindCanvas() {
         await cityPinGesture(t.id, d.start, d.end, moved);
         return;
       }
-      if (t.gesture === 'link' && !moved && t.id !== 'band_pin') {
+      if (t.gesture === 'link' && !moved && t.id !== 'band_pin' && t.id !== 'nation_seed') {
         toast('Drag from the first place to the second.');
         return;
       }
@@ -2169,6 +2220,11 @@ function bindCanvas() {
       if (t.rename) {
         name = window.prompt(t.id === 'rename_state' ? 'New state name' : 'New province name')?.trim() ?? '';
         if (!name) return;
+      }
+      if (t.id === 'nation_seed' && !moved) {
+        const v = window.prompt('Name of the nation (leave empty for its capital\'s name)', '');
+        if (v === null) return;
+        name = v.trim();
       }
       const stroke = {
         tool: t.rust ?? S.tool,
@@ -2275,7 +2331,8 @@ function hover(p: Vec3 | null) {
       const d = await api.json('probe', { cell: c, month: S.month });
       if (d.state !== undefined) await political();
       if (c !== hoverCell) return;
-      $('#hover').textContent = describe(d);
+      lastProbe = d;
+      renderHover();
     } catch { /* ignore */ }
   }, 60);
 }
@@ -2284,13 +2341,98 @@ function riverClass(w: number): string {
   return w >= 1000 ? 'great river' : w >= 400 ? 'major river' : w >= 150 ? 'river' : 'stream';
 }
 
-function describe(d: any): string {
-  const parts: string[] = [];
+// ------------------------------------------------------------------ info tags (status bar)
+
+/** Kinds of cell information in the status bar; the tags choose which are shown. */
+const INFO_TAGS = [
+  ['relief', 'Relief', 'Elevation, plate and boundary'],
+  ['climate', 'Climate', 'Temperature, rain and Köppen class'],
+  ['water', 'Water', 'Rivers and lakes'],
+  ['land', 'Land', 'Terrain, habitability and springs'],
+  ['province', 'Province', 'Province, goods, state, region and continent'],
+  ['culture', 'Culture', 'Culture and population density'],
+  ['nation', 'Nation', 'Owner, era, realm and institutions'],
+  ['transport', 'Transport', 'Railways, roads, ports and airports'],
+] as const;
+type InfoTag = (typeof INFO_TAGS)[number][0];
+
+/** The tags Auto shows for each layer group. */
+const AUTO_TAGS: Record<string, InfoTag[]> = {
+  Planet: ['relief'],
+  Climate: ['climate', 'relief'],
+  Water: ['water', 'relief'],
+  Biomes: ['climate', 'land'],
+  Political: ['land', 'province'],
+  Cultures: ['culture', 'province'],
+  Nations: ['nation', 'transport'],
+};
+
+const infoTags: { auto: boolean; on: InfoTag[] } = (() => {
+  try {
+    const v = JSON.parse(localStorage.getItem('fwm.infotags') ?? '');
+    if (typeof v?.auto === 'boolean' && Array.isArray(v.on)) return { auto: v.auto, on: v.on.filter((t: string) => INFO_TAGS.some((x) => x[0] === t)) };
+  } catch { /* ignore */ }
+  return { auto: true, on: ['relief', 'climate', 'province', 'nation'] };
+})();
+let lastProbe: any = null;
+
+function activeTags(): Set<InfoTag> {
+  if (!infoTags.auto) return new Set(infoTags.on);
+  const group = LAYERS.find((l) => l.id === S.layer)?.group ?? 'Planet';
+  const tags = new Set<InfoTag>(AUTO_TAGS[group] ?? ['relief']);
+  if (S.layer === 'transport' || S.layer === 'railways') tags.add('transport');
+  return tags;
+}
+
+function renderInfoTags() {
+  const box = $('#infotags');
+  box.innerHTML = '';
+  const active = activeTags();
+  const save = () => {
+    try { localStorage.setItem('fwm.infotags', JSON.stringify(infoTags)); } catch { /* ignore */ }
+    renderInfoTags();
+    renderHover();
+  };
+  box.append(h('button', { class: infoTags.auto ? 'tag on' : 'tag', title: 'Show what fits the current map layer', onclick: () => {
+    infoTags.auto = !infoTags.auto;
+    if (!infoTags.auto) infoTags.on = [...active];
+    save();
+  } }, 'Auto'));
+  for (const [id, label, tip] of INFO_TAGS) {
+    box.append(h('button', { class: active.has(id) ? (infoTags.auto ? 'tag auto' : 'tag on') : 'tag', title: tip, onclick: () => {
+      const on = new Set(active);
+      if (on.has(id)) on.delete(id); else on.add(id);
+      infoTags.auto = false;
+      infoTags.on = INFO_TAGS.map((t) => t[0]).filter((t) => on.has(t));
+      save();
+    } }, label));
+  }
+}
+
+/** The status-bar text for the last probed cell, limited to the active tags; the tooltip holds everything. */
+function renderHover() {
+  const el = $('#hover');
+  if (infoTags.auto) renderInfoTags();
+  if (!lastProbe) return;
+  const parts = describe(lastProbe);
+  const active = activeTags();
+  const shown = parts.filter(([tag]) => tag === 'place' || active.has(tag as InfoTag));
+  el.textContent = shown.map((x) => x[1]).join('  ·  ');
+  el.title = INFO_TAGS.map(([id, label]) => [label, parts.filter(([t]) => t === id).map((x) => x[1]).join(' · ')])
+    .filter(([, v]) => v).map(([l, v]) => `${l}: ${v}`).join('\n');
+}
+
+function describe(d: any): [string, string][] {
+  const out: [string, string][] = [];
+  let tag = 'place';
+  const parts = { push: (s: string) => out.push([tag, s]) };
   const ns = d.lat >= 0 ? 'N' : 'S', ew = d.lon >= 0 ? 'E' : 'W';
   parts.push(`${Math.abs(d.lat).toFixed(1)}°${ns} ${Math.abs(d.lon).toFixed(1)}°${ew}`);
+  tag = 'relief';
   if (d.elevation !== undefined) parts.push(`${Math.round(d.elevation).toLocaleString()} m`);
   if (d.plate !== undefined) parts.push(`plate #${d.plate}${d.crust === 1 ? ' (continental)' : d.crust === 0 ? ' (oceanic)' : ''}`);
   if (d.boundary) parts.push(BOUNDARY[d.boundary][0]);
+  tag = 'climate';
   const adj = d.temp_adjust ?? 0;
   if (Array.isArray(d.temp)) {
     const mean = d.temp.reduce((a: number, b: number) => a + b, 0) / 12 + adj;
@@ -2298,11 +2440,16 @@ function describe(d: any): string {
   } else if (typeof d.temp === 'number') parts.push(`${(d.temp + adj).toFixed(1)} °C in ${MONTHS[S.month ?? 0]}`);
   if (d.p_ann !== undefined) parts.push(`${Math.round(d.p_ann).toLocaleString()} mm/yr`);
   if (d.koppen) parts.push(`${KOPPEN[d.koppen][0]} ${KOPPEN[d.koppen][2]}`);
+  tag = 'land';
   if (d.terrain !== undefined) parts.push(TERRAIN[d.terrain][0]);
+  tag = 'water';
   if (d.river) parts.push(`${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, ${Math.round(d.discharge).toLocaleString()} m³/s, order ${d.river}`);
   if (d.lake) parts.push(['', 'fresh lake', 'salt lake', 'dry lake'][d.lake]);
+  tag = 'land';
+  if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
   if (d.habitability !== undefined && d.water === 0) parts.push(`habitability ${d.habitability.toFixed(2)}${d.river_role === 1 ? ', border river' : d.river_role === 2 ? ', backbone river' : ''}`);
   const P = S.political;
+  tag = 'province';
   if (P && d.province) {
     const p = P.byProv.get(d.province);
     if (p) {
@@ -2317,28 +2464,31 @@ function describe(d: any): string {
     const ct = s ? P.byCont.get(s.continent) : null;
     if (s) parts.push(`state ${s.name} (#${s.id})${r ? ', ' + r.name + ' (region #' + r.id + ')' : ''}${ct ? ', ' + ct.name : ''}`);
   }
+  tag = 'nation';
   if (d.owner) {
     const n = SIM.nations.get(d.owner) ?? P?.byNation.get(d.owner);
     parts.push(n ? `${n.name} (nation #${n.id}, ${n.government})` : `nation #${d.owner}`);
   } else if (d.owner === 0 && d.water === 0) parts.push('no ruler');
+  tag = 'transport';
   if (d.railway) parts.push(d.railway === 3 ? 'railway junction' : d.railway === 2 ? 'railway station' : 'railway');
   if (d.road) parts.push(['', 'track', 'paved road', 'highway'][d.road] ?? 'road');
   if (d.airport) parts.push('airport');
   if (d.port === 2) parts.push('port');
   else if (d.port === 1) parts.push('good harbour');
+  tag = 'nation';
   if (d.institutions) parts.push(`institutions: ${INSTITUTION_NAMES.filter((_, k) => (d.institutions >> k) & 1).join(', ')}`);
   if (d.realm && d.owner && d.realm !== d.owner) {
     const r = SIM.nations.get(d.realm) ?? S.political?.byNation.get(d.realm);
     parts.push(`realm of ${r ? r.name : '#' + d.realm}${d.imperial ? ' (imperial territory)' : ''}`);
   }
   if (d.nation_era) parts.push(`${ERA_NAMES[d.nation_era - 1]} era`);
+  tag = 'culture';
   if (d.culture) {
     const c = SIM.cultures.get(d.culture) ?? P?.byCulture.get(d.culture), g = c && P ? P.byGroup.get(c.group) : null;
     if (c) parts.push(`${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}`);
   }
   if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
-  if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
-  return parts.join('  ·  ');
+  return out;
 }
 
 function bindKeys() {

@@ -40,7 +40,7 @@ USAGE:
   worldgen edit <project-dir> --tool TOOL --at LAT,LON[;LAT,LON...] [--value V] [--radius KM]
                 [--strength S] [--hardness H] [--name NAME] [--run]
                                              add one override stroke (tools as in the app:
-                                             province_merge, fertility_paint, band_pin, ...)
+                                             province_merge, fertility_paint, band_pin, nation_seed, ...)
   worldgen directive <project-dir> --stage cultures|nations --at N [--month 1-12] --action NAME [--args JSON] [--note TEXT] [--run]
                                              add a directive by hand (applies before generation N or
                                              year N); `worldgen directive --list` shows the actions

@@ -64,6 +64,12 @@ pub enum Tool {
     // an oil port). The stroke's first point places it; `value` is the
     // population it should reach.
     SitePin,
+    // Nation seed (Stage 4): a polity that already exists at the start year,
+    // its capital at the stroke's first point; `value` = its provinces (0:
+    // the default size), `name` = its name (empty: the capital's). A drag
+    // that starts on a seed moves it; erase removes the nearest seed.
+    NationSeed,
+    NationSeedErase,
 }
 
 impl Tool {
@@ -80,6 +86,7 @@ impl Tool {
             Tool::FertilityPaint | Tool::FertilityErase => EditLayer::Fertility,
             Tool::BandPin | Tool::BandErase => EditLayer::Bands,
             Tool::Attraction | Tool::AttractionErase => EditLayer::Attraction,
+            Tool::NationSeed | Tool::NationSeedErase => EditLayer::NationSeeds,
         }
     }
 }
@@ -98,12 +105,13 @@ pub enum EditLayer {
     Fertility,
     Bands,
     Attraction,
+    NationSeeds,
     /// Time-stamped steering of the Stage 3 and 4 simulations (not strokes).
     Directives,
 }
 
 impl EditLayer {
-    pub const ALL: [EditLayer; 12] = [
+    pub const ALL: [EditLayer; 13] = [
         EditLayer::Sketch,
         EditLayer::Plates,
         EditLayer::Elevation,
@@ -115,6 +123,7 @@ impl EditLayer {
         EditLayer::Provinces,
         EditLayer::Bands,
         EditLayer::Attraction,
+        EditLayer::NationSeeds,
         EditLayer::Directives,
     ];
 
@@ -132,6 +141,7 @@ impl EditLayer {
             EditLayer::Fertility => "fertility",
             EditLayer::Bands => "bands",
             EditLayer::Attraction => "attraction",
+            EditLayer::NationSeeds => "nation_seeds",
             EditLayer::Directives => "directives",
         }
     }
@@ -153,6 +163,7 @@ impl EditLayer {
             EditLayer::States => Step::States,
             EditLayer::Provinces => Step::Provinces,
             EditLayer::Bands | EditLayer::Attraction | EditLayer::Directives => Step::Cultures,
+            EditLayer::NationSeeds => Step::Nations,
         }
     }
 
@@ -169,6 +180,7 @@ impl EditLayer {
             EditLayer::Fertility => "Fertility",
             EditLayer::Bands => "Founding bands",
             EditLayer::Attraction => "Attraction",
+            EditLayer::NationSeeds => "Nation seeds",
             EditLayer::Directives => "Simulation directives (Stages 3 and 4)",
         }
     }
@@ -266,6 +278,8 @@ pub struct Overrides {
     pub fertility: Vec<Stroke>,
     pub bands: Vec<Stroke>,
     pub attraction: Vec<Stroke>,
+    /// Polities that already exist when Stage 4 starts.
+    pub nation_seeds: Vec<Stroke>,
     /// Steering of the Stage 3 and 4 simulations, by hand or by the AI guide.
     pub directives: Vec<crate::directives::Directive>,
 }
@@ -334,34 +348,14 @@ impl Edits {
             EditLayer::Provinces => self.overrides.provinces.push(s),
             EditLayer::Sites => self.overrides.sites.push(s),
             EditLayer::Fertility => self.overrides.fertility.push(s),
-            EditLayer::Bands => self.add_band_pin(s),
+            EditLayer::Bands => add_pin(&mut self.overrides.bands, s, Tool::BandErase),
             EditLayer::Attraction => self.overrides.attraction.push(s),
+            EditLayer::NationSeeds => add_pin(&mut self.overrides.nation_seeds, s, Tool::NationSeedErase),
             EditLayer::Directives => {}
         }
     }
 
-    /// Founding-band pins: a drag that starts within 400 km of a pin moves
-    /// it; otherwise the pin goes where the stroke ends. Erase removes the
-    /// nearest pin within 600 km.
-    fn add_band_pin(&mut self, s: Stroke) {
-        let (Some(first), Some(last)) = (s.points.first().copied(), s.points.last().copied()) else { return };
-        let km = |a: [f64; 2], b: [f64; 2]| Vec3::from_lat_lon_deg(a[0], a[1]).angle_to(Vec3::from_lat_lon_deg(b[0], b[1])) * 6371.0;
-        let pins = &mut self.overrides.bands;
-        let nearest = |pins: &Vec<Stroke>, max: f64| {
-            pins.iter().enumerate().filter_map(|(k, p)| p.points.first().map(|q| (k, km(*q, first)))).filter(|x| x.1 <= max).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| x.0)
-        };
-        match s.tool {
-            Tool::BandErase => {
-                if let Some(k) = nearest(pins, 600.0) {
-                    pins.remove(k);
-                }
-            }
-            _ => match nearest(pins, 400.0).filter(|_| s.points.len() >= 2 && km(first, last) > 50.0) {
-                Some(k) => pins[k].points = vec![last],
-                None => pins.push(Stroke { points: vec![last], ..s }),
-            },
-        }
-    }
+
     /// Strokes of an override layer (the sketch layer: its strokes only).
     pub fn strokes(&self, layer: EditLayer) -> &Vec<Stroke> {
         let o = &self.overrides;
@@ -377,6 +371,7 @@ impl Edits {
             EditLayer::Fertility => &o.fertility,
             EditLayer::Bands => &o.bands,
             EditLayer::Attraction => &o.attraction,
+            EditLayer::NationSeeds => &o.nation_seeds,
             EditLayer::Directives => &NO_STROKES,
         }
     }
@@ -395,6 +390,7 @@ impl Edits {
             EditLayer::Fertility => &mut o.fertility,
             EditLayer::Bands => &mut o.bands,
             EditLayer::Attraction => &mut o.attraction,
+            EditLayer::NationSeeds => &mut o.nation_seeds,
             EditLayer::Directives => unreachable!("directives are not strokes"),
         }
     }
@@ -533,8 +529,31 @@ impl Edits {
             EditLayer::Fertility => self.overrides.fertility.clear(),
             EditLayer::Bands => self.overrides.bands.clear(),
             EditLayer::Attraction => self.overrides.attraction.clear(),
+            EditLayer::NationSeeds => self.overrides.nation_seeds.clear(),
             EditLayer::Directives => self.overrides.directives.clear(),
         }
+    }
+}
+
+/// Pins (founding bands, nation seeds): a drag that starts within 400 km of
+/// a pin moves it; otherwise the pin goes where the stroke ends. The erase
+/// tool removes the nearest pin within 600 km.
+fn add_pin(pins: &mut Vec<Stroke>, s: Stroke, erase: Tool) {
+    let (Some(first), Some(last)) = (s.points.first().copied(), s.points.last().copied()) else { return };
+    let km = |a: [f64; 2], b: [f64; 2]| Vec3::from_lat_lon_deg(a[0], a[1]).angle_to(Vec3::from_lat_lon_deg(b[0], b[1])) * 6371.0;
+    let nearest = |pins: &Vec<Stroke>, max: f64| {
+        pins.iter().enumerate().filter_map(|(k, p)| p.points.first().map(|q| (k, km(*q, first)))).filter(|x| x.1 <= max).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| x.0)
+    };
+    match s.tool {
+        t if t == erase => {
+            if let Some(k) = nearest(pins, 600.0) {
+                pins.remove(k);
+            }
+        }
+        _ => match nearest(pins, 400.0).filter(|_| s.points.len() >= 2 && km(first, last) > 50.0) {
+            Some(k) => pins[k].points = vec![last],
+            None => pins.push(Stroke { points: vec![last], ..s }),
+        },
     }
 }
 

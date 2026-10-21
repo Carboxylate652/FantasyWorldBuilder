@@ -222,7 +222,7 @@ pub(crate) fn unapplied(layer: &str, index: usize, s: &crate::edits::Stroke, rea
     serde_json::json!({ "layer": layer, "index": index, "tool": s.tool, "at": s.points.first(), "reason": reason })
 }
 
-pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 3, 2, 4, 6, 2, 5, 3, 6, 5, 5];
+pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 3, 2, 4, 6, 2, 5, 3, 6, 5, 6];
 
 /// Cache keys: each step hashes only the inputs it actually reads, chained to
 /// the previous step's key, so a change only invalidates what depends on it.
@@ -252,7 +252,7 @@ pub fn input_hashes(p: &WorldParams, e: &Edits) -> [u64; N_STEPS] {
     } else {
         hash::combine(h9, hash::json(&("cultures", &p.cultures, &e.overrides.bands, &e.overrides.attraction, &cdir)))
     };
-    let h11 = hash::combine(h10, hash::json(&("nations", &p.nations, &crate::directives::of_stage(&e.overrides.directives, "nations"))));
+    let h11 = hash::combine(h10, hash::json(&("nations", &p.nations, &crate::directives::of_stage(&e.overrides.directives, "nations"), &e.overrides.nation_seeds)));
     let h = [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11];
     // Fold in the model versions, preserving the chain (a version bump in one
     // step invalidates every later step too).

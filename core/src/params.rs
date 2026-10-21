@@ -589,6 +589,11 @@ pub struct NationParams {
     pub institution_share: f64,
     /// How many candidate birthplaces are offered when an institution emerges.
     pub institution_candidates: u32,
+    /// Polities that already exist at the start year, besides your nation
+    /// seeds: placed in the most populous free provinces, spaced apart, each
+    /// ruling about `initial_size` provinces around its capital.
+    pub initial_nations: u32,
+    pub initial_size: u32,
 }
 
 impl Default for NationParams {
@@ -640,6 +645,8 @@ impl Default for NationParams {
             institution_spread: 1.0,
             institution_share: 0.5,
             institution_candidates: 8,
+            initial_nations: 12,
+            initial_size: 6,
         }
     }
 }
