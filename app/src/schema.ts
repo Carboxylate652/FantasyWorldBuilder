@@ -166,7 +166,7 @@ export const STEPS: StepUI[] = [
   },
   {
     key: 'climate', title: 'Climate', layer: 'temperature', tools: [],
-    blurb: 'Seasonal energy balance by latitude, three-cell winds, maritime air, coastal currents and moisture transport.',
+    blurb: 'Seasonal energy balance by latitude, three-cell winds, maritime air held back by mountains, coastal currents, moisture transport and Foehn.',
     params: [
       { group: 'climate', key: 'climate_level', label: 'Solve on grid level', options: [[5, '5 (fast)'], [6, '6'], [7, '7 (default)'], [8, '8 (slow)']] },
       p('climate', 'lapse_rate_c_per_km', 'Lapse rate (°C/km)', 0, 12, 0.1),
@@ -178,6 +178,8 @@ export const STEPS: StepUI[] = [
       p('climate', 'moisture_passes', 'Moisture passes', 20, 300, 5),
       p('climate', 'thermal_wind', 'Thermal winds ×', 0, 3, 0.05, 'Winds driven by temperature-made pressure systems: monsoons, winter highs over continents, summer heat lows, plateau lows. 0 = zonal belts only.'),
       p('climate', 'mountain_blocking', 'Mountain blocking', 0, 1, 0.05, 'Share of upslope wind turned along steep terrain: air flows around ranges and through gaps instead of over them.'),
+      p('climate', 'sea_air_blocking', 'Mountains block sea air', 0, 3, 0.05, 'Mild sea air stays on the windward side of ranges: air coming down the lee side loses about half its maritime influence per 2 km of descent (at 1), so the land behind a range has hotter summers and colder winters. 0 = mountains do not hold it back.'),
+      p('climate', 'foehn', 'Foehn ×', 0, 3, 0.05, 'Air that rains out climbing a range comes down the far side warmer: 1.5 °C per km of wet climb at 1, approaching 4 °C in a month behind the highest, wettest ranges, fading over a few hundred km. Shown by the Foehn warming layer.'),
     ],
   },
   {

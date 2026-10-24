@@ -65,6 +65,8 @@ Every parameter of the twelve steps, with its default and meaning. This file is 
 | `heat_diffusion` | Poleward heat transport (0.1–2) | `0.68` | Heat transport toward the poles (W/m²/K, North's D). |
 | `thermal_wind` | Thermal winds × (0–3) | `1.0` | Strength of winds driven by thermal pressure systems (monsoons, continental highs). |
 | `mountain_blocking` | Mountain blocking (0–1) | `0.7` | Fraction of upslope wind turned along the contours of steep terrain. |
+| `sea_air_blocking` | Mountains block sea air (0–3) | `1.0` | How strongly mountains hold back maritime air (1 = air coming down the lee side loses about half its maritime influence per 2 km of descent). |
+| `foehn` | Foehn × (0–3) | `1.0` | Foehn strength: air that rains out climbing a range comes down the far side warmer (1 = 1.5 °C per km of wet climb, at most about 4 °C in a month, fading downwind). |
 
 ## Hydrology and erosion (step 6)
 

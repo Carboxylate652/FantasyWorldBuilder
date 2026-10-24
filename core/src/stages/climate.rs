@@ -7,11 +7,14 @@
 //!    and land-like heat capacity give the seasonal swing for maritime and
 //!    continental places; a land-fraction-weighted run gives the annual mean.
 //! 3. Local temperature: continentality from maritime air carried along the
-//!    wind, warm/cold coastal currents, and a lapse rate.
+//!    wind (and held back by mountains), warm/cold coastal currents, and a
+//!    lapse rate.
 //! 4. Three-cell winds with a seasonally migrating ITCZ, blended so they never
 //!    break at the cell edges.
 //! 5. Moisture: evaporation, transport along the wind, orographic rain and
 //!    rain shadows, ITCZ and subtropical-high modulation.
+//! 6. Foehn: air that rained out climbing a range warms the land below the
+//!    lee slope.
 //!
 //! The solve runs on a coarser grid (level 7 by default) and is interpolated
 //! onto the world grid, where the lapse rate is reapplied with full detail.
@@ -397,6 +400,12 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     // ---- maritime influence along the wind, then sea-level temperatures.
     // Run twice: with the belt winds, then with the thermally driven winds.
     let lapse = cp.lapse_rate_c_per_km / 1000.0;
+    let h_c: Vec<f64> = elev_c.iter().map(|&e| e.max(0.0) as f64).collect();
+    // Maritime air is shallow and stays on the windward side of a range: the air
+    // that comes down the far side has lost part of it for each metre it descends,
+    // so the land behind a range is more continental than the coast before it.
+    // Windward slopes and summits keep it.
+    let block_k = cp.sea_air_blocking.max(0.0) * std::f64::consts::LN_2 / 2000.0;
     let thermo = |wind_ann: &[Vec3]| -> (Vec<f64>, Vec<f64>, Vec<Vec<f32>>) {
     let reach = cp.maritime_reach_km.max(50.0);
     let decay_adv = (-spacing_km / reach).exp();
@@ -421,11 +430,12 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                     let j = nb as usize;
                     let dir = (coarse.pos[i] - coarse.pos[j]).normalized();
                     let a = wind_ann[j].dot(dir).max(0.0);
+                    let mj = mar[j] * (-block_k * (h_c[j] - h_c[i]).max(0.0)).exp();
                     aw += a;
-                    am += a * mar[j];
-                    ac += a * mar[j] * cur[j];
-                    if mar[j] > iso {
-                        iso = mar[j];
+                    am += a * mj;
+                    ac += a * mj * cur[j];
+                    if mj > iso {
+                        iso = mj;
                         iso_c = cur[j];
                     }
                 }
@@ -471,7 +481,6 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
 
     // ---- thermally driven winds and mountain blocking
     ctx.progress(0.36, "Building pressure systems");
-    let h_c: Vec<f64> = elev_c.iter().map(|&e| e.max(0.0) as f64).collect();
     let grad = super::wind::Gradient::new(coarse, r_km * 1000.0);
     let wind_ms = super::wind::dynamic_winds(p, coarse, &grad, &wind_base, &t_first, &h_c, &water_frac);
     let wind_m: Vec<Vec<Vec3>> = wind_ms.iter().map(|w| w.iter().map(|v| *v * (1.0 / super::wind::W_REF)).collect()).collect();
@@ -607,6 +616,17 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
         })
         .collect();
 
+    // ---- Foehn: air that rains out on the way up comes down the far side warmer
+    ctx.progress(0.85, "Warming lee slopes (Foehn)");
+    let foehn_c: Vec<Vec<f32>> = if cp.foehn > 0.0 {
+        (0..12)
+            .into_par_iter()
+            .map(|m| foehn_warming(coarse, &wind_m[m], &h_c, &precip_c[m], cp.foehn, spacing_km))
+            .collect()
+    } else {
+        vec![vec![0.0; nc]; 12]
+    };
+
     // ---- onto the world grid
     ctx.progress(0.88, "Interpolating to world grid");
     let n = fine.len();
@@ -618,14 +638,21 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     };
     let mut temp = vec![0.0f32; 12 * n];
     let mut precip = vec![0.0f32; 12 * n];
+    let mut foehn = vec![0.0f32; n];
     for m in 0..12 {
         let t_sl = up(&t_sl_c[m]);
         let pr = up(&precip_c[m]);
+        let fw = up(&foehn_c[m]);
         for i in 0..n {
             let e = elev_f[i];
             let mut t = t_sl[i] - (lapse * e.max(0.0) as f64) as f32;
             if water_f[i] == 1 {
                 t = t.max(-1.8);
+            } else if water_f[i] == 0 {
+                // Foehn warms the land; seas and lakes keep their own temperature.
+                let w = fw[i].max(0.0);
+                t += w;
+                foehn[i] += w / 12.0;
             }
             temp[m * n + i] = t;
             precip[m * n + i] = pr[i].max(0.0);
@@ -673,6 +700,8 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     f.put("wind_v", Field::F32(wind_v));
     f.put("continentality", Field::F32(mar_f.iter().map(|m| 1.0 - m).collect()));
     f.put("current_offset", Field::F32(cur_f));
+    let foehn_max = foehn.iter().cloned().fold(0.0f32, f32::max);
+    f.put("foehn", Field::F32(foehn));
 
     // Zonal profile for charts.
     let zonal: Vec<serde_json::Value> = (0..37)
@@ -702,9 +731,73 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
             "climate_level": cl,
             "hadley_edge_deg": belts.hadley,
             "ferrel_edge_deg": belts.ferrel,
+            "foehn_max_c": foehn_max,
             "zonal": zonal,
         }),
     }
+}
+
+/// Warming per km of climb on which the air rains out (°C/km at `foehn` = 1).
+/// Rising saturated air cools at ~6 °C/km, sinking dry air warms at 9.8 °C/km;
+/// a month's mean sees only part of that, since the wind does not always blow
+/// across the range.
+const FOEHN_C_PER_KM: f64 = 1.5;
+/// Monthly Foehn warming approaches this (°C at `foehn` = 1) behind the
+/// highest, wettest ranges.
+const FOEHN_MAX_C: f64 = 4.0;
+/// Distance over which Foehn air mixes back into its surroundings (km).
+const FOEHN_REACH_KM: f64 = 300.0;
+/// Monthly rain (mm) at which about 63% of the climb is counted as wet.
+const FOEHN_WET_MM: f64 = 60.0;
+
+/// One month's Foehn warming (°C) on the climate grid. Air carried along the
+/// wind banks warmth while it climbs and rains out (`gain` per metre of climb,
+/// scaled by how wet the slope is), and remembers the highest ground it has
+/// crossed. Below that crest it shows the banked warmth, up to `gain` per metre
+/// of descent: nothing on the windward side or the crest, most at the foot of
+/// the lee slope. Both fade with distance as the air mixes. The result
+/// saturates toward `FOEHN_MAX_C × strength`.
+fn foehn_warming(g: &Grid, wind: &[Vec3], h: &[f64], precip: &[f32], strength: f64, spacing_km: f64) -> Vec<f32> {
+    let nc = g.len();
+    let gain = strength * FOEHN_C_PER_KM / 1000.0;
+    let decay = (-spacing_km / FOEHN_REACH_KM).exp();
+    let passes = ((FOEHN_REACH_KM * 3.0) / spacing_km).ceil() as usize + 4;
+    let wet: Vec<f64> = precip.iter().map(|&p| 1.0 - (-(p.max(0.0) as f64) / FOEHN_WET_MM).exp()).collect();
+    let mut bank = vec![0.0f64; nc];
+    let mut crest = h.to_vec();
+    for _ in 0..passes {
+        let next: Vec<(f64, f64)> = (0..nc)
+            .map(|i| {
+                let (mut aw, mut ab, mut ac, mut ah) = (0.0, 0.0, 0.0, 0.0);
+                for &nb in g.neighbors(i) {
+                    let j = nb as usize;
+                    let a = wind[j].dot((g.pos[i] - g.pos[j]).normalized()).max(0.0);
+                    aw += a;
+                    ab += a * bank[j];
+                    ac += a * crest[j];
+                    ah += a * h[j];
+                }
+                if aw <= 0.0 {
+                    return (0.0, h[i]);
+                }
+                let climb = (h[i] - ah / aw).max(0.0);
+                let b = ab / aw * decay + gain * wet[i] * climb;
+                let c = h[i] + (ac / aw - h[i]).max(0.0) * decay;
+                (b, c)
+            })
+            .collect();
+        for (i, (b, c)) in next.into_iter().enumerate() {
+            bank[i] = b;
+            crest[i] = c;
+        }
+    }
+    let cap = FOEHN_MAX_C * strength;
+    (0..nc)
+        .map(|i| {
+            let raw = bank[i].min(gain * (crest[i] - h[i])).max(0.0);
+            (cap * (1.0 - (-raw / cap).exp())) as f32
+        })
+        .collect()
 }
 
 /// Annual mean, warmest month, coldest month, annual precipitation.

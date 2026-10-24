@@ -1158,3 +1158,77 @@ fn stale_results_do_not_shadow_fresh_ones_and_can_be_cleared() {
     assert_eq!(states[Step::Sketch.index()], "done");
     assert!(states[Step::Plates.index()..].iter().all(|&s| s == "empty"), "{states:?}");
 }
+
+/// Foehn warms only land below the lee of ranges, by exactly the `foehn`
+/// field, without touching rain or the sea; mountains hold maritime air back,
+/// so lee slopes turn more continental than windward ones.
+#[test]
+fn foehn_and_mountains_blocking_sea_air() {
+    let mut p = small_params(5);
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    let run = |foehn: f64, blocking: f64| {
+        let mut q = p.clone();
+        q.climate.foehn = foehn;
+        q.climate.sea_air_blocking = blocking;
+        let mut w = World::new(q);
+        w.run_to(Step::Climate, &|_, _, _| {});
+        w
+    };
+    let f32_of = |w: &mut World, name: &str| match w.field(name) {
+        Some((worldcore::fields::Field::F32(v), _, _)) => v.clone(),
+        _ => panic!("{name}"),
+    };
+    let mut none = run(0.0, 0.0);
+    let mut foehn = run(1.0, 0.0);
+    let mut blocked = run(0.0, 1.0);
+    let grid = none.grid();
+    let n = grid.len();
+    let elev = f32_of(&mut none, "elevation");
+
+    // How far each land cell lies below the ground its annual-mean wind comes from.
+    let (u, v) = (f32_of(&mut none, "wind_u"), f32_of(&mut none, "wind_v"));
+    let below_upwind: Vec<f64> = (0..n)
+        .map(|i| {
+            let (mut aw, mut ah) = (0.0, 0.0);
+            for &nb in grid.neighbors(i) {
+                let j = nb as usize;
+                let (e, nn) = grid.pos[j].east_north();
+                let (uj, vj) = ((0..12).map(|m| u[m * n + j]).sum::<f32>(), (0..12).map(|m| v[m * n + j]).sum::<f32>());
+                let a = (e * uj as f64 + nn * vj as f64).dot((grid.pos[i] - grid.pos[j]).normalized()).max(0.0);
+                aw += a;
+                ah += a * elev[j].max(0.0) as f64;
+            }
+            if aw > 0.0 { ah / aw - elev[i].max(0.0) as f64 } else { 0.0 }
+        })
+        .collect();
+    let land: Vec<usize> = (0..n).filter(|&i| elev[i] > 0.0).collect();
+    let lee: Vec<usize> = land.iter().copied().filter(|&i| below_upwind[i] > 150.0).collect();
+    let windward: Vec<usize> = land.iter().copied().filter(|&i| below_upwind[i] < -150.0).collect();
+    assert!(lee.len() > 20 && windward.len() > 20, "{} lee, {} windward cells", lee.len(), windward.len());
+    let mean = |v: &[f32], cells: &[usize]| cells.iter().map(|&i| v[i] as f64).sum::<f64>() / cells.len() as f64;
+
+    // Foehn: none when switched off, only on land, within its cap, mostly on lee slopes.
+    assert!(f32_of(&mut none, "foehn").iter().all(|&x| x == 0.0));
+    let fw = f32_of(&mut foehn, "foehn");
+    assert!((0..n).all(|i| fw[i] >= 0.0 && (elev[i] > 0.0 || fw[i] == 0.0)), "only land is warmed");
+    let max = fw.iter().cloned().fold(0.0, f32::max);
+    assert!(max > 0.3 && max < 4.0, "strongest Foehn {max} °C");
+    let (f_lee, f_wind) = (mean(&fw, &lee), mean(&fw, &windward));
+    assert!(f_lee > 2.0 * f_wind && f_lee > 0.05, "Foehn on lee slopes {f_lee:.3} °C, windward {f_wind:.3} °C");
+    // It adds exactly its warming to each land month (ice sheets, which damp
+    // summer warmth, aside) and changes nothing else.
+    let (t0, t1) = (f32_of(&mut none, "t_mean"), f32_of(&mut foehn, "t_mean"));
+    for i in (0..n).filter(|&i| t0[i].min(t1[i]) > -8.0) {
+        assert!((t1[i] - t0[i] - fw[i]).abs() < 1e-3, "cell {i}: {} vs {}", t1[i] - t0[i], fw[i]);
+    }
+    assert_eq!(f32_of(&mut none, "p_ann"), f32_of(&mut foehn, "p_ann"), "rain unchanged");
+    assert_eq!(f32_of(&mut none, "continentality"), f32_of(&mut foehn, "continentality"));
+
+    // Blocking: lee slopes lose more maritime air than windward ones.
+    let (c0, c1) = (f32_of(&mut none, "continentality"), f32_of(&mut blocked, "continentality"));
+    let dc: Vec<f32> = (0..n).map(|i| c1[i] - c0[i]).collect();
+    let (d_lee, d_wind) = (mean(&dc, &lee), mean(&dc, &windward));
+    assert!(d_lee > 0.02 && d_lee > 2.0 * d_wind.max(0.0), "continentality rise on lee slopes {d_lee:.3}, windward {d_wind:.3}");
+    assert!(mean(&dc, &land) > 0.0, "land is more continental overall");
+}

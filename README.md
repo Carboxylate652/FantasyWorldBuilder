@@ -232,7 +232,9 @@ Each cell then takes its province by majority pixel vote. A province joins the s
   - Mountain blocking turns the upslope part of the wind along the contours.
   - Temperatures are re-solved with the new winds, and low-level convergence adds rain.
   - Winds are stored per month (`wind_u`, `wind_v`, in m/s) and shown by the *Wind speed* layer and the *Wind* overlay. The *Thermal winds ×* and *Mountain blocking* settings in the Climate card control them.
+  - Mountains block sea air: the air coming down a lee slope has lost part of its maritime influence, so the land behind a range is more continental than the coast before it.
   - Moisture transport with recycling over land, orographic rain, rain shadows, summer convection, and Clausius–Clapeyron scaling.
+  - Foehn: air that rains out climbing a range comes down the far side warmer, up to about 4 °C in a month at the foot of the highest, wettest ranges (*Foehn warming* layer). The *Mountains block sea air* and *Foehn ×* settings in the Climate card control both.
 - **Hydrology:**
   - Isolated below-sea-level water bodies smaller than *Inland sea limit* are basins, not ocean.
   - Rivers cut basin outlets down by *Outlet incision*, so only deeper basins can hold lakes.
