@@ -284,7 +284,9 @@ fn springs_resources_and_site_pins() {
     assert!(w.meta(Step::Cultures).unwrap()["desert_towns"].is_u64());
 
     // Pin a town in the driest land province that has people around.
-    let dry = land.iter().filter(|p| !p["river"].as_bool().unwrap()).min_by(|a, b| a["rain_mm"].as_f64().partial_cmp(&b["rain_mm"].as_f64()).unwrap()).unwrap();
+    let people = &w.meta(Step::Cultures).unwrap()["table"]["provinces"];
+    let peopled = |id: u64| people.as_array().unwrap().iter().any(|c| c["id"].as_u64() == Some(id) && c["population"].as_f64().unwrap_or(0.0) >= 1000.0);
+    let dry = land.iter().filter(|p| !p["river"].as_bool().unwrap() && peopled(p["id"].as_u64().unwrap())).min_by(|a, b| a["rain_mm"].as_f64().partial_cmp(&b["rain_mm"].as_f64()).unwrap()).unwrap();
     let (lat, lon) = (dry["center"][0].as_f64().unwrap(), dry["center"][1].as_f64().unwrap());
     let pid = dry["id"].as_u64().unwrap();
     w.edits.add_stroke(Stroke { tool: Tool::SitePin, value: 40_000.0, points: vec![[lat, lon]], ..Default::default() });
@@ -882,8 +884,9 @@ fn institutions_ports_and_step_schedule() {
     // Stepping again without choosing stays put.
     let again = call("sim_step", serde_json::json!({ "steps": 3, "stop_at_choice": true }));
     assert_eq!(again["live"]["position"], st["live"]["position"]);
-    // Choose the last candidate: it is born there.
-    let chosen = cands.last().unwrap()["province"].as_u64().unwrap();
+    // Choose the best-ranked candidate: it is born there. (A low-ranked, poorly
+    // connected birthplace can keep an institution from spreading at all.)
+    let chosen = cands[0]["province"].as_u64().unwrap();
     call("sim_directive", serde_json::json!({ "action": "institution_birth", "args": { "institution": 0, "province": chosen } }));
     let st = call("sim_step", serde_json::json!({ "steps": 1, "stop_at_choice": true }));
     let gun = &st["sim"]["institutions"][0];
@@ -1157,4 +1160,150 @@ fn stale_results_do_not_shadow_fresh_ones_and_can_be_cleared() {
     assert_eq!(st["cleared"], 2, "plates and relief");
     assert_eq!(states[Step::Sketch.index()], "done");
     assert!(states[Step::Plates.index()..].iter().all(|&s| s == "empty"), "{states:?}");
+}
+
+/// Foehn warms only land below the lee of ranges, by exactly the `foehn`
+/// field, without touching rain or the sea; mountains hold maritime air back,
+/// so lee slopes turn more continental than windward ones.
+#[test]
+fn foehn_and_mountains_blocking_sea_air() {
+    let mut p = small_params(5);
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    let run = |foehn: f64, blocking: f64| {
+        let mut q = p.clone();
+        q.climate.foehn = foehn;
+        q.climate.sea_air_blocking = blocking;
+        let mut w = World::new(q);
+        w.run_to(Step::Climate, &|_, _, _| {});
+        w
+    };
+    let f32_of = |w: &mut World, name: &str| match w.field(name) {
+        Some((worldcore::fields::Field::F32(v), _, _)) => v.clone(),
+        _ => panic!("{name}"),
+    };
+    let mut none = run(0.0, 0.0);
+    let mut foehn = run(1.0, 0.0);
+    let mut blocked = run(0.0, 1.0);
+    let grid = none.grid();
+    let n = grid.len();
+    let elev = f32_of(&mut none, "elevation");
+
+    // How far each land cell lies below the ground its annual-mean wind comes from.
+    let (u, v) = (f32_of(&mut none, "wind_u"), f32_of(&mut none, "wind_v"));
+    let below_upwind: Vec<f64> = (0..n)
+        .map(|i| {
+            let (mut aw, mut ah) = (0.0, 0.0);
+            for &nb in grid.neighbors(i) {
+                let j = nb as usize;
+                let (e, nn) = grid.pos[j].east_north();
+                let (uj, vj) = ((0..12).map(|m| u[m * n + j]).sum::<f32>(), (0..12).map(|m| v[m * n + j]).sum::<f32>());
+                let a = (e * uj as f64 + nn * vj as f64).dot((grid.pos[i] - grid.pos[j]).normalized()).max(0.0);
+                aw += a;
+                ah += a * elev[j].max(0.0) as f64;
+            }
+            if aw > 0.0 { ah / aw - elev[i].max(0.0) as f64 } else { 0.0 }
+        })
+        .collect();
+    let land: Vec<usize> = (0..n).filter(|&i| elev[i] > 0.0).collect();
+    let lee: Vec<usize> = land.iter().copied().filter(|&i| below_upwind[i] > 150.0).collect();
+    let windward: Vec<usize> = land.iter().copied().filter(|&i| below_upwind[i] < -150.0).collect();
+    assert!(lee.len() > 20 && windward.len() > 20, "{} lee, {} windward cells", lee.len(), windward.len());
+    let mean = |v: &[f32], cells: &[usize]| cells.iter().map(|&i| v[i] as f64).sum::<f64>() / cells.len() as f64;
+
+    // Foehn: none when switched off, only on land, within its cap, mostly on lee slopes.
+    assert!(f32_of(&mut none, "foehn").iter().all(|&x| x == 0.0));
+    let fw = f32_of(&mut foehn, "foehn");
+    assert!((0..n).all(|i| fw[i] >= 0.0 && (elev[i] > 0.0 || fw[i] == 0.0)), "only land is warmed");
+    let max = fw.iter().cloned().fold(0.0, f32::max);
+    assert!(max > 0.3 && max < 4.0, "strongest Foehn {max} °C");
+    let (f_lee, f_wind) = (mean(&fw, &lee), mean(&fw, &windward));
+    assert!(f_lee > 2.0 * f_wind && f_lee > 0.05, "Foehn on lee slopes {f_lee:.3} °C, windward {f_wind:.3} °C");
+    // It adds exactly its warming to each land month (ice sheets, which damp
+    // summer warmth, aside) and changes nothing else.
+    let (t0, t1) = (f32_of(&mut none, "t_mean"), f32_of(&mut foehn, "t_mean"));
+    for i in (0..n).filter(|&i| t0[i].min(t1[i]) > -8.0) {
+        assert!((t1[i] - t0[i] - fw[i]).abs() < 1e-3, "cell {i}: {} vs {}", t1[i] - t0[i], fw[i]);
+    }
+    assert_eq!(f32_of(&mut none, "p_ann"), f32_of(&mut foehn, "p_ann"), "rain unchanged");
+    assert_eq!(f32_of(&mut none, "continentality"), f32_of(&mut foehn, "continentality"));
+
+    // Blocking: lee slopes lose more maritime air than windward ones.
+    let (c0, c1) = (f32_of(&mut none, "continentality"), f32_of(&mut blocked, "continentality"));
+    let dc: Vec<f32> = (0..n).map(|i| c1[i] - c0[i]).collect();
+    let (d_lee, d_wind) = (mean(&dc, &lee), mean(&dc, &windward));
+    assert!(d_lee > 0.02 && d_lee > 2.0 * d_wind.max(0.0), "continentality rise on lee slopes {d_lee:.3}, windward {d_wind:.3}");
+    assert!(mean(&dc, &land) > 0.0, "land is more continental overall");
+}
+
+/// Orographic rain: wet air forced up a slope rains more on the windward side
+/// than on the lee, on the climate grid and on the finer world grid; no month
+/// exceeds the rain-rate limit, and the global total stays put.
+#[test]
+fn orographic_rain_on_windward_slopes() {
+    let mut p = small_params(5);
+    p.planet.grid_level = 7;
+    p.climate.climate_level = 6;
+    let run = |oro: f64| {
+        let mut q = p.clone();
+        q.climate.orographic = oro;
+        let mut w = World::new(q);
+        w.run_to(Step::Climate, &|_, _, _| {});
+        w
+    };
+    let f32_of = |w: &mut World, name: &str| match w.field(name) {
+        Some((worldcore::fields::Field::F32(v), _, _)) => v.clone(),
+        _ => panic!("{name}"),
+    };
+    let mut flat = run(0.0);
+    let mut oro = run(1.0);
+    let grid = flat.grid();
+    let n = grid.len();
+    let elev = f32_of(&mut flat, "elevation");
+    let (u, v) = (f32_of(&mut flat, "wind_u"), f32_of(&mut flat, "wind_v"));
+    let pm0 = f32_of(&mut flat, "precip");
+    // Climb of each land cell above the ground its wind comes from, weighting
+    // each month's wind by its rain (the wet-season wind is the one that counts).
+    let climb: Vec<f64> = (0..n)
+        .map(|i| {
+            let (mut aw, mut ah) = (0.0, 0.0);
+            for &nb in grid.neighbors(i) {
+                let j = nb as usize;
+                let (e, nn) = grid.pos[j].east_north();
+                let (uj, vj) = ((0..12).map(|m| u[m * n + j] * pm0[m * n + j]).sum::<f32>(), (0..12).map(|m| v[m * n + j] * pm0[m * n + j]).sum::<f32>());
+                let a = (e * uj as f64 + nn * vj as f64).dot((grid.pos[i] - grid.pos[j]).normalized()).max(0.0);
+                aw += a;
+                ah += a * elev[j].max(0.0) as f64;
+            }
+            if aw > 0.0 { elev[i].max(0.0) as f64 - ah / aw } else { 0.0 }
+        })
+        .collect();
+    let land: Vec<usize> = (0..n).filter(|&i| elev[i] > 0.0).collect();
+    let windward: Vec<usize> = land.iter().copied().filter(|&i| climb[i] > 150.0).collect();
+    let lee: Vec<usize> = land.iter().copied().filter(|&i| climb[i] < -150.0).collect();
+    assert!(windward.len() > 20 && lee.len() > 20, "{} windward, {} lee cells", windward.len(), lee.len());
+    let (p0, p1) = (f32_of(&mut flat, "p_ann"), f32_of(&mut oro, "p_ann"));
+    // Median gain per cell from switching orographic rain on.
+    let gain = |cells: &[usize]| {
+        let mut r: Vec<f64> = cells.iter().map(|&i| p1[i] as f64 / (p0[i] as f64).max(1.0)).collect();
+        r.sort_by(|a, b| a.total_cmp(b));
+        r[r.len() / 2]
+    };
+    let (g_wind, g_lee) = (gain(&windward), gain(&lee));
+    assert!(g_wind > 1.7, "windward slopes gain x{g_wind:.2}");
+    assert!(g_wind > g_lee + 0.35, "windward x{g_wind:.2} vs lee x{g_lee:.2}");
+    // The global total barely moves: orographic rain only moves rain around.
+    let total = |pa: &[f32]| (0..n).map(|i| pa[i] as f64 * grid.area[i]).sum::<f64>();
+    let ratio = total(&p1) / total(&p0);
+    assert!((ratio - 1.0).abs() < 0.03, "global precipitation changed x{ratio:.3}");
+
+    // A very wet world with strong orographic rain still keeps every month
+    // under the rain-rate limit.
+    let mut wet = p.clone();
+    wet.climate.global_precip_mm = 3000.0;
+    wet.climate.orographic = 2.0;
+    let mut w = World::new(wet);
+    w.run_to(Step::Climate, &|_, _, _| {});
+    let max = f32_of(&mut w, "precip").iter().cloned().fold(0.0, f32::max);
+    assert!(max > 1500.0 && max < 2500.0, "wettest month {max} mm");
 }

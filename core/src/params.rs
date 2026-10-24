@@ -134,7 +134,10 @@ pub struct ClimateParams {
     pub ocean_current_c: f64,
     /// How far maritime air reaches inland along the wind (km).
     pub maritime_reach_km: f64,
-    /// Orographic rain strength.
+    /// Orographic rain strength: wet air forced up a slope condenses part of
+    /// its vapour into cloud that rains out over the slope and the crest (1 =
+    /// 63% within 800 m of climb), and rain shifts onto slopes facing the wind
+    /// on the world grid.
     pub orographic: f64,
     pub moisture_passes: u32,
     /// Heat transport toward the poles (W/m²/K, North's D).
@@ -143,6 +146,13 @@ pub struct ClimateParams {
     pub thermal_wind: f64,
     /// Fraction of upslope wind turned along the contours of steep terrain.
     pub mountain_blocking: f64,
+    /// How strongly mountains hold back maritime air (1 = air coming down the
+    /// lee side loses about half its maritime influence per 2 km of descent).
+    pub sea_air_blocking: f64,
+    /// Foehn strength: air that rains out climbing a range comes down the far
+    /// side warmer (1 = 1.5 °C per km of wet climb, at most about 4 °C in a
+    /// month, fading downwind).
+    pub foehn: f64,
 }
 
 impl Default for ClimateParams {
@@ -158,6 +168,8 @@ impl Default for ClimateParams {
             heat_diffusion: 0.68,
             thermal_wind: 1.0,
             mountain_blocking: 0.7,
+            sea_air_blocking: 1.0,
+            foehn: 1.0,
         }
     }
 }

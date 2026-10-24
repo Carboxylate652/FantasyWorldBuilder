@@ -218,7 +218,7 @@ function stepOfLayer(id: LayerId): string {
   const m: Record<string, string> = {
     sketch: 'Continent sketch', plates: 'Plates', crust: 'Plates', boundaries: 'Tectonic relief', elevation: 'Tectonic relief',
     stress: 'Tectonic relief', old_relief: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', continentality: 'Climate',
-    currents: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
+    currents: 'Climate', foehn: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
     habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
     resources: 'Provinces',
     cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures', attraction: 'Cultures',
@@ -2438,6 +2438,7 @@ function describe(d: any): [string, string][] {
     const mean = d.temp.reduce((a: number, b: number) => a + b, 0) / 12 + adj;
     parts.push(`${mean.toFixed(1)} °C (${(Math.min(...d.temp) + adj).toFixed(0)} to ${(Math.max(...d.temp) + adj).toFixed(0)})`);
   } else if (typeof d.temp === 'number') parts.push(`${(d.temp + adj).toFixed(1)} °C in ${MONTHS[S.month ?? 0]}`);
+  if (d.foehn >= 0.1) parts.push(`Foehn +${d.foehn.toFixed(1)} °C`);
   if (d.p_ann !== undefined) parts.push(`${Math.round(d.p_ann).toLocaleString()} mm/yr`);
   if (d.koppen) parts.push(`${KOPPEN[d.koppen][0]} ${KOPPEN[d.koppen][2]}`);
   tag = 'land';
