@@ -60,7 +60,7 @@ Every parameter of the twelve steps, with its default and meaning. This file is 
 | `global_precip_mm` | Global precipitation (mm/yr) (100–3000) | `1000.0` | Global mean precipitation at Earth temperature (mm/year). |
 | `ocean_current_c` | Coastal currents (°C) (0–15) | `5.0` | Strength of warm/cold coastal current offsets (°C at full effect). |
 | `maritime_reach_km` | Maritime reach (km) (100–5000) | `1400.0` | How far maritime air reaches inland along the wind (km). |
-| `orographic` | Orographic rain × (0–4) | `1.0` | Orographic rain strength. |
+| `orographic` | Orographic rain × (0–4) | `1.0` | Orographic rain strength: wet air forced up a slope condenses part of its vapour into cloud that rains out over the slope and the crest (1 = 63% within 800 m of climb), and rain shifts onto slopes facing the wind on the world grid. |
 | `moisture_passes` | Moisture passes (20–300) | `90` | — |
 | `heat_diffusion` | Poleward heat transport (0.1–2) | `0.68` | Heat transport toward the poles (W/m²/K, North's D). |
 | `thermal_wind` | Thermal winds × (0–3) | `1.0` | Strength of winds driven by thermal pressure systems (monsoons, continental highs). |

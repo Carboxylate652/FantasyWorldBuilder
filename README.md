@@ -234,6 +234,7 @@ Each cell then takes its province by majority pixel vote. A province joins the s
   - Winds are stored per month (`wind_u`, `wind_v`, in m/s) and shown by the *Wind speed* layer and the *Wind* overlay. The *Thermal winds ×* and *Mountain blocking* settings in the Climate card control them.
   - Mountains block sea air: the air coming down a lee slope has lost part of its maritime influence, so the land behind a range is more continental than the coast before it.
   - Moisture transport with recycling over land, orographic rain, rain shadows, summer convection, and Clausius–Clapeyron scaling.
+  - Orographic rain and snow: wet air forced up a slope turns vapour into cloud that rains out over the windward slope and crest, and the rain is placed on slopes facing the wind at full map detail.
   - Foehn: air that rains out climbing a range comes down the far side warmer, up to about 4 °C in a month at the foot of the highest, wettest ranges (*Foehn warming* layer). The *Mountains block sea air* and *Foehn ×* settings in the Climate card control both.
 - **Hydrology:**
   - Isolated below-sea-level water bodies smaller than *Inland sea limit* are basins, not ocean.

@@ -134,7 +134,10 @@ pub struct ClimateParams {
     pub ocean_current_c: f64,
     /// How far maritime air reaches inland along the wind (km).
     pub maritime_reach_km: f64,
-    /// Orographic rain strength.
+    /// Orographic rain strength: wet air forced up a slope condenses part of
+    /// its vapour into cloud that rains out over the slope and the crest (1 =
+    /// 63% within 800 m of climb), and rain shifts onto slopes facing the wind
+    /// on the world grid.
     pub orographic: f64,
     pub moisture_passes: u32,
     /// Heat transport toward the poles (W/m²/K, North's D).

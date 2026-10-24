@@ -521,10 +521,14 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 }
                 stay[j] = 1.0 - sent;
             }
-            // Per-cell rain fraction and evaporation.
+            // Per-cell rain fraction and evaporation; share of the vapour flowing
+            // in that condenses on the climb, and share of the cloud that
+            // evaporates again where the air comes down.
             let mut rain_frac = vec![0.0; nc];
             let mut evap = vec![0.0; nc];
             let mut cap = vec![0.0; nc];
+            let mut lift = vec![0.0; nc];
+            let mut dissolve = vec![0.0; nc];
             for i in 0..nc {
                 let mut up = 0.0;
                 let mut down = 0.0;
@@ -549,13 +553,15 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 lm *= 1.0 - 0.7 * gauss(a, belts.hadley, 8.0);
                 lm *= 1.0 + 0.5 * gauss(a, belts.ferrel - 8.0, 10.0);
                 let cold_coast = (1.0 + 0.09 * cur[i].min(0.0) * mar[i]).clamp(0.3, 1.0);
-                // Saturating: a steep windward slope wrings out at most ~30% per step,
-                // so rain spreads up the slope instead of piling onto one cell.
-                let oro = 0.3 * cp.orographic * (1.0 - (-up / 900.0).exp());
+                // Orographic rain: air forced up a slope condenses part of its
+                // vapour into cloud (most of it within ~OROGRAPHIC_LIFT_M of climb);
+                // the cloud drifts on and rains out over the slope and the crest.
+                lift[i] = 1.0 - (-cp.orographic.max(0.0) * up / OROGRAPHIC_LIFT_M).exp();
+                dissolve[i] = 1.0 - (-down / CLOUD_DRY_M).exp();
                 let shadow = (-down / 900.0).exp();
                 // Summer convection over warm land.
                 let convect = 1.0 + 0.8 * (1.0 - water_frac[i]) * smoothstep(8.0, 28.0, temp[i]);
-                rain_frac[i] = ((0.03 * lm + oro) * shadow * cold_coast * convect).clamp(0.002, 0.6);
+                rain_frac[i] = (0.03 * lm * shadow * cold_coast * convect).clamp(0.002, 0.6);
                 let q = qsat(temp[i]);
                 let speed = wind[i].len();
                 // Open water (ocean and lakes) evaporates freely; land only weakly.
@@ -563,30 +569,47 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 evap[i] = wf * 0.12 * q * (0.5 + speed) + (1.0 - wf) * 0.01 * q;
                 cap[i] = 9.0 * q;
             }
-            // Iterate transport.
+            // Iterate transport of vapour `w` and cloud water `cl`.
             let mut w = vec![0.0f64; nc];
+            let mut cl = vec![0.0f64; nc];
             let mut acc = vec![0.0f64; nc];
             let mut last_rain = vec![0.0f64; nc];
             const RECYCLE: f64 = 0.55;
             let warm = passes / 2;
             for pass in 0..passes {
-                let next: Vec<(f64, f64)> = (0..nc)
+                let next: Vec<(f64, f64, f64)> = (0..nc)
                     .map(|i| {
+                        let (mut inflow, mut inflow_cl) = (0.0, 0.0);
+                        for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
+                            let (j, wt) = (nbr_idx[e] as usize, out_w[nbr_rev[e] as usize]);
+                            inflow += w[j] * wt;
+                            inflow_cl += cl[j] * wt;
+                        }
+                        // Only air that arrives up the slope is lifted, so water
+                        // lingering in a cell is not wrung out again each pass.
+                        let cond = inflow * lift[i];
                         // Land re-evaporates part of what fell on it last pass (recycling).
                         let recycled = RECYCLE * (1.0 - water_frac[i]) * last_rain[i];
-                        let mut v = w[i] * stay[i] + evap[i] + recycled;
-                        for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
-                            v += w[nbr_idx[e] as usize] * out_w[nbr_rev[e] as usize];
-                        }
-                        let mut r = v * rain_frac[i];
+                        let mut v = w[i] * stay[i] + evap[i] + recycled + inflow - cond;
+                        let mut c = cl[i] * stay[i] + inflow_cl + cond;
+                        // Sinking air dries the cloud it brings over the crest.
+                        let back = c * dissolve[i];
+                        c -= back;
+                        v += back;
+                        let r = v * rain_frac[i];
+                        // Vapour beyond what the (cold, high) air can hold turns to
+                        // cloud too, rather than all raining on one summit.
                         if v - r > cap[i] {
-                            r = v - cap[i];
+                            c += v - r - cap[i];
+                            v = cap[i] + r;
                         }
-                        (v - r, r)
+                        let rc = c * CLOUD_FALLOUT;
+                        (v - r, c - rc, r + rc)
                     })
                     .collect();
-                for (i, (v, r)) in next.into_iter().enumerate() {
+                for (i, (v, c, r)) in next.into_iter().enumerate() {
                     w[i] = v;
+                    cl[i] = c;
                     last_rain[i] = r;
                     if pass >= warm {
                         acc[i] += r;
@@ -686,6 +709,15 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
         wind_u[m * n..(m + 1) * n].copy_from_slice(&up(&eu));
         wind_v[m * n..(m + 1) * n].copy_from_slice(&up(&ev));
     }
+    // Orographic rain finer than the climate grid: within each climate cell,
+    // rain moves toward the slopes facing the wind and away from lee slopes.
+    if let Some(t) = transfer {
+        ctx.progress(0.93, "Placing mountain rain");
+        orographic_downscale(fine, t, nc, elev_f, &wind_u, &wind_v, &mut precip, cp.orographic, r_km);
+    }
+    // Rain-rate limit: the wettest places on Earth average ~2,800 mm in their
+    // wettest month. A soft limit (−3% at 1,500 mm) keeps monsoon summits below it.
+    precip.par_iter_mut().for_each(|p| *p /= (1.0 + (*p / RAIN_MONTH_MAX_MM).powi(4)).powf(0.25));
     let mar_f = up(&mar.iter().map(|&x| x as f32).collect::<Vec<_>>());
     let cur_f = up(&(0..nc).map(|i| (if ocean_c[i] { current_c[i] } else { cur[i] * mar[i] }) as f32).collect::<Vec<_>>());
     let mut f = Fields::default();
@@ -735,6 +767,82 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
             "zonal": zonal,
         }),
     }
+}
+
+/// Climb (m) over which rising air condenses 63% of the vapour it brings, at
+/// `orographic` = 1. Shorter than the ~2 km scale height of water vapour,
+/// since forced ascent also sets off showers and seeder–feeder rain: real
+/// windward slopes get 1.5–3 times the rain of the lowland upwind.
+const OROGRAPHIC_LIFT_M: f64 = 800.0;
+/// Share of cloud water that rains out per transport pass; the rest drifts on
+/// with the wind, so orographic rain spreads up the slope and over the crest.
+const CLOUD_FALLOUT: f64 = 0.5;
+/// Descent (m) over which sinking air evaporates 63% of the cloud it carries.
+const CLOUD_DRY_M: f64 = 1000.0;
+
+/// Monthly precipitation approaches this (mm) at the very wettest places.
+const RAIN_MONTH_MAX_MM: f32 = 2500.0;
+
+/// World-grid orographic rain: a slope facing the wind gets up to (1 + GAIN)
+/// times its share, approached at slopes of a few × SLOPE (m of climb per km);
+/// a lee slope keeps e^(−descent/LEE) of it. Climate-cell totals are kept.
+const DOWNSCALE_GAIN: f64 = 3.0;
+const DOWNSCALE_SLOPE: f64 = 25.0;
+const DOWNSCALE_LEE: f64 = 40.0;
+
+/// Redistribute each month's rain inside every climate cell by the world-grid
+/// terrain: more where the wind blows up a slope, less where it comes down.
+/// The climate grid already set how much falls in the region; this only
+/// places it, so every climate cell keeps (up to interpolation) its total.
+#[allow(clippy::too_many_arguments)]
+fn orographic_downscale(fine: &Grid, t: &GridTransfer, nc: usize, elev: &[f32], wind_u: &[f32], wind_v: &[f32], precip: &mut [f32], strength: f64, r_km: f64) {
+    if strength <= 0.0 {
+        return;
+    }
+    let n = fine.len();
+    // Terrain gradient (m per km, as a tangent vector) of lightly smoothed
+    // heights, so single-cell noise and grid directions do not streak the rain.
+    let h0: Vec<f64> = elev.iter().map(|&e| e.max(0.0) as f64).collect();
+    let hs = smooth(fine, &smooth(fine, &h0));
+    let grad: Vec<Vec3> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let nb = fine.neighbors(i);
+            let mut g = Vec3::ZERO;
+            for &j in nb {
+                let d = (fine.pos[j as usize] - fine.pos[i]) * r_km;
+                g += d * ((hs[j as usize] - hs[i]) / d.dot(d));
+            }
+            g * (2.0 / nb.len() as f64)
+        })
+        .collect();
+    let basis: Vec<(Vec3, Vec3)> = fine.pos.iter().map(|p| p.east_north()).collect();
+    precip.par_chunks_mut(n).enumerate().for_each(|(m, pm)| {
+        let (wu, wv) = (&wind_u[m * n..(m + 1) * n], &wind_v[m * n..(m + 1) * n]);
+        // Log of the rain factor: + up a slope facing the wind, − down a lee slope.
+        let lf: Vec<f64> = (0..n)
+            .map(|i| {
+                let (e, nn) = basis[i];
+                let w = e * wu[i] as f64 + nn * wv[i] as f64;
+                let speed = w.len();
+                if speed < 1e-6 {
+                    return 0.0;
+                }
+                // Slope along the wind (m/km); calm air barely lifts.
+                let s = w.dot(grad[i]) / speed;
+                let calm = (speed / 3.0).min(1.0);
+                calm * if s > 0.0 { (1.0 + DOWNSCALE_GAIN * strength * (1.0 - (-s / DOWNSCALE_SLOPE).exp())).ln() } else { s / DOWNSCALE_LEE }
+            })
+            .collect();
+        let lf = smooth(fine, &lf);
+        let raw: Vec<f32> = (0..n).map(|i| pm[i] * lf[i].exp() as f32).collect();
+        let (before, after) = (t.down(fine, nc, pm), t.down(fine, nc, &raw));
+        let ratio: Vec<f32> = (0..nc).map(|c| if after[c] > 0.0 { before[c] / after[c] } else { 1.0 }).collect();
+        let keep = t.up(&ratio);
+        for i in 0..n {
+            pm[i] = raw[i] * keep[i];
+        }
+    });
 }
 
 /// Warming per km of climb on which the air rains out (°C/km at `foehn` = 1).

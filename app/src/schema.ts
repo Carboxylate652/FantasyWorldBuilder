@@ -174,7 +174,7 @@ export const STEPS: StepUI[] = [
       p('climate', 'global_precip_mm', 'Global precipitation (mm/yr)', 100, 3000, 10),
       p('climate', 'ocean_current_c', 'Coastal currents (°C)', 0, 15, 0.5),
       p('climate', 'maritime_reach_km', 'Maritime reach (km)', 100, 5000, 50),
-      p('climate', 'orographic', 'Orographic rain ×', 0, 4, 0.05),
+      p('climate', 'orographic', 'Orographic rain ×', 0, 4, 0.05, 'Wet air forced up a slope turns vapour into cloud that rains or snows out over the slope and the crest; sinking air beyond dries what is left (rain shadow). Also shifts rain onto slopes facing the wind at full map detail. 0 = mountains add no rain.'),
       p('climate', 'moisture_passes', 'Moisture passes', 20, 300, 5),
       p('climate', 'thermal_wind', 'Thermal winds ×', 0, 3, 0.05, 'Winds driven by temperature-made pressure systems: monsoons, winter highs over continents, summer heat lows, plateau lows. 0 = zonal belts only.'),
       p('climate', 'mountain_blocking', 'Mountain blocking', 0, 1, 0.05, 'Share of upslope wind turned along steep terrain: air flows around ranges and through gaps instead of over them.'),
