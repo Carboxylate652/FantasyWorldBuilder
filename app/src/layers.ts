@@ -84,6 +84,7 @@ export const RAMPS: Record<string, Stop[]> = {
   wind: [[0, [30, 40, 90]], [3, [50, 110, 170]], [6, [90, 180, 160]], [9, [220, 220, 110]], [13, [240, 140, 60]], [18, [200, 50, 60]]],
   habit: [[0, [120, 100, 85]], [0.15, [190, 160, 110]], [0.35, [220, 210, 120]], [0.6, [130, 190, 90]], [0.85, [40, 140, 60]], [1, [20, 100, 50]]],
   barrier: [[0, [235, 232, 220]], [1, [215, 200, 160]], [3, [190, 140, 90]], [6, [140, 80, 70]], [10, [70, 40, 60]]],
+  foehn: [[0, [235, 230, 215]], [0.5, [245, 205, 140]], [1, [240, 160, 80]], [2, [205, 85, 50]], [3, [140, 25, 40]]],
   old: [[0, [225, 210, 160]], [400, [210, 170, 100]], [1000, [175, 110, 60]], [2000, [100, 50, 35]]],
   age: [[0, [250, 60, 60]], [20, [250, 170, 40]], [60, [240, 240, 120]], [120, [80, 170, 200]], [200, [40, 50, 140]]],
 };
@@ -147,7 +148,7 @@ export type Legend = { title: string; items?: LegendItem[]; gradient?: { stops: 
 
 export type LayerId =
   | 'sketch' | 'plates' | 'crust' | 'boundaries' | 'elevation' | 'temperature' | 'precipitation'
-  | 'continentality' | 'currents' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress' | 'old_relief'
+  | 'continentality' | 'currents' | 'foehn' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress' | 'old_relief'
   | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population' | 'attraction'
   | 'nations' | 'railways' | 'transport' | 'eras' | 'institutions' | 'realms' | 'city_growth';
 
@@ -174,6 +175,7 @@ export const LAYERS: LayerDef[] = [
   { id: 'wind', label: 'Wind speed', fields: ['wind_u', 'wind_v', 'elevation'], monthly: true, smooth: true, group: 'Climate' },
   { id: 'continentality', label: 'Continentality', fields: ['continentality', 'elevation'], smooth: true, group: 'Climate' },
   { id: 'currents', label: 'Coastal currents', fields: ['current_offset', 'elevation'], smooth: true, group: 'Climate' },
+  { id: 'foehn', label: 'Foehn warming', fields: ['foehn', 'elevation'], smooth: true, group: 'Climate' },
   { id: 'discharge', label: 'Rivers & lakes', fields: ['discharge', 'elevation', 'lake', 'water'], smooth: false, group: 'Water' },
   { id: 'erosion', label: 'Erosion / deposition', fields: ['erosion', 'elevation'], smooth: true, group: 'Water' },
   { id: 'koppen', label: 'Köppen climate', fields: ['koppen', 'elevation'], smooth: false, group: 'Biomes' },
@@ -387,6 +389,18 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       const c = f['current_offset'];
       for (let i = 0; i < n; i++) put(i, ramp(RAMPS.diverging, (c ? c[i] : 0) / 5), elev && elev[i] > 0 ? sh(i) * 0.9 : 1);
       legend = { title: 'Coastal current offset', gradient: { stops: RAMPS.diverging.map(([v, c]) => [v * 5, c] as Stop), unit: '°C' } };
+      break;
+    }
+    case 'foehn': {
+      // Annual mean warming from Foehn on the lee of ranges, over grey land.
+      const fw = f['foehn'];
+      for (let i = 0; i < n; i++) {
+        const v = fw ? fw[i] : 0;
+        if (elev && elev[i] <= 0) put(i, [70, 90, 115], 1);
+        else if (v > 0.05) put(i, ramp(RAMPS.foehn, v), sh(i));
+        else put(i, grey(i), sh(i));
+      }
+      legend = { title: 'Foehn warming (annual mean)', gradient: { stops: RAMPS.foehn, unit: '°C' } };
       break;
     }
     case 'discharge': {

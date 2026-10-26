@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Mountains now shape temperature as well as rain.
+
+- **Foehn:** air that rains out climbing a range comes down the far side warmer. The lee of high, wet ranges is up to about 4 °C warmer in a month (most in the wet season), fading over a few hundred km; windward slopes and crests are unchanged, and so is rain. New *Foehn warming* layer, `foehn` field and *Foehn ×* setting (0–3, default 1); the status line shows the warming.
+- **Mountains block sea air:** mild maritime air stays on the windward side of a range, so the land behind it has hotter summers and colder winters (larger annual range) than the coast before it; windward slopes and summits stay maritime. *Mountains block sea air* setting (0–3, default 1: half the maritime influence lost per 2 km of descent).
+- **More rain and snow on windward mountains:** wet air forced up a slope now turns vapour into cloud that rains out over the whole windward slope and crest instead of a thin line at the foot, and sinking air on the far side dries what is left. Rain is also placed on slopes facing the wind at full map detail, not just on the coarser climate grid. Windward mountains get about 1.5–1.9× the rain they would without orographic rain (1.3× before), lee slopes stay dry, and no month exceeds ~2,500 mm (the wettest places reached 18,000–27,000 mm a year before, about 15,000 now). *Orographic rain ×* scales it.
+- Climates, and everything after them, change slightly for the same seed.
+
 ## 0.3.0
 
 The 0.3.0 line out of beta: everything from 0.3.0-beta.1 to 0.3.0-beta.4, with no changes since 0.3.0-beta.4. For those updating from 0.2.0-beta.2:
