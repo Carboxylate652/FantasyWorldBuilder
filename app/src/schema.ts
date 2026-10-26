@@ -22,7 +22,8 @@ export type ToolId =
   | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase' | 'nation_seed' | 'nation_seed_erase'
   | 'attraction' | 'attraction_erase'
   | 'goods_paint' | 'province_merge' | 'state_merge' | 'province_to_state' | 'rename_province' | 'rename_state'
-  | 'city_pin' | 'city_unpin';
+  | 'city_pin' | 'city_unpin'
+  | 'culture_merge' | 'culture_paint' | 'culture_split' | 'culture_split_traits' | 'culture_reparent' | 'rename_culture' | 'culture_new_name' | 'culture_lock';
 
 export type ToolDef = {
   id: ToolId;
@@ -31,7 +32,7 @@ export type ToolDef = {
   step: string; // step the edit belongs to (auto-run target)
   rust?: string; // core Tool name when it differs from the id
   scatter?: boolean; // noisy natural edge (scatter brush)
-  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people' | 'fertility' | 'bands' | 'goods' | 'attraction' | 'provinces';
+  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people' | 'fertility' | 'bands' | 'goods' | 'attraction' | 'provinces' | 'parts';
   /** Click (or drag from a start to an end point) instead of painting with a brush. */
   gesture?: 'point' | 'link';
   /** Asks for a name when used. */
@@ -82,10 +83,19 @@ export const TOOLS: ToolDef[] = [
   { id: 'rename_state', label: 'Rename state', step: 'states', gesture: 'point', rename: true, hint: 'Click a state and type its new name. Culture names will not replace it.' },
   { id: 'state_paint', label: 'Grow state', key: 'e', step: 'states', hint: 'Start the stroke inside a state, then paint: every land cell you cover joins that state.' },
   { id: 'province_paint', label: 'Grow province', key: 'o', step: 'provinces', hint: 'Start inside a province, then paint over its neighbours in the same state.' },
+  // Culture editor: cultures are picked by place, since their ids change when Stage 3 re-runs.
+  { id: 'culture_merge', label: 'Merge cultures', step: 'cultures', gesture: 'link', hint: 'Drag from a culture onto the culture that should absorb it.' },
+  { id: 'culture_paint', label: 'Paint culture', key: 'c', step: 'cultures', hint: 'Start the stroke inside a culture, then paint: provinces mostly under the brush join it.' },
+  { id: 'culture_split', label: 'Split by line', step: 'cultures', hint: 'Draw a line across a culture: the smaller side becomes a daughter culture. Draw a loop around part of a culture to make the provinces inside a daughter culture.' },
+  { id: 'culture_split_traits', label: 'Split by contacts', step: 'cultures', gesture: 'point', value: 'parts', defaultValue: 2, hint: 'Click a culture to split it into this many daughter cultures along the lines where its people are least in touch.' },
+  { id: 'culture_reparent', label: 'Re-parent', step: 'cultures', gesture: 'link', hint: 'Drag from a culture onto its new parent in the family tree (the parent must be older).' },
+  { id: 'rename_culture', label: 'Rename culture', step: 'cultures', gesture: 'point', rename: true, hint: 'Click a culture and type its new name.' },
+  { id: 'culture_new_name', label: 'New name', step: 'cultures', gesture: 'point', hint: 'Click a culture to give it another name from its own language.' },
+  { id: 'culture_lock', label: 'Lock / unlock', step: 'cultures', gesture: 'point', hint: 'Click a culture to lock it as it is now: re-running Stage 3 keeps its provinces and name, other edits leave it alone, and Stage 4 history never changes it. Click a locked culture to unlock it.' },
 ];
 
 /** Map editor (top bar): province, state and goods tools, available whatever step is open. */
-export const EDITOR_TOOLS: ToolId[] = ['province_merge', 'state_merge', 'province_to_state', 'province_paint', 'state_paint', 'rename_province', 'rename_state', 'goods_paint'];
+export const EDITOR_TOOLS: ToolId[] = ['province_merge', 'state_merge', 'province_to_state', 'province_paint', 'state_paint', 'rename_province', 'rename_state', 'goods_paint', 'culture_merge', 'culture_paint', 'culture_split', 'rename_culture', 'culture_lock'];
 
 /** Last step of each stage (the stage buttons run up to it). */
 export const STAGE_ENDS = [{ stage: 1, step: 'biomes' }, { stage: 2, step: 'provinces' }, { stage: 3, step: 'cultures' }, { stage: 4, step: 'nations' }];
@@ -272,7 +282,7 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'cultures', title: 'Cultures', layer: 'cultures', tools: ['band_pin', 'band_erase', 'attraction', 'attraction_erase'],
+    key: 'cultures', title: 'Cultures', layer: 'cultures', tools: ['band_pin', 'band_erase', 'attraction', 'attraction_erase', 'culture_merge', 'culture_paint', 'culture_split', 'culture_split_traits', 'culture_reparent', 'rename_culture', 'culture_new_name', 'culture_lock'],
     blurb: 'Bands of people spread over the provinces, grow, split and meet. Contact makes them alike, isolation and drift make them differ; where contact stays rare, cultures split. Groups are cultures that stay in touch.',
     params: [
       p('cultures', 'ticks', 'Generations', 20, 2000, 10, 'One generation is a tick of the simulation.'),

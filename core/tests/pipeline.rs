@@ -1357,3 +1357,147 @@ fn rivers_run_along_cell_edges_and_divide_land() {
     let types = &w.meta(Step::Provinces).unwrap()["borders"];
     assert!(types["river"].as_u64().unwrap_or(0) > 0, "no river borders: {types}");
 }
+
+/// The culture editor: merge, rename, split by a line and by traits,
+/// re-parent, new name, paint and lock. Edits pick cultures by place, apply
+/// at the end of Stage 3, and report what no longer applies. A locked culture
+/// keeps its provinces and name when Stage 3 re-runs with other settings,
+/// refuses further edits, and Stage 4 never changes its share of any province.
+#[test]
+fn culture_editor_and_locks() {
+    use serde_json::Value;
+    use worldcore::api::{prepare_culture_edit, CultureEdit};
+    use worldcore::edits::EditLayer;
+    use worldcore::fields::Field;
+    let mut p = small_params(9);
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 240;
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Cultures, &|_, _, _| {});
+    let table = |w: &World, key: &str| -> Vec<Value> { w.meta(Step::Cultures).unwrap()["table"][key].as_array().unwrap().clone() };
+    let centres: std::collections::HashMap<u64, [f64; 2]> = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().iter().map(|r| (r["id"].as_u64().unwrap(), [r["center"][0].as_f64().unwrap(), r["center"][1].as_f64().unwrap()])).collect();
+    let culture_at = |w: &mut World, ll: [f64; 2]| -> u32 {
+        let g = w.grid();
+        let c = g.nearest(Vec3::from_lat_lon_deg(ll[0], ll[1]), None);
+        match w.field("culture") { Some((Field::U16(v), _, _)) => v[c] as u32, _ => panic!() }
+    };
+    let row = |w: &World, c: u32| table(w, "cultures").into_iter().find(|r| r["id"].as_u64() == Some(c as u64)).unwrap();
+    // Provinces (centres) where culture c is the majority, most populous first.
+    let provs_of = |w: &World, c: u32| -> Vec<[f64; 2]> {
+        let mut v: Vec<(f64, [f64; 2])> = table(w, "provinces").iter().filter(|r| r["culture"].as_u64() == Some(c as u64)).map(|r| (r["population"].as_f64().unwrap(), centres[&r["id"].as_u64().unwrap()])).collect();
+        v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        v.into_iter().map(|x| x.1).collect()
+    };
+    let edit = |w: &mut World, st: Stroke| -> Result<(), String> {
+        match prepare_culture_edit(w, st)? {
+            CultureEdit::Add(s) => w.edits.add_stroke(s),
+            CultureEdit::Unlock(idx) => { w.edits.remove_strokes(EditLayer::Cultures, &idx); }
+        }
+        Ok(())
+    };
+    let run = |w: &mut World| { w.run_to(Step::Cultures, &|_, _, _| {}); };
+    let living = |w: &World| -> Vec<(u32, u64)> {
+        let mut v: Vec<(u32, u64)> = table(w, "cultures").iter().filter(|r| r["alive"].as_bool().unwrap()).map(|r| (r["id"].as_u64().unwrap() as u32, r["provinces"].as_u64().unwrap())).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    };
+    let cultures = living(&w);
+    assert!(cultures.len() >= 4, "{} living cultures", cultures.len());
+    let (a, b, c, d) = (cultures[0].0, cultures[1].0, cultures[2].0, cultures[3].0);
+    let (pa, pb, pc, pd) = (provs_of(&w, a), provs_of(&w, b), provs_of(&w, c), provs_of(&w, d));
+    let n0 = cultures.len();
+
+    // Merge D into C; rename C.
+    edit(&mut w, Stroke { tool: Tool::CultureMerge, points: vec![pd[0], pc[0]], ..Default::default() }).unwrap();
+    edit(&mut w, Stroke { tool: Tool::RenameCulture, points: vec![pc[0]], name: "Testlandic".into(), ..Default::default() }).unwrap();
+    run(&mut w);
+    assert_eq!(culture_at(&mut w, pd[0]), c, "D's land is C's now");
+    let rd = row(&w, d);
+    assert!(!rd["alive"].as_bool().unwrap() && rd["fate"] == "merged" && rd["fate_other"].as_u64() == Some(c as u64), "{rd}");
+    assert_eq!(row(&w, c)["name"], "Testlandic");
+    assert_eq!(living(&w).len(), n0 - 1);
+
+    // Split A by a line between its two farthest provinces.
+    let v = |ll: [f64; 2]| Vec3::from_lat_lon_deg(ll[0], ll[1]);
+    let (mut f1, mut f2, mut far) = (pa[0], pa[0], 0.0);
+    for &x in &pa { for &y in &pa { let dd = v(x).angle_to(v(y)); if dd > far { far = dd; f1 = x; f2 = y; } } }
+    let m = (v(f1) + v(f2)).normalized();
+    let perp = m.cross((v(f2) - v(f1)).normalized()).normalized();
+    let deg = |q: Vec3| { let (la, lo) = q.lat_lon(); [la.to_degrees(), lo.to_degrees()] };
+    let line: Vec<[f64; 2]> = (-10..=10).map(|k| deg((m + perp * (k as f64 * 0.06)).normalized())).collect();
+    edit(&mut w, Stroke { tool: Tool::CultureSplit, points: line, ..Default::default() }).unwrap();
+    run(&mut w);
+    let (s1, s2) = (culture_at(&mut w, f1), culture_at(&mut w, f2));
+    assert_ne!(s1, s2, "the line splits A");
+    let daughter = if s1 == a { s2 } else { s1 };
+    assert!(s1 == a || s2 == a, "one side keeps A");
+    assert_eq!(row(&w, daughter)["parent"].as_u64(), Some(a as u64), "the other side is A's daughter");
+
+    // Split B by its people's contacts into two.
+    edit(&mut w, Stroke { tool: Tool::CultureSplitTraits, points: vec![pb[0]], value: 2.0, ..Default::default() }).unwrap();
+    run(&mut w);
+    let b_daughters = table(&w, "cultures").iter().filter(|r| r["parent"].as_u64() == Some(b as u64) && r["alive"].as_bool().unwrap() && r["founded_year"] == row(&w, daughter)["founded_year"]).count();
+    let unapplied = w.meta(Step::Cultures).unwrap()["unapplied_edits"].clone();
+    assert!(b_daughters >= 1 || unapplied.to_string().contains("closely knit"), "split by traits: {unapplied}");
+
+    // Re-parent the daughter of A under C (C is older); B under A's daughter fails (too young).
+    edit(&mut w, Stroke { tool: Tool::CultureReparent, points: vec![if s1 == daughter { f1 } else { f2 }, pc[0]], ..Default::default() }).unwrap();
+    edit(&mut w, Stroke { tool: Tool::CultureReparent, points: vec![pb[0], if s1 == daughter { f1 } else { f2 }], ..Default::default() }).unwrap();
+    // A new name for B, and paint C over one of B's provinces.
+    let cb = culture_at(&mut w, pb[0]);
+    let old_b = row(&w, cb)["name"].clone();
+    edit(&mut w, Stroke { tool: Tool::CultureNewName, points: vec![pb[0]], ..Default::default() }).unwrap();
+    let target = *pb.last().unwrap();
+    edit(&mut w, Stroke { tool: Tool::CulturePaint, points: vec![pc[0], target], radius_km: 60.0, ..Default::default() }).unwrap();
+    run(&mut w);
+    assert_eq!(row(&w, daughter)["parent"].as_u64(), Some(c as u64), "re-parented under C");
+    let bnow = culture_at(&mut w, pb[0]);
+    assert_ne!(row(&w, bnow)["name"], old_b, "B has a new name");
+    assert_eq!(culture_at(&mut w, target), c, "the painted province is C's");
+    let reasons = w.meta(Step::Cultures).unwrap()["unapplied_edits"].to_string();
+    assert!(reasons.contains("younger"), "re-parenting under a younger culture is refused: {reasons}");
+    let report = worldcore::api::overrides_report(&w);
+    assert!(report["unapplied"].as_array().unwrap().iter().any(|u| u["layer"] == "cultures"), "the overrides report lists it");
+
+    // Lock C ("Testlandic"), then change a Stage 3 setting and re-run.
+    edit(&mut w, Stroke { tool: Tool::CultureLock, points: vec![pc[0]], ..Default::default() }).unwrap();
+    run(&mut w);
+    let lc = culture_at(&mut w, pc[0]);
+    assert!(row(&w, lc)["locked"].as_bool().unwrap() && row(&w, lc)["name"] == "Testlandic");
+    let ids = |w: &World, c: u32| -> std::collections::BTreeSet<u64> { table(w, "provinces").iter().filter(|r| r["culture"].as_u64() == Some(c as u64)).map(|r| r["id"].as_u64().unwrap()).collect() };
+    let held = ids(&w, lc);
+    assert!(edit(&mut w, Stroke { tool: Tool::CultureMerge, points: vec![pb[0], pc[0]], ..Default::default() }).unwrap_err().contains("locked"));
+    w.params.cultures.drift *= 1.7;
+    w.params.cultures.contact_scale_km *= 0.8;
+    run(&mut w);
+    let lc2 = culture_at(&mut w, pc[0]);
+    assert!(row(&w, lc2)["locked"].as_bool().unwrap(), "still locked after re-running Stage 3");
+    assert_eq!(row(&w, lc2)["name"], "Testlandic", "keeps its name");
+    assert_eq!(ids(&w, lc2), held, "keeps exactly its provinces");
+
+    // Stage 4 never changes a locked culture's share of a province.
+    let start: Vec<(u64, f64)> = table(&w, "provinces").iter().filter_map(|r| {
+        let sh: Vec<(u64, f64)> = r["shares"].as_array().unwrap().iter().map(|s| (s[0].as_u64().unwrap(), s[1].as_f64().unwrap())).collect();
+        let total: f64 = sh.iter().map(|x| x.1).sum();
+        sh.iter().find(|x| x.0 == lc2 as u64).map(|x| (r["id"].as_u64().unwrap(), x.1 / total))
+    }).collect();
+    assert!(!start.is_empty());
+    w.run_to(LAST, &|_, _, _| {});
+    let end: std::collections::HashMap<u64, f64> = w.meta(Step::Nations).unwrap()["table"]["provinces"].as_array().unwrap().iter().map(|r| {
+        let s = r["shares"].as_array().unwrap().iter().find(|s| s[0].as_u64() == Some(lc2 as u64)).map_or(0.0, |s| s[1].as_f64().unwrap());
+        (r["id"].as_u64().unwrap(), s)
+    }).collect();
+    for (id, s0) in &start {
+        let s1 = end.get(id).copied().unwrap_or(0.0);
+        assert!((s1 - s0).abs() < 0.003, "province {id}: locked share {s0:.3} became {s1:.3}");
+    }
+
+    // Unlock.
+    edit(&mut w, Stroke { tool: Tool::CultureLock, points: vec![pc[0]], ..Default::default() }).unwrap();
+    run(&mut w);
+    let cu = culture_at(&mut w, pc[0]);
+    assert!(!row(&w, cu)["locked"].as_bool().unwrap(), "unlocked");
+    let rep = worldcore::validate::validate(&mut w);
+    assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+}

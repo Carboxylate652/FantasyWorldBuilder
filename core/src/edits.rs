@@ -70,6 +70,30 @@ pub enum Tool {
     // that starts on a seed moves it; erase removes the nearest seed.
     NationSeed,
     NationSeedErase,
+    // Culture editor (Stage 3). Cultures are picked by location, since their
+    // ids change whenever Stage 3 re-runs.
+    /// Drag from a culture onto the culture that should absorb it.
+    CultureMerge,
+    /// The stroke's first point picks the culture; provinces mostly under the
+    /// brush join it.
+    CulturePaint,
+    /// A line across a culture splits it in two (the smaller side becomes a
+    /// daughter culture); a loop makes the provinces inside a daughter culture.
+    CultureSplit,
+    /// Split the culture under the point by its people's traits into `value`
+    /// (2–5) daughter cultures.
+    CultureSplitTraits,
+    /// Drag from a culture onto its new parent in the family tree.
+    CultureReparent,
+    /// Rename the culture under the point to `name`.
+    RenameCulture,
+    /// Give the culture under the point a new name from its own language
+    /// (`seed` picks it).
+    CultureNewName,
+    /// Lock a culture: the first point picks it and the other points are its
+    /// provinces when it was locked; `name` is its name. Re-running keeps its
+    /// provinces and name, and Stage 4 never changes it.
+    CultureLock,
 }
 
 impl Tool {
@@ -87,6 +111,14 @@ impl Tool {
             Tool::BandPin | Tool::BandErase => EditLayer::Bands,
             Tool::Attraction | Tool::AttractionErase => EditLayer::Attraction,
             Tool::NationSeed | Tool::NationSeedErase => EditLayer::NationSeeds,
+            Tool::CultureMerge
+            | Tool::CulturePaint
+            | Tool::CultureSplit
+            | Tool::CultureSplitTraits
+            | Tool::CultureReparent
+            | Tool::RenameCulture
+            | Tool::CultureNewName
+            | Tool::CultureLock => EditLayer::Cultures,
         }
     }
 }
@@ -106,12 +138,14 @@ pub enum EditLayer {
     Bands,
     Attraction,
     NationSeeds,
+    /// Culture editor: merges, splits, paint, family tree, names and locks.
+    Cultures,
     /// Time-stamped steering of the Stage 3 and 4 simulations (not strokes).
     Directives,
 }
 
 impl EditLayer {
-    pub const ALL: [EditLayer; 13] = [
+    pub const ALL: [EditLayer; 14] = [
         EditLayer::Sketch,
         EditLayer::Plates,
         EditLayer::Elevation,
@@ -123,6 +157,7 @@ impl EditLayer {
         EditLayer::Provinces,
         EditLayer::Bands,
         EditLayer::Attraction,
+        EditLayer::Cultures,
         EditLayer::NationSeeds,
         EditLayer::Directives,
     ];
@@ -142,6 +177,7 @@ impl EditLayer {
             EditLayer::Bands => "bands",
             EditLayer::Attraction => "attraction",
             EditLayer::NationSeeds => "nation_seeds",
+            EditLayer::Cultures => "cultures",
             EditLayer::Directives => "directives",
         }
     }
@@ -162,7 +198,7 @@ impl EditLayer {
             EditLayer::Barriers | EditLayer::Sites | EditLayer::Fertility => Step::Habitability,
             EditLayer::States => Step::States,
             EditLayer::Provinces => Step::Provinces,
-            EditLayer::Bands | EditLayer::Attraction | EditLayer::Directives => Step::Cultures,
+            EditLayer::Bands | EditLayer::Attraction | EditLayer::Cultures | EditLayer::Directives => Step::Cultures,
             EditLayer::NationSeeds => Step::Nations,
         }
     }
@@ -181,6 +217,7 @@ impl EditLayer {
             EditLayer::Bands => "Founding bands",
             EditLayer::Attraction => "Attraction",
             EditLayer::NationSeeds => "Nation seeds",
+            EditLayer::Cultures => "Cultures (merge, split, paint, family tree, names, locks)",
             EditLayer::Directives => "Simulation directives (Stages 3 and 4)",
         }
     }
@@ -280,6 +317,8 @@ pub struct Overrides {
     pub attraction: Vec<Stroke>,
     /// Polities that already exist when Stage 4 starts.
     pub nation_seeds: Vec<Stroke>,
+    /// Culture editor, applied in order at the end of Stage 3.
+    pub cultures: Vec<Stroke>,
     /// Steering of the Stage 3 and 4 simulations, by hand or by the AI guide.
     pub directives: Vec<crate::directives::Directive>,
 }
@@ -351,6 +390,7 @@ impl Edits {
             EditLayer::Bands => add_pin(&mut self.overrides.bands, s, Tool::BandErase),
             EditLayer::Attraction => self.overrides.attraction.push(s),
             EditLayer::NationSeeds => add_pin(&mut self.overrides.nation_seeds, s, Tool::NationSeedErase),
+            EditLayer::Cultures => self.overrides.cultures.push(s),
             EditLayer::Directives => {}
         }
     }
@@ -372,6 +412,7 @@ impl Edits {
             EditLayer::Bands => &o.bands,
             EditLayer::Attraction => &o.attraction,
             EditLayer::NationSeeds => &o.nation_seeds,
+            EditLayer::Cultures => &o.cultures,
             EditLayer::Directives => &NO_STROKES,
         }
     }
@@ -391,6 +432,7 @@ impl Edits {
             EditLayer::Bands => &mut o.bands,
             EditLayer::Attraction => &mut o.attraction,
             EditLayer::NationSeeds => &mut o.nation_seeds,
+            EditLayer::Cultures => &mut o.cultures,
             EditLayer::Directives => unreachable!("directives are not strokes"),
         }
     }
@@ -530,6 +572,7 @@ impl Edits {
             EditLayer::Bands => self.overrides.bands.clear(),
             EditLayer::Attraction => self.overrides.attraction.clear(),
             EditLayer::NationSeeds => self.overrides.nation_seeds.clear(),
+            EditLayer::Cultures => self.overrides.cultures.clear(),
             EditLayer::Directives => self.overrides.directives.clear(),
         }
     }

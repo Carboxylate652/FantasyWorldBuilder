@@ -27,6 +27,7 @@ type Status = {
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
     site_pins: number; sites: { lat: number; lon: number; population: number }[];
     fertility_strokes: number; attraction_strokes: number; band_pins: { lat: number; lon: number; bands: number }[];
+    culture_edits?: number;
     nation_seeds?: { lat: number; lon: number; size: number; name: string }[];
   };
   grid: { level: number; cells: number; spacing_km: number };
@@ -902,7 +903,7 @@ async function onOverrides() {
       await mutate(cmd, args);
       await render();
     };
-    const stale = ['states', 'provinces'].some((k) => S.status!.steps.find((s) => s.key === k)?.state !== 'done');
+    const stale = ['states', 'provinces', 'cultures'].some((k) => S.status!.steps.find((s) => s.key === k)?.state !== 'done');
     const byLayer = new Map<string, any[]>();
     for (const u of r.unapplied) byLayer.set(u.layer, [...(byLayer.get(u.layer) ?? []), u]);
     box.innerHTML = '';
@@ -925,7 +926,7 @@ async function onOverrides() {
             for (const [layer, list] of byLayer) await mutate('remove_edits', { layer, indices: list.map((u) => u.index) });
             await render();
           } }, 'Remove them'))
-        : h('p', { class: 'muted' }, stale ? 'Generate Stage 2 to check that every state and province edit still applies.' : 'Every state and province edit applies to the current map.'),
+        : h('p', { class: 'muted' }, stale ? 'Generate Stages 2 and 3 to check that every state, province and culture edit still applies.' : 'Every state, province and culture edit applies to the current map.'),
       h('div', { class: 'actions' },
         h('button', { disabled: !r.total, onclick: () => exportOverrides([...sel]) }, 'Export…'),
         h('button', { onclick: async () => { if (await importOverrides(replace)) await render(); } }, 'Import…'),
@@ -1684,6 +1685,12 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
         h('button', { class: 'small', disabled: !pins.length, onclick: () => mutate('clear_layer', { layer: 'bands' }, 'cultures') }, 'Clear pins')),
       h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, `${e.attraction_strokes} attraction strokes`),
         h('button', { class: 'small', disabled: !e.attraction_strokes, onclick: () => mutate('clear_layer', { layer: 'attraction' }, 'cultures') }, 'Clear attraction')));
+    const ce = e.culture_edits ?? 0;
+    const locked = S.status!.steps.find((x) => x.key === 'cultures')?.meta?.locked_cultures ?? 0;
+    body.append(h('h4', {}, 'Culture editor'),
+      h('p', { class: 'muted' }, 'Merge, split, paint, re-parent, rename and lock cultures. Edits pick a culture by where you click, apply at the end of the run, and come back whenever Stage 3 re-runs.'),
+      h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, `${ce} culture edits${locked ? `, ${locked} locked culture${locked === 1 ? '' : 's'}` : ''}`),
+        h('button', { class: 'small', disabled: !ce, onclick: () => { if (confirm('Remove every culture edit, locks included?')) mutate('clear_layer', { layer: 'cultures' }, 'cultures'); } }, 'Clear culture edits')));
   }
   if (ui.key === 'nations') {
     const seeds = e.nation_seeds ?? [];
@@ -1941,16 +1948,34 @@ function summary(key: string, m: any): HTMLElement {
             const cc = cultureColor(c.id, c.group).map(Math.round);
             const parent = c.parent ? P.byCulture.get(c.parent) : null;
             const origin = parent ? `Split from ${parent.name} in ${yr(c.founded_year)}` : `Emerged in ${yr(c.founded_year)}`;
-            list.append(h('div', { class: 'item', title: origin },
-              h('span', {}, '\u00a0\u00a0', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name),
+            list.append(h('div', { class: 'item', title: origin + (c.locked ? '. Locked: re-running keeps it as it is.' : '') },
+              h('span', {}, '\u00a0\u00a0', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name, c.locked ? ' 🔒' : ''),
               h('span', { class: 'muted' }, `${fmt(c.population / 1e6, 2)} M · ${c.provinces} prov.${parent ? ' · from ' + parent.name : ''}`)));
           }
         }
+        // Family tree: every living culture under its ancestors (ended ones greyed).
+        const kids = new Map<number, any[]>();
+        const keep = new Set<number>();
+        for (const c of P.cultures) if (c.alive) for (let x: any = c; x && !keep.has(x.id); x = x.parent ? P.byCulture.get(x.parent) : null) keep.add(x.id);
+        for (const c of P.cultures) if (keep.has(c.id)) { const k = c.parent && keep.has(c.parent) ? c.parent : 0; if (!kids.has(k)) kids.set(k, []); kids.get(k)!.push(c); }
+        const tree = h('div', { class: 'list' });
+        const walk = (pid: number, depth: number) => {
+          for (const c of (kids.get(pid) ?? []).sort((a, b) => a.founded_year - b.founded_year || a.id - b.id)) {
+            const cc = cultureColor(c.id, c.group).map(Math.round);
+            const fate = c.alive ? `${fmt(c.population / 1e6, 2)} M` : `${c.fate === 'merged' ? 'merged into ' + (P.byCulture.get(c.fate_other)?.name ?? '?') : 'died out'} in ${yr(c.ended_year)}`;
+            tree.append(h('div', { class: 'item', style: c.alive ? '' : 'opacity:0.55' },
+              h('span', { class: 'tree-name', style: `padding-left:${4 + Math.min(depth, 8) * 10}px` }, depth ? '└ ' : '', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name, c.locked ? ' 🔒' : ''),
+              h('span', { class: 'muted' }, `${yr(c.founded_year)} · ${fate}`)));
+            walk(c.id, depth + 1);
+          }
+        };
+        walk(0, 0);
+        box.append(h('details', {}, h('summary', {}, `Family tree (${keep.size} cultures)`), tree));
         const recent = P.events.filter((e) => e.kind !== 'emerged').slice(-8).reverse();
         if (recent.length) list.append(h('div', { class: 'item' }, h('b', {}, 'Latest events')));
         for (const e of recent) {
           const a = P.byCulture.get(e.culture)?.name ?? `#${e.culture}`, b = P.byCulture.get(e.other)?.name ?? '';
-          const text = e.kind === 'split' ? `${a} split from ${b}` : e.kind === 'merged' ? `${a} merged into ${b}` : `${a} died out`;
+          const text = (e.kind === 'split' ? `${a} split from ${b}` : e.kind === 'merged' ? `${a} merged into ${b}` : `${a} died out`) + (e.edit ? ' (edit)' : '');
           list.append(h('div', { class: 'item' }, h('span', {}, text), h('span', { class: 'muted' }, yr(e.year))));
         }
       });
@@ -2043,6 +2068,7 @@ function renderToolbar() {
     } }), out));
   }
   if (t.value === 'provinces') bb.append(h('label', {}, h('span', {}, 'Provinces (0: default)'), h('input', { type: 'number', step: 1, min: 0, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
+  if (t.value === 'parts') bb.append(h('label', {}, h('span', {}, 'Daughter cultures'), h('input', { type: 'number', step: 1, min: 2, max: 5, value: val, onchange: (e: Event) => setVal(Math.max(2, Math.min(5, Math.round(Number((e.target as HTMLInputElement).value))))) })));
   if (t.value === 'bands') bb.append(h('label', {}, h('span', {}, 'Bands'), h('input', { type: 'number', step: 1, min: 1, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'goods') {
     const goods = TRADE_GOODS.map(([g], i) => [g, i + 1] as const).filter(([g]) => g !== 'none');
@@ -2252,7 +2278,7 @@ function bindCanvas() {
       }
       let name = '';
       if (t.rename) {
-        name = window.prompt(t.id === 'rename_state' ? 'New state name' : 'New province name')?.trim() ?? '';
+        name = window.prompt(t.id === 'rename_state' ? 'New state name' : t.id === 'rename_culture' ? 'New culture name' : 'New province name')?.trim() ?? '';
         if (!name) return;
       }
       if (t.id === 'nation_seed' && !moved) {
@@ -2520,7 +2546,7 @@ function describe(d: any): [string, string][] {
   tag = 'culture';
   if (d.culture) {
     const c = SIM.cultures.get(d.culture) ?? P?.byCulture.get(d.culture), g = c && P ? P.byGroup.get(c.group) : null;
-    if (c) parts.push(`${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}`);
+    if (c) parts.push(`${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}${c.locked ? ', locked' : ''}`);
   }
   if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
   return out;

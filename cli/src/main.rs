@@ -568,7 +568,7 @@ fn overrides(args: &Args) {
             }
             let un = r["unapplied"].as_array().cloned().unwrap_or_default();
             if un.is_empty() {
-                println!("all edits apply (as of the last up-to-date run of states and provinces)");
+                println!("all edits apply (as of the last up-to-date run of states, provinces and cultures)");
             } else {
                 println!("{} edits no longer apply:", un.len());
                 for u in &un {
@@ -658,7 +658,16 @@ fn edit(args: &Args) {
         ..d
     };
     let layer = tool.layer();
-    w.edits.add_stroke(st);
+    if layer == worldcore::edits::EditLayer::Cultures {
+        match worldcore::api::prepare_culture_edit(&mut w, st).unwrap_or_else(|e| die(&e)) {
+            worldcore::api::CultureEdit::Add(st) => w.edits.add_stroke(st),
+            worldcore::api::CultureEdit::Unlock(idx) => {
+                w.edits.remove_strokes(layer, &idx);
+            }
+        }
+    } else {
+        w.edits.add_stroke(st);
+    }
     println!("added a {} edit to layer {} ({} edits)", args.get("tool").unwrap_or(""), layer.key(), w.edits.count(layer));
     if args.flag("run") {
         run_world(&mut w, LAST);

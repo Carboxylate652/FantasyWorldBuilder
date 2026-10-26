@@ -256,6 +256,8 @@ pub struct NationSim {
     state_names: BTreeMap<u16, String>,
     culture_group: HashMap<u32, u32>,
     culture_names: HashMap<u32, String>,
+    /// Cultures locked in the culture editor: history never changes them.
+    locked: BTreeSet<u32>,
     coastal_land: Vec<usize>,
     pop: Vec<f64>,
     cap: Vec<f64>,
@@ -451,6 +453,7 @@ impl NationSim {
         let cap: Vec<f64> = (0..n).map(|p| if provs[p].land { (6.0 * pop[p]).max(provs[p].land_cap) } else { 0.0 }).collect();
         let culture_group: HashMap<u32, u32> = ctable["cultures"].as_array().unwrap_or(&empty).iter().map(|c| (c["id"].as_u64().unwrap_or(0) as u32, c["group"].as_u64().unwrap_or(0) as u32)).collect();
         let culture_names: HashMap<u32, String> = ctable["cultures"].as_array().unwrap_or(&empty).iter().map(|c| (c["id"].as_u64().unwrap_or(0) as u32, c["name"].as_str().unwrap_or("").to_string())).collect();
+        let locked: BTreeSet<u32> = ctable["cultures"].as_array().unwrap_or(&empty).iter().filter(|c| c["locked"].as_bool().unwrap_or(false)).map(|c| c["id"].as_u64().unwrap_or(0) as u32).collect();
         let region_names: BTreeMap<u16, String> = ptable["regions"].as_array().unwrap_or(&empty).iter().map(|r| (r["id"].as_u64().unwrap_or(0) as u16, r["name"].as_str().unwrap_or("").to_string())).collect();
         let state_names: BTreeMap<u16, String> = ptable["states"].as_array().unwrap_or(&empty).iter().map(|r| (r["id"].as_u64().unwrap_or(0) as u16, r["name"].as_str().unwrap_or("").to_string())).collect();
         let harbour = ports::harbour_quality(ctx, &provs, &index);
@@ -484,6 +487,7 @@ impl NationSim {
             state_names,
             culture_group,
             culture_names,
+            locked,
             coastal_land,
             pop,
             cap,
@@ -863,11 +867,13 @@ impl NationSim {
         if n > 0 {
             self.members[n as usize].insert(p);
             self.stale[n as usize] = true;
-            // Settlers bring the ruler's culture to empty land.
+            // Settlers bring the ruler's culture to empty land. A locked culture
+            // does not spread, and land a locked culture holds keeps it.
             if self.pop[p] < 1.0 && self.provs[p].land {
                 let prim = self.nation(n).primary;
                 self.pop[p] = (0.02 * self.cap[p]).max(200.0).min(self.cap[p].max(200.0));
-                if prim > 0 {
+                let held = self.shares[p].iter().any(|x| self.locked.contains(&x.0));
+                if prim > 0 && !self.locked.contains(&prim) && !held {
                     self.shares[p] = vec![(prim, 1.0)];
                     self.major[p] = prim;
                 }
@@ -2106,24 +2112,33 @@ impl NationSim {
                     continue;
                 }
                 let prim = self.nation(o).primary;
-                if prim == 0 {
+                // Locked cultures neither gain nor lose people to assimilation.
+                if prim == 0 || self.locked.contains(&prim) {
                     continue;
                 }
                 let a = (a0 * (0.5 + self.integ[p])).min(1.0);
+                let locked = &self.locked;
                 let sh = &mut self.shares[p];
                 let s0 = sh.iter().find(|x| x.0 == prim).map_or(0.0, |x| x.1);
-                if s0 >= 1.0 {
+                let fixed: f64 = sh.iter().filter(|x| locked.contains(&x.0)).map(|x| x.1).sum();
+                let others = 1.0 - s0 - fixed;
+                if others <= 1e-12 {
                     continue;
                 }
-                let s1 = s0 + a * (1.0 - s0);
-                let scale = (1.0 - s1) / (1.0 - s0).max(1e-12);
+                let s1 = s0 + a * others;
                 for x in sh.iter_mut() {
-                    x.1 = if x.0 == prim { s1 } else { x.1 * scale };
+                    x.1 = if x.0 == prim {
+                        s1
+                    } else if locked.contains(&x.0) {
+                        x.1
+                    } else {
+                        x.1 * (1.0 - a)
+                    };
                 }
                 if s0 == 0.0 {
                     sh.push((prim, s1));
                 }
-                sh.retain(|x| x.1 >= 0.005);
+                sh.retain(|x| x.1 >= 0.005 || locked.contains(&x.0));
                 self.major[p] = sh.iter().max_by(|x, y| x.1.partial_cmp(&y.1).unwrap().then(y.0.cmp(&x.0))).map_or(0, |x| x.0);
             }
         }

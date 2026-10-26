@@ -1,6 +1,6 @@
 # Status: what is implemented and what is not
 
-Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.md`). Last updated for 0.2.0-beta.1 (the 1949 / transport work, commit `a63f795`).
+Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.md`). Last updated for the culture editor (after 0.3.1).
 
 ## Roadmap milestones
 
@@ -11,15 +11,15 @@ Measured against the roadmap in the proposal (`Fantasy World Maker — Proposal.
 | **M2 Climate, hydrology, biomes** | Implemented | The acceptance check ("Earth's real elevation in, Köppen map broadly matches") needs an Earth heightmap, which is not shipped; import one with `worldgen import-heightmap … --encoding linear --min -11000 --max 8500` and compare `biomes.png` |
 | **M3 States, provinces, export/import** | Implemented | Habitability and barriers, states/regions/continents, provinces with wasteland, lakes and sea zones, the neutral CK3/Vic3-style package, re-import with validation (round trip tested) |
 | **M4 Culture simulation** | Implemented, one item open | Cultures, groups, family tree, names, springs, site pins, resources and trade goods, era-gated caravan/mining/irrigation towns; 5,000 bands × 400 generations in ~10 s; desert towns on seeds 1–3. Open: saving the band state so Stage 4 continues the same agents |
-| **M5 Nations and history** | Implemented, one check open | Formation, expansion, war, colonies, exclaves, breakups, assimilation, per-nation technology, institutions (chosen or random birthplaces, spread over land, roads, railways, ports and airports) gating eras to the air age, reforms, treasuries, roads, railway lines with junctions, ports, airports, fertilizer, tags, feudal empires, cities rising and falling, city pins, time steps shortening toward the present; step-by-step runs with directives and the AI guide; exact replay (tested). Open: "re-running Stage 4 never changes a locked culture" waits for culture locks |
-| **M6 World editor and polish** | Started | Map editor (merge provinces/states, province → state, grow, rename, goods paint), fertility, founding-band and attraction paint, stage buttons, undo/redo. See below for what is missing |
+| **M5 Nations and history** | Done | Formation, expansion, war, colonies, exclaves, breakups, assimilation, per-nation technology, institutions (chosen or random birthplaces, spread over land, roads, railways, ports and airports) gating eras to the air age, reforms, treasuries, roads, railway lines with junctions, ports, airports, fertilizer, tags, feudal empires, cities rising and falling, city pins, time steps shortening toward the present; step-by-step runs with directives and the AI guide; exact replay (tested). "Re-running Stage 4 never changes a locked culture" holds (tested: a locked culture's share of every province is unchanged by history) |
+| **M6 World editor and polish** | Started | Map editor (merge provinces/states, province → state, grow, rename, goods paint), fertility, founding-band and attraction paint, stage buttons, undo/redo, and the culture editor (merge, paint, split by line, loop or contacts, re-parent, rename, new name, lock, family tree). See below for what is missing |
 
 ## Not implemented
 
 ### World editor (proposal § World editor)
 - **Provinces:** split by a line; mark as wasteland / lake / sea zone.
 - **States and regions:** split, regroup states into regions and continents, recolour.
-- **Cultures:** merge, split (automatic or by line/lasso/pick), paint, re-parent in the family tree, rename or regenerate names, **lock**.
+- **Cultures:** split by picking provinces (paint into the culture instead, or split by a loop); merge as siblings under one group (a merge joins one culture into another).
 - **Nations:** paint ownership, merge, release a nation, recolour, lock. (Founding, unions, treaties, renames, capital moves, feudal empires and tags exist as directives in a live run.)
 - **Railways:** add/move/delete stations, draw/reroute/delete lines, set opening years, lock lines. (A `railway` directive builds a line in a live run.) Roads and airports have no editor either (directives only).
 - **Continue sim** from an edited state, and an inspector panel for the hovered province.

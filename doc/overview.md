@@ -55,6 +55,7 @@ Hand edits are stored as override layers, never baked into results:
 | `barriers`, `sites`, `fertility` | Barrier paint, site pins, fertility paint | 8 |
 | `states`, `provinces` | Grow, merge, move, rename, goods paint | 9, 10 |
 | `bands`, `attraction` | Founding-band pins, attraction paint | 11 |
+| `cultures` | Culture editor: merge, paint, split, re-parent, rename, new name, lock | 11 |
 | `nation_seeds` | Nation-seed pins (nations that exist in the first year) | 12 |
 | `directives` | Step-by-step steering, by hand or by the AI guide | 11, 12 |
 

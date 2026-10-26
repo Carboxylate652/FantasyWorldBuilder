@@ -77,6 +77,7 @@ impl LayerState {
             (EditLayer::Bands, LayerState::Strokes(v)) => edits.overrides.bands = v,
             (EditLayer::Attraction, LayerState::Strokes(v)) => edits.overrides.attraction = v,
             (EditLayer::NationSeeds, LayerState::Strokes(v)) => edits.overrides.nation_seeds = v,
+            (EditLayer::Cultures, LayerState::Strokes(v)) => edits.overrides.cultures = v,
             _ => unreachable!("history state does not match edit layer"),
         }
     }
@@ -196,10 +197,88 @@ impl Live {
     }
 }
 
+/// What adding a culture-editor stroke does.
+pub enum CultureEdit {
+    Add(Stroke),
+    /// Remove these lock strokes (the culture was locked: the click unlocks it).
+    Unlock(Vec<usize>),
+}
+
+/// Check a culture-editor stroke against the current Stage 3 result. A lock
+/// records the culture's provinces and name as they are now, or unlocks a
+/// locked culture; an edit aimed at a locked culture is refused.
+pub fn prepare_culture_edit(w: &mut World, mut st: Stroke) -> Result<CultureEdit, String> {
+    use crate::edits::Tool;
+    use crate::vec3::Vec3;
+    let g = w.grid();
+    let fresh = w.is_fresh(Step::Cultures);
+    let cell = |ll: [f64; 2]| g.nearest(Vec3::from_lat_lon_deg(ll[0], ll[1]), None);
+    let cult_field: Option<Vec<u16>> = match w.field("culture") {
+        Some((Field::U16(v), _, false)) => Some(v.clone()),
+        _ => None,
+    };
+    let culture_at = |ll: [f64; 2]| cult_field.as_ref().map_or(0, |v| v[cell(ll)] as u32);
+    let rows = w.meta(Step::Cultures).and_then(|m| m["table"]["cultures"].as_array().cloned()).unwrap_or_default();
+    let row = |c: u32| rows.iter().find(|r| r["id"].as_u64() == Some(c as u64));
+    let locked = |c: u32| row(c).is_some_and(|r| r["locked"].as_bool().unwrap_or(false));
+    let name = |c: u32| row(c).and_then(|r| r["name"].as_str()).unwrap_or("This culture").to_string();
+    if st.tool == Tool::CultureLock {
+        if !fresh || cult_field.is_none() {
+            return Err("Run the Cultures step first: a lock records the culture as it is now.".into());
+        }
+        let c = culture_at(st.points[0]);
+        if c == 0 {
+            return Err("No culture here.".into());
+        }
+        if locked(c) {
+            let idx: Vec<usize> = w.edits.overrides.cultures.iter().enumerate().filter(|(_, s)| s.tool == Tool::CultureLock && s.points.iter().skip(1).any(|&p| culture_at(p) == c)).map(|(k, _)| k).collect();
+            return if idx.is_empty() { Err(format!("Could not find the lock of {}.", name(c))) } else { Ok(CultureEdit::Unlock(idx)) };
+        }
+        // Its provinces now: the centre of every province where it is the majority.
+        let prov_field: Vec<u32> = match w.field("province") {
+            Some((Field::U32(v), _, _)) => v.clone(),
+            _ => return Err("Run the Provinces step first.".into()),
+        };
+        let cf = cult_field.as_ref().unwrap();
+        let ids: std::collections::BTreeSet<u32> = (0..cf.len()).filter(|&i| cf[i] as u32 == c).map(|i| prov_field[i]).collect();
+        let centres: Vec<[f64; 2]> = w
+            .meta(Step::Provinces)
+            .and_then(|m| m["table"]["provinces"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter(|p| p["id"].as_u64().is_some_and(|id| ids.contains(&(id as u32))))
+            .filter_map(|p| Some([p["center"][0].as_f64()?, p["center"][1].as_f64()?]))
+            .collect();
+        if centres.is_empty() {
+            return Err(format!("{} holds no province.", name(c)));
+        }
+        st.points.truncate(1);
+        st.points.extend(centres);
+        st.name = name(c);
+        return Ok(CultureEdit::Add(st));
+    }
+    if fresh {
+        let ends: Vec<[f64; 2]> = match st.tool {
+            Tool::CultureMerge | Tool::CultureReparent => vec![st.points[0], *st.points.last().unwrap()],
+            Tool::CultureSplit => vec![st.points[st.points.len() / 2]],
+            _ => vec![st.points[0]],
+        };
+        if let Some(c) = ends.iter().map(|&p| culture_at(p)).find(|&c| c > 0 && locked(c)) {
+            return Err(format!("{} is locked: unlock it first.", name(c)));
+        }
+    }
+    if st.tool == Tool::CultureNewName && st.seed == 0 {
+        // A different name each time, and the same one when the edit replays.
+        let p = st.points[0];
+        st.seed = (w.edits.overrides.cultures.len() as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (p[0] * 1e4) as i64 as u64 ^ ((p[1] * 1e4) as i64 as u64).rotate_left(29);
+    }
+    Ok(CultureEdit::Add(st))
+}
+
 /// The inputs a live run depends on besides upstream steps and its directives.
 fn live_inputs(w: &World, step: Step) -> Value {
     match step {
-        Step::Cultures => json!([w.params.cultures, w.edits.overrides.bands, w.edits.overrides.attraction]),
+        Step::Cultures => json!([w.params.cultures, w.edits.overrides.bands, w.edits.overrides.attraction, w.edits.overrides.cultures]),
         _ => json!([w.params.nations, w.edits.overrides.nation_seeds]),
     }
 }
@@ -253,6 +332,7 @@ impl Session {
                 "site_pins": e.overrides.sites.len(),
                 "fertility_strokes": e.overrides.fertility.len(),
                 "attraction_strokes": e.overrides.attraction.len(),
+                "culture_edits": e.overrides.cultures.len(),
                 "nation_seeds": e.overrides.nation_seeds.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "size": s.value, "name": s.name }))).collect::<Vec<_>>(),
                 "band_pins": e.overrides.bands.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "bands": s.value }))).collect::<Vec<_>>(),
                 "sites": e.overrides.sites.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "population": s.value }))).collect::<Vec<_>>(),
@@ -279,7 +359,7 @@ pub fn overrides_report(w: &World) -> Value {
         .map(|&l| json!({ "layer": l.key(), "title": l.title(), "step": l.step().key(), "edits": w.edits.count(l) }))
         .collect();
     let mut unapplied = Vec::new();
-    for st in [Step::States, Step::Provinces] {
+    for st in [Step::States, Step::Provinces, Step::Cultures] {
         if let Some(m) = w.meta(st) {
             if let Some(a) = m["unapplied_edits"].as_array() {
                 // Indices refer to the run's edits: drop entries the layer no longer has.
@@ -518,8 +598,15 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             if st.points.is_empty() {
                 return Err("empty stroke".into());
             }
-            s.snapshot_layers(&[st.tool.layer()]);
-            s.world.edits.add_stroke(st);
+            let layer = st.tool.layer();
+            let action = if layer == EditLayer::Cultures { prepare_culture_edit(&mut s.world, st)? } else { CultureEdit::Add(st) };
+            s.snapshot_layers(&[layer]);
+            match action {
+                CultureEdit::Add(st) => s.world.edits.add_stroke(st),
+                CultureEdit::Unlock(idx) => {
+                    s.world.edits.remove_strokes(EditLayer::Cultures, &idx);
+                }
+            }
             Ok(Reply::Json(s.status()))
         }
         "add_pin" => {

@@ -10,6 +10,14 @@ Rivers run between cells, like Civilization V's.
 - **Export:** `rivers.png` and `rivers.geojson` follow the cell edges, and `provinces.png` borders are not warped next to rivers, so borders along rivers line up with the river pixels.
 - Hydrology, habitability, states and provinces change for the same seed; projects store four more per-corner river fields (about 17 MB at grid level 8).
 
+Culture editor and locks (M6).
+
+- **Edit cultures by hand** (Cultures card and *Edit map*): *Merge cultures* (drag one onto the culture that absorbs it), *Paint culture* (provinces under the brush join the culture where the stroke starts), *Split by line* (the smaller side of a line across a culture becomes a daughter; a loop makes the part inside a daughter), *Split by contacts* (into 2–5 daughters along the lines where its people are least in touch), *Re-parent* (drag a culture onto its new, older parent), *Rename culture* and *New name* (from its own language).
+- **Locks:** *Lock / unlock* records a culture's provinces and name. Whenever Stage 3 re-runs, even with other settings, the culture keeps exactly those provinces and its name; other edits leave it alone; and Stage 4 history never changes it (no assimilation into or out of it, no settlers replacing or spreading it). This closes the last open check of milestone M5.
+- Edits pick cultures by place, since culture ids change on every run, and apply at the end of the run, so groups, names and tables follow. Edits that no longer apply are listed in the Overrides panel and by `worldgen overrides`; `worldgen edit` takes the new tools too.
+- **Family tree** in the Cultures card: every living culture under its ancestors, ended ones greyed; 🔒 marks locked cultures, and events made by edits say so.
+- Province names are now drawn one province at a time, so an edit only renames the provinces it changes; names differ from before for the same seed.
+
 ## 0.3.1
 
 Mountains now shape temperature as well as rain.

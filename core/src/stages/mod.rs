@@ -222,7 +222,7 @@ pub(crate) fn unapplied(layer: &str, index: usize, s: &crate::edits::Stroke, rea
     serde_json::json!({ "layer": layer, "index": index, "tool": s.tool, "at": s.points.first(), "reason": reason })
 }
 
-pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 3, 2, 6, 7, 2, 6, 4, 7, 5, 6];
+pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 3, 2, 6, 7, 2, 6, 4, 7, 6, 7];
 
 /// Cache keys: each step hashes only the inputs it actually reads, chained to
 /// the previous step's key, so a change only invalidates what depends on it.
@@ -246,12 +246,13 @@ pub fn input_hashes(p: &WorldParams, e: &Edits) -> [u64; N_STEPS] {
     let h8 = hash::combine(h7, hash::json(&("states", &p.states, &e.overrides.states)));
     let h9 = hash::combine(h8, hash::json(&("provinces", &p.provinces, &e.overrides.provinces, &e.imports.provinces)));
     // Directives are hashed only when there are some, so worlds without them keep their cache keys.
+    // So are culture edits.
     let cdir = crate::directives::of_stage(&e.overrides.directives, "cultures");
-    let h10 = if cdir.is_empty() {
-        hash::combine(h9, hash::json(&("cultures", &p.cultures, &e.overrides.bands, &e.overrides.attraction)))
-    } else {
-        hash::combine(h9, hash::json(&("cultures", &p.cultures, &e.overrides.bands, &e.overrides.attraction, &cdir)))
-    };
+    let base10 = hash::json(&("cultures", &p.cultures, &e.overrides.bands, &e.overrides.attraction));
+    let mut h10 = if cdir.is_empty() { hash::combine(h9, base10) } else { hash::combine(h9, hash::json(&("cultures", &p.cultures, &e.overrides.bands, &e.overrides.attraction, &cdir))) };
+    if !e.overrides.cultures.is_empty() {
+        h10 = hash::combine(h10, hash::json(&("culture_edits", &e.overrides.cultures)));
+    }
     let h11 = hash::combine(h10, hash::json(&("nations", &p.nations, &crate::directives::of_stage(&e.overrides.directives, "nations"), &e.overrides.nation_seeds)));
     let h = [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11];
     // Fold in the model versions, preserving the chain (a version bump in one
