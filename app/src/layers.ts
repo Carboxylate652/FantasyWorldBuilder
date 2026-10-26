@@ -182,7 +182,7 @@ export const LAYERS: LayerDef[] = [
   { id: 'terrain', label: 'Game terrain', fields: ['terrain', 'elevation'], smooth: false, group: 'Biomes' },
   { id: 'habitability', label: 'Habitability', fields: ['habitability', 'water', 'elevation'], smooth: true, group: 'Political' },
   { id: 'springs', label: 'Groundwater & springs', fields: ['groundwater', 'site', 'site_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
-  { id: 'barrier', label: 'Barriers', fields: ['barrier', 'river_role', 'water', 'elevation'], smooth: false, group: 'Political' },
+  { id: 'barrier', label: 'Barriers', fields: ['barrier', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'states', label: 'States', fields: ['state', 'province', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'regions', label: 'Regions & continents', fields: ['region', 'state', 'continent', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'provinces', label: 'Provinces', fields: ['province', 'province_kind', 'state', 'water', 'elevation'], smooth: false, group: 'Political' },
@@ -452,11 +452,10 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       break;
     }
     case 'barrier': {
-      const b = f['barrier'], rr = f['river_role'];
+      // Border and backbone rivers are drawn on their cell edges (overlay).
+      const b = f['barrier'];
       for (let i = 0; i < n; i++) {
         if (isSea(i) || (wm && wm[i] === 2)) { put(i, [32, 48, 78]); continue; }
-        if (rr && rr[i] === 1) { put(i, [235, 60, 50]); continue; }
-        if (rr && rr[i] === 2) { put(i, [60, 210, 120]); continue; }
         put(i, ramp(RAMPS.barrier, b ? b[i] : 0), sh(i));
       }
       legend = { title: 'Crossing cost (barrier)', gradient: { stops: RAMPS.barrier, unit: '' }, items: [

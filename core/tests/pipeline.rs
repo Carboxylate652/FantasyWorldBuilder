@@ -1307,3 +1307,53 @@ fn orographic_rain_on_windward_slopes() {
     let max = f32_of(&mut w, "precip").iter().cloned().fold(0.0, f32::max);
     assert!(max > 1500.0 && max < 2500.0, "wettest month {max} mm");
 }
+
+/// Rivers run along cell edges (like Civilization V's): every segment joins
+/// two adjacent cell corners, both its banks are land and mark a river, the
+/// courses form a tree, and border rivers are where provinces meet.
+#[test]
+fn rivers_run_along_cell_edges_and_divide_land() {
+    let mut p = small_params(5);
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let g = w.grid();
+    let get = |w: &World, name: &str| w.field(name).unwrap_or_else(|| panic!("{name}")).0.clone();
+    use worldcore::fields::Field;
+    let Field::I32(to) = get(&w, "river_to") else { panic!() };
+    let Field::F32(q) = get(&w, "river_seg_discharge") else { panic!() };
+    let Field::U8(seg_role) = get(&w, "river_seg_role") else { panic!() };
+    let Field::F32(bank_w) = get(&w, "river_width") else { panic!() };
+    let Field::U8(wat) = get(&w, "water") else { panic!() };
+    let Field::U32(prov) = get(&w, "province") else { panic!() };
+    assert_eq!(to.len(), g.tris.len(), "one segment slot per cell corner");
+    let segs: Vec<usize> = (0..to.len()).filter(|&t| to[t] >= 0).collect();
+    assert!(segs.len() > 100, "{} river segments", segs.len());
+    for &t in &segs {
+        let u = to[t] as usize;
+        let shared = g.tris[t].iter().filter(|c| g.tris[u].contains(c)).count();
+        assert_eq!(shared, 2, "segment {t}→{u} does not run along a cell edge");
+        let (a, b) = g.corner_edge_cells(t, u);
+        assert!(wat[a] == 0 && wat[b] == 0, "both banks are land");
+        assert!(bank_w[a] > 0.0 && bank_w[b] > 0.0, "both banks are river cells");
+        assert!(q[t] as f64 >= p.hydrology.river_threshold_m3s, "segment {t} carries {} m³/s", q[t]);
+    }
+    // Courses form a tree: following them always ends.
+    for &t in &segs {
+        let (mut c, mut k) = (t, 0);
+        while to[c] >= 0 {
+            c = to[c] as usize;
+            k += 1;
+            assert!(k <= to.len(), "river course from corner {t} loops");
+        }
+    }
+    // Border rivers are where provinces meet, and their borders are typed "river".
+    let border: Vec<usize> = segs.iter().copied().filter(|&t| seg_role[t] == 1).collect();
+    assert!(border.len() > 20, "{} border-river segments", border.len());
+    let split = border.iter().filter(|&&t| { let (a, b) = g.corner_edge_cells(t, to[t] as usize); prov[a] != prov[b] }).count();
+    let share = split as f64 / border.len() as f64;
+    assert!(share > 0.9, "only {:.0}% of border-river length divides provinces", share * 100.0);
+    let types = &w.meta(Step::Provinces).unwrap()["borders"];
+    assert!(types["river"].as_u64().unwrap_or(0) > 0, "no river borders: {types}");
+}

@@ -280,34 +280,33 @@ async function refreshOverlays() {
   const exagLift = (i: number, elev: ArrayLike<number> | undefined) =>
     elev && S.exag > 0 ? (S.exag * Math.max(0, elev[i])) / (S.status!.params.planet.radius_km * 1000) : 0;
 
-  // Rivers as ribbons whose on-screen width follows the real bankfull width
-  // (log scale: ~0.8 px for a 60 m stream, ~5 px for a 2 km great river).
-  const width = S.overlays.rivers ? await getField('river_width') : null;
-  const recv = width ? await getField('receiver') : null;
-  if (width && recv && !width.stale) {
-    const elev = (await getField('elevation'))?.values;
-    const wv = width.values, rc = recv.values;
+  // Rivers run along cell edges, from cell corner to cell corner (where the
+  // borders are drawn), as ribbons whose on-screen width follows the real
+  // bankfull width (log scale: ~0.8 px for a 60 m stream, ~5 px for a 2 km great river).
+  const width = S.overlays.rivers ? await getField('river_seg_width') : null;
+  const to = width ? await getField('river_to') : null;
+  const elevF = width || S.layer === 'barrier' ? (await getField('elevation'))?.values : undefined;
+  if (width && to && !width.stale) {
+    const wv = width.values, tv = to.values;
     const segs: number[] = [];
-    for (let i = 0; i < g.n; i++) if (wv[i] > 0 && rc[i] >= 0) segs.push(i);
-    const mk = (): RibbonSet => ({ a: new Float32Array(segs.length * 3), b: new Float32Array(segs.length * 3), width: new Float32Array(segs.length), color: new Float32Array(segs.length * 4), count: segs.length });
-    const gl3 = mk(), fl = mk();
-    segs.forEach((i, k) => {
-      const r = rc[i];
-      const t = Math.min(1, Math.max(0, Math.log(wv[i] / 60) / Math.log(2000 / 60)));
-      const px = 0.8 + 4.2 * t;
-      const col = [0.32 - 0.22 * t, 0.58 - 0.3 * t, 0.95 - 0.15 * t, 0.85 + 0.15 * t];
-      const pa = surface(g.p(i), 0.0025 + exagLift(i, elev)), pb = surface(g.p(r), 0.0025 + exagLift(r, elev));
-      gl3.a.set(pa, k * 3); gl3.b.set(pb, k * 3);
-      const [la, loa] = toLatLon(g.p(i));
-      let [lb, lob] = toLatLon(g.p(r));
-      if (lob - loa > Math.PI) lob -= 2 * Math.PI;
-      if (lob - loa < -Math.PI) lob += 2 * Math.PI;
-      fl.a.set([loa, la, 0], k * 3); fl.b.set([lob, lb, 0], k * 3);
-      gl3.width[k] = fl.width[k] = px;
-      gl3.color.set(col, k * 4); fl.color.set(col, k * 4);
+    for (let t = 0; t < g.t; t++) if (wv[t] > 0 && tv[t] >= 0) segs.push(t);
+    const [gl3, fl] = cornerRibbons(g, segs, tv, elevF, (t) => {
+      const k = Math.min(1, Math.max(0, Math.log(wv[t] / 60) / Math.log(2000 / 60)));
+      return [0.8 + 4.2 * k, [0.32 - 0.22 * k, 0.58 - 0.3 * k, 0.95 - 0.15 * k, 0.85 + 0.15 * k]];
     });
     R.setRibbons('rivers', gl3, fl);
   } else R.setRibbons('rivers', null, null);
+
+  // On the barrier layer: border rivers (red) and backbone rivers (green) on their edges.
+  const roles = S.layer === 'barrier' ? await getField('river_seg_role') : null;
+  const rto = roles ? await getField('river_to') : null;
+  if (roles && rto && !roles.stale) {
+    const rv = roles.values, tv = rto.values;
+    const segs: number[] = [];
+    for (let t = 0; t < g.t; t++) if (rv[t] > 0 && tv[t] >= 0) segs.push(t);
+    const [gl3, fl] = cornerRibbons(g, segs, tv, elevF, (t) => [7, rv[t] === 1 ? [0.92, 0.24, 0.2, 1] : [0.24, 0.82, 0.47, 1]]);
+    R.setRibbons('river_roles', gl3, fl);
+  } else R.setRibbons('river_roles', null, null);
 
   // Winds (sampled on the first 2,562 cells = the level-4 sub-grid)
   if (S.overlays.wind) {
@@ -456,6 +455,41 @@ async function drawTransportIcons() {
     const [a, b] = L.sets();
     R.setOverlay('transport', a, b);
   } else R.setOverlay('transport', null, null);
+}
+
+/** Position of cell corner t (the centroid of its triangle, as the renderer draws it). */
+function cornerPos(g: Grid, t: number): Vec3 {
+  const [p, q, r] = [g.p(g.tris[t * 3]), g.p(g.tris[t * 3 + 1]), g.p(g.tris[t * 3 + 2])];
+  const s: Vec3 = [p[0] + q[0] + r[0], p[1] + q[1] + r[1], p[2] + q[2] + r[2]];
+  const l = Math.hypot(...s);
+  return [s[0] / l, s[1] / l, s[2] / l];
+}
+
+/** Globe and flat ribbons for river segments from corner t to corner to[t];
+ *  `style` gives each segment's width (px) and colour. */
+function cornerRibbons(g: Grid, segs: number[], to: ArrayLike<number>, elev: ArrayLike<number> | undefined, style: (t: number) => [number, number[]]): [RibbonSet, RibbonSet] {
+  const mk = (): RibbonSet => ({ a: new Float32Array(segs.length * 3), b: new Float32Array(segs.length * 3), width: new Float32Array(segs.length), color: new Float32Array(segs.length * 4), count: segs.length });
+  const gl3 = mk(), fl = mk();
+  const R0 = S.status!.params.planet.radius_km * 1000;
+  const lift = (t: number) => {
+    if (!elev || S.exag <= 0) return 0.0025;
+    const e = (Math.max(0, elev[g.tris[t * 3]]) + Math.max(0, elev[g.tris[t * 3 + 1]]) + Math.max(0, elev[g.tris[t * 3 + 2]])) / 3;
+    return 0.0025 + (S.exag * e) / R0;
+  };
+  segs.forEach((t, k) => {
+    const u = to[t];
+    const [px, col] = style(t);
+    const ca = cornerPos(g, t), cb = cornerPos(g, u);
+    gl3.a.set(surface(ca, lift(t)), k * 3); gl3.b.set(surface(cb, lift(u)), k * 3);
+    const [la, loa] = toLatLon(ca);
+    let [lb, lob] = toLatLon(cb);
+    if (lob - loa > Math.PI) lob -= 2 * Math.PI;
+    if (lob - loa < -Math.PI) lob += 2 * Math.PI;
+    fl.a.set([loa, la, 0], k * 3); fl.b.set([lob, lb, 0], k * 3);
+    gl3.width[k] = fl.width[k] = px;
+    gl3.color.set(col, k * 4); fl.color.set(col, k * 4);
+  });
+  return [gl3, fl];
 }
 
 /** Cell-edge segments between neighbouring cells whose values differ (and pass `keep`):
@@ -1804,7 +1838,7 @@ function summary(key: string, m: any): HTMLElement {
       break;
     case 'hydrology': {
       if (m.channel_loss_m3s !== undefined) box.append(stat('Lost in dry channels', `${fmt(m.channel_loss_m3s)} m³/s`));
-      box.append(stat('River cells', fmt(m.river_cells)), stat('Lakes', `${m.lakes} (${m.endorheic_lakes} endorheic)`), stat('Eroded', `${fmt(m.eroded_km3 / 1000)}k km³`));
+      box.append(stat('Rivers', `${fmt(m.river_km ?? 0)} km`), stat('Lakes', `${m.lakes} (${m.endorheic_lakes} endorheic)`), stat('Eroded', `${fmt(m.eroded_km3 / 1000)}k km³`));
       const list = h('div', { class: 'list' });
       (m.major_rivers ?? []).forEach((r: any, i: number) => list.append(h('div', { class: 'item link', onclick: () => R.lookAt(fromLatLon((r.lat * Math.PI) / 180, (r.lon * Math.PI) / 180)) },
         `${i + 1}. ${fmt(r.discharge_m3s)} m³/s · ${fmt(r.width_m ?? 0)} m wide · ${fmt(r.length_km)} km · basin ${fmt(r.basin_mkm2, 2)} M km²`)));
@@ -2444,7 +2478,7 @@ function describe(d: any): [string, string][] {
   tag = 'land';
   if (d.terrain !== undefined) parts.push(TERRAIN[d.terrain][0]);
   tag = 'water';
-  if (d.river) parts.push(`${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, ${Math.round(d.discharge).toLocaleString()} m³/s, order ${d.river}`);
+  if (d.river) parts.push(`beside a ${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, order ${d.river}`);
   if (d.lake) parts.push(['', 'fresh lake', 'salt lake', 'dry lake'][d.lake]);
   tag = 'land';
   if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);

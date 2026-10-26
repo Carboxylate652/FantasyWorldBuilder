@@ -9,8 +9,8 @@
 | `heightmap.png` | 8-bit greyscale; sea level = 20 by default; 255 = 6,500 m |
 | `heightmap16.png` | 16-bit; metres = v / 65535 × 20000 − 11000 (lossless round trip) |
 | `terrain.png` | Indexed palette of 18 game terrains |
-| `rivers.png` | CK3-style indexed palette: source, merge, width classes 3–11 (each ×√2 in real width), land 254, water 255 |
-| `rivers.geojson` | One LineString per river with `width_m` and `discharge_m3s` per vertex |
+| `rivers.png` | CK3-style indexed palette: source, merge, width classes 3–11 (each ×√2 in real width), land 254, water 255. Rivers run along cell edges, and province borders in `provinces.png` are not warped next to rivers, so a border along a river follows the river line |
+| `rivers.geojson` | One LineString per river with `width_m` and `discharge_m3s` per vertex; vertices are cell corners |
 | `biomes.png`, `climate.png`, `precipitation.png` | Reference layers (Köppen colours, temperature, rain) |
 | `provinces.png` | One unique 24-bit RGB colour per province, no anti-aliasing; borders noise-warped (up to a third of a cell); the coastline matches the heightmap pixel for pixel |
 | `definition.csv` | `id;r;g;b;name;x;` with a `0;0;0;0;x;x;` first row (CK3 / Victoria 3) |

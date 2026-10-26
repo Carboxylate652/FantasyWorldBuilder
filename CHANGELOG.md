@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+Rivers run between cells, like Civilization V's.
+
+- **Rivers along cell edges:** water still flows from cell to cell, but each river's line now runs along the boundaries between cells, from corner to corner. A river is the line between the two cells on its banks, both of which count as riverside (water, floodplains, harbours).
+- **Rivers as borders:** a border river's crossing cost sits on the edge it runs along, so where a state or province border follows a river, it is the river itself, no longer a line beside it that switches banks from cell to cell. Border rivers divide provinces and states at least as often as before (on seeds 1 and 5: 76–78% of their length divides provinces, 49–63% states). Province borders along a river are typed `river` from the river edges themselves.
+- **Barriers layer:** border and backbone rivers are drawn on their edges; *Remove barrier* turns off the border role of the rivers along the erased cells.
+- **Export:** `rivers.png` and `rivers.geojson` follow the cell edges, and `provinces.png` borders are not warped next to rivers, so borders along rivers line up with the river pixels.
+- Hydrology, habitability, states and provinces change for the same seed; projects store four more per-corner river fields (about 17 MB at grid level 8).
+
 ## 0.3.1
 
 Mountains now shape temperature as well as rain.

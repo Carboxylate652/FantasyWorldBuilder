@@ -12,7 +12,10 @@
 //!    only a playa remains when there is almost no inflow.
 //! 4. Lake–climate feedback: the climate is re-solved with lakes as open water
 //!    (evaporation source, maritime influence), then lakes are re-balanced.
-//! 5. Discharge, rivers ranked by Strahler order.
+//! 5. Discharge on the cell flow tree. Rivers run along cell edges, like
+//!    Civilization V's: their lines are routed over the cell corners, so a
+//!    river is the boundary between the cells on its banks; ranked by Strahler
+//!    order.
 
 use super::climate;
 use super::{Ctx, StepOutput, Upstream};
@@ -200,6 +203,142 @@ fn accumulate_channel(order: &[u32], receiver: &[i32], local: &[f64], sink: &[f6
         }
     }
     (q, lost)
+}
+
+/// Rivers along cell edges, routed over the cell corners (triangles).
+struct CornerRivers {
+    /// Downstream corner of every corner (−1 at the coast, a lake shore or a
+    /// terminal basin floor).
+    receiver: Vec<i32>,
+    /// Donors before receivers.
+    order: Vec<u32>,
+    /// Discharge on the segment leaving each corner (internal units).
+    q: Vec<f64>,
+    /// Drainage area above each corner (km²).
+    drainage: Vec<f64>,
+}
+
+/// The water budget, lakes and erosion run on the cell flow tree; the river
+/// *line* is routed here over the cell corners, so every step runs along the
+/// boundary between two cells. Corner heights are the mean of their three
+/// cells; a priority flood from the corners touching the sea, a lake or a
+/// terminal basin floor drains every corner, and steepest descent on the
+/// filled surface picks each corner's receiver. Each land cell's runoff is
+/// shared among its corners, and an overflowing lake's outflow enters at the
+/// lowest corner of the cell it drains into.
+#[allow(clippy::too_many_arguments)]
+fn corner_rivers(g: &Grid, adj: &[[u32; 3]], h: &[f64], lakes: &Lakes, ocean: &[bool], q_cell: &[f64], bud: &Budget, area_km2: &[f64], hp: &HydroParams, r_km: f64, thr: f64) -> CornerRivers {
+    let nt = g.tris.len();
+    let land = |c: usize| !ocean[c] && lakes.water[c] == water::LAND;
+    let cpos: Vec<crate::vec3::Vec3> = (0..nt).map(|t| g.corner_pos(t)).collect();
+    let sink: Vec<bool> = g
+        .tris
+        .iter()
+        .map(|tri| tri.iter().any(|&c| { let c = c as usize; !land(c) || lakes.receiver[c] < 0 }))
+        .collect();
+    let hc: Vec<f64> = g.tris.iter().map(|tri| tri.iter().map(|&c| h[c as usize]).sum::<f64>() / 3.0).collect();
+    let mut filled = vec![f64::NAN; nt];
+    let mut done = vec![false; nt];
+    let mut parent = vec![-1i32; nt];
+    let mut heap = BinaryHeap::new();
+    for t in 0..nt {
+        if sink[t] {
+            filled[t] = hc[t];
+            done[t] = true;
+            if adj[t].iter().any(|&u| !sink[u as usize]) {
+                heap.push(Item(hc[t], t as u32));
+            }
+        }
+    }
+    if heap.is_empty() && nt > 0 {
+        let low = (0..nt).min_by(|&a, &b| hc[a].partial_cmp(&hc[b]).unwrap()).unwrap();
+        filled[low] = hc[low];
+        done[low] = true;
+        heap.push(Item(hc[low], low as u32));
+    }
+    while let Some(Item(level, t)) = heap.pop() {
+        for &u in &adj[t as usize] {
+            let u = u as usize;
+            if done[u] {
+                continue;
+            }
+            done[u] = true;
+            filled[u] = hc[u].max(level + EPS);
+            parent[u] = t as i32;
+            heap.push(Item(filled[u], u as u32));
+        }
+    }
+    let receiver: Vec<i32> = (0..nt)
+        .into_par_iter()
+        .map(|t| {
+            if sink[t] {
+                return -1;
+            }
+            let mut best = parent[t];
+            let mut best_s = 0.0;
+            for &u in &adj[t] {
+                let u = u as usize;
+                let drop = filled[t] - filled[u];
+                if drop > 0.0 {
+                    let s = drop / cpos[t].angle_to(cpos[u]);
+                    if s > best_s {
+                        best_s = s;
+                        best = u as i32;
+                    }
+                }
+            }
+            best
+        })
+        .collect();
+    // Each land cell's runoff and area, shared among its corners.
+    let mut local = vec![0.0f64; nt];
+    let mut area = vec![0.0f64; nt];
+    for (c, (&runoff, &a)) in lakes.local.iter().zip(area_km2).enumerate() {
+        if !land(c) {
+            continue;
+        }
+        let ts = g.incident_tris(c);
+        let k = 1.0 / ts.len() as f64;
+        for &t in ts {
+            local[t as usize] += runoff * k;
+            area[t as usize] += a * k;
+        }
+    }
+    // Overflowing lakes: the outflow enters at the lowest open corner of the
+    // cell the lake drains into.
+    for (c, &out) in q_cell.iter().enumerate() {
+        let r = lakes.receiver[c];
+        if lakes.water[c] != water::LAKE || r < 0 || !land(r as usize) {
+            continue;
+        }
+        let entry = g.incident_tris(r as usize).iter().map(|&t| t as usize).filter(|&t| !sink[t]).min_by(|&a, &b| filled[a].partial_cmp(&filled[b]).unwrap());
+        if let Some(t) = entry {
+            local[t] += out;
+        }
+    }
+    let loss: Vec<f64> = (0..nt)
+        .map(|t| {
+            let r = receiver[t];
+            if r < 0 {
+                return 0.0;
+            }
+            let (mut ar, mut k) = (0.0, 0.0);
+            for &c in &g.tris[t] {
+                let c = c as usize;
+                if land(c) && bud.pet[c] > 0.0 {
+                    ar += (1.0 - bud.precip[c] / bud.pet[c]).clamp(0.0, 1.0);
+                    k += 1.0;
+                }
+            }
+            let reach_km = cpos[t].angle_to(cpos[r as usize]) * r_km;
+            if k > 0.0 { (hp.channel_loss * ar / k * reach_km / 100.0).clamp(0.0, 0.5) } else { 0.0 }
+        })
+        .collect();
+    let order = upstream_first(&receiver);
+    let zero = vec![0.0; nt];
+    let (q, _) = accumulate_channel(&order, &receiver, &local, &zero, &loss, 0.5 * thr);
+    let drainage = accumulate(&order, &receiver, &area, &zero);
+    CornerRivers { receiver, order, q, drainage }
 }
 
 /// Per-cell water budget from monthly climate (all in mm/yr).
@@ -561,87 +700,93 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         }
     }
 
-    ctx.progress(0.9, "Ranking rivers");
-    let is_river: Vec<bool> = (0..n).map(|i| !ocean[i] && lakes.water[i] != water::LAKE && discharge[i] as f64 >= thr).collect();
+    // ---- Rivers along cell edges: the line is routed over the cell corners.
+    ctx.progress(0.9, "Tracing rivers along cell edges");
+    let adj = g.corner_adjacency();
+    let cr = corner_rivers(g, &adj, &h_route, &lakes, &ocean, &q, &bud, &area_km2, hp, r_km, thr / TO_M3S);
+    let nt = g.tris.len();
+    let cpos: Vec<crate::vec3::Vec3> = (0..nt).map(|t| g.corner_pos(t)).collect();
+    let seg_km = |t: usize, u: usize| cpos[t].angle_to(cpos[u]) * r_km;
+    let cq: Vec<f64> = cr.q.iter().map(|&x| x * TO_M3S).collect();
+    let mut is_river: Vec<bool> = (0..nt).map(|t| cr.receiver[t] >= 0 && cq[t] >= thr).collect();
     // Drop river systems whose longest course is shorter than the minimum length
-    // (one- or two-cell coastal stubs in wet regions).
-    let mut is_river = is_river;
+    // (short coastal stubs in wet regions).
     {
-        let mut up_len = vec![0.0f64; n];
-        for &c in &lakes.order {
-            let i = c as usize;
-            if !is_river[i] {
-                continue;
-            }
-            let r = lakes.receiver[i];
-            if r >= 0 && is_river[r as usize] {
-                let l = up_len[i] + g.pos[i].angle_to(g.pos[r as usize]) * r_km;
+        let mut up_len = vec![0.0f64; nt];
+        for &c in &cr.order {
+            let t = c as usize;
+            let r = cr.receiver[t];
+            if is_river[t] && r >= 0 && is_river[r as usize] {
+                let l = up_len[t] + seg_km(t, r as usize);
                 if l > up_len[r as usize] {
                     up_len[r as usize] = l;
                 }
             }
         }
-        let mut mouth = vec![u32::MAX; n];
-        for &c in lakes.order.iter().rev() {
-            let i = c as usize;
-            if !is_river[i] {
+        let mut mouth = vec![u32::MAX; nt];
+        for &c in cr.order.iter().rev() {
+            let t = c as usize;
+            if !is_river[t] {
                 continue;
             }
-            let r = lakes.receiver[i];
-            mouth[i] = if r >= 0 && is_river[r as usize] { mouth[r as usize] } else { i as u32 };
+            let r = cr.receiver[t];
+            mouth[t] = if r >= 0 && is_river[r as usize] { mouth[r as usize] } else { t as u32 };
         }
-        for i in 0..n {
-            if is_river[i] && up_len[mouth[i] as usize] + spacing_km < hp.min_river_length_km {
-                is_river[i] = false;
+        let course = |m: usize| up_len[m] + seg_km(m, cr.receiver[m] as usize);
+        let short: Vec<bool> = (0..nt).map(|t| is_river[t] && course(mouth[t] as usize) < hp.min_river_length_km).collect();
+        for t in 0..nt {
+            if short[t] {
+                is_river[t] = false;
             }
         }
     }
-    let mut strahler = vec![0u8; n];
-    let mut in_max = vec![0u8; n];
-    let mut in_cnt = vec![0u8; n];
-    let mut length_km = vec![0.0f64; n];
-    for &c in &lakes.order {
-        let i = c as usize;
-        if !is_river[i] {
+    let mut strahler = vec![0u8; nt];
+    let mut in_max = vec![0u8; nt];
+    let mut in_cnt = vec![0u8; nt];
+    let mut length_km = vec![0.0f64; nt];
+    for &c in &cr.order {
+        let t = c as usize;
+        if !is_river[t] {
             continue;
         }
-        strahler[i] = if in_max[i] == 0 { 1 } else if in_cnt[i] >= 2 { in_max[i].saturating_add(1) } else { in_max[i] };
-        let r = lakes.receiver[i];
-        if r >= 0 {
-            let r = r as usize;
-            if strahler[i] > in_max[r] {
-                in_max[r] = strahler[i];
-                in_cnt[r] = 1;
-            } else if strahler[i] == in_max[r] {
-                in_cnt[r] = in_cnt[r].saturating_add(1);
-            }
-            let l = length_km[i] + g.pos[i].angle_to(g.pos[r]) * r_km;
-            if l > length_km[r] {
-                length_km[r] = l;
-            }
+        strahler[t] = if in_max[t] == 0 { 1 } else if in_cnt[t] >= 2 { in_max[t].saturating_add(1) } else { in_max[t] };
+        let r = cr.receiver[t] as usize;
+        if strahler[t] > in_max[r] {
+            in_max[r] = strahler[t];
+            in_cnt[r] = 1;
+        } else if strahler[t] == in_max[r] {
+            in_cnt[r] = in_cnt[r].saturating_add(1);
+        }
+        let l = length_km[t] + seg_km(t, r);
+        if l > length_km[r] {
+            length_km[r] = l;
         }
     }
     // Hydraulic geometry (Leopold & Maddock): bankfull width w = a·Q^b.
     let width_of = |q: f64| hp.width_coeff * q.max(0.0).powf(hp.width_exponent);
-    let river_width: Vec<f32> = (0..n).map(|i| if is_river[i] { width_of(discharge[i] as f64) as f32 } else { 0.0 }).collect();
+    let river_to: Vec<i32> = (0..nt).map(|t| if is_river[t] { cr.receiver[t] } else { -1 }).collect();
+    let seg_width: Vec<f32> = (0..nt).map(|t| if is_river[t] { width_of(cq[t]) as f32 } else { 0.0 }).collect();
+    let seg_q: Vec<f32> = (0..nt).map(|t| if is_river[t] { cq[t] as f32 } else { 0.0 }).collect();
+    let river_km: f64 = (0..nt).filter(|&t| is_river[t]).map(|t| seg_km(t, cr.receiver[t] as usize)).sum();
+    // The cells on each river's banks: their widest river and its order.
+    let river_width = crate::rivers::bank_max(g, &river_to, &seg_width);
+    let bank_order = crate::rivers::bank_max(g, &river_to, &strahler);
     // Width classes 1–9 (export palette), each a factor √2 in width.
     let w_thr = width_of(thr);
-    let river_rank: Vec<u8> = (0..n)
-        .map(|i| if is_river[i] { (1.0 + 2.0 * (river_width[i] as f64 / w_thr).log2().max(0.0)).min(9.0) as u8 } else { 0 })
-        .collect();
-    let mut mouths: Vec<(usize, f64)> = (0..n)
-        .filter(|&i| is_river[i] && (lakes.receiver[i] < 0 || !is_river[lakes.receiver[i] as usize]))
-        .map(|i| (i, discharge[i] as f64))
-        .collect();
+    let rank_of = |w: f64| if w > 0.0 { (1.0 + 2.0 * (w / w_thr).log2().max(0.0)).min(9.0) as u8 } else { 0 };
+    let river_rank: Vec<u8> = river_width.iter().map(|&w| rank_of(w as f64)).collect();
+    let mut mouths: Vec<(usize, f64)> = (0..nt).filter(|&t| is_river[t] && !is_river[cr.receiver[t] as usize]).map(|t| (t, cq[t])).collect();
     mouths.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
     let major: Vec<serde_json::Value> = mouths
         .iter()
         .take(8)
-        .map(|&(i, qd)| {
+        .map(|&(t, qd)| {
+            let r = cr.receiver[t] as usize;
+            let (la, lo) = cpos[r].lat_lon();
             serde_json::json!({
-                "lat": g.lat[i].to_degrees(), "lon": g.lon[i].to_degrees(),
-                "discharge_m3s": qd, "length_km": length_km[i], "order": strahler[i],
-                "basin_mkm2": drainage[i] / 1e6, "width_m": river_width[i],
+                "lat": la.to_degrees(), "lon": lo.to_degrees(),
+                "discharge_m3s": qd, "length_km": length_km[t] + seg_km(t, r), "order": strahler[t],
+                "basin_mkm2": cr.drainage[t] / 1e6, "width_m": seg_width[t],
             })
         })
         .collect();
@@ -677,7 +822,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     };
     let erosion: Vec<f32> = (0..n).map(|i| elevation[i] - elev0[i]).collect();
     let eroded_km3: f64 = (0..n).map(|i| (-erosion[i] as f64).max(0.0) / 1000.0 * area_km2[i]).sum();
-    let n_river = is_river.iter().filter(|&&r| r).count();
+    let n_river = river_width.iter().filter(|&&w| w > 0.0).count();
 
     let mut f = Fields::default();
     let mut feedback = serde_json::Value::Null;
@@ -695,9 +840,14 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     f.put("receiver", Field::I32(lakes.receiver));
     f.put("discharge", Field::F32(discharge));
     f.put("drainage_area", Field::F32(drainage.iter().map(|&x| x as f32).collect()));
-    f.put("river", Field::U8(strahler));
+    f.put("river", Field::U8(bank_order));
     f.put("river_rank", Field::U8(river_rank));
     f.put("river_width", Field::F32(river_width));
+    // Per corner (one value per triangle): the river segment from each corner.
+    f.put("river_to", Field::I32(river_to));
+    f.put("river_seg_width", Field::F32(seg_width));
+    f.put("river_seg_discharge", Field::F32(seg_q));
+    f.put("river_seg_order", Field::U8(strahler));
     f.put("lake", Field::U8(lakes.class));
     f.put("water", Field::U8(lakes.water));
     f.put("water_level", Field::F32(lakes.level));
@@ -707,6 +857,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         fields: f,
         meta: serde_json::json!({
             "river_cells": n_river,
+            "river_km": river_km,
             "channel_loss_m3s": lost * TO_M3S,
             "lakes": n_lakes,
             "endorheic_lakes": n_closed,

@@ -166,7 +166,7 @@ fn summary(w: &World) {
             "plates" => format!("{} plates ({} continental), {} landmasses", m["plate_count"], m["continental_plates"], m["landmasses"]),
             "relief" => format!("elevation {:.0}..{:.0} m", m["min_elevation_m"].as_f64().unwrap_or(0.0), m["max_elevation_m"].as_f64().unwrap_or(0.0)),
             "climate" => format!("global mean {:.1} °C, {:.0} mm/yr", m["global_mean_temp_c"].as_f64().unwrap_or(0.0), m["global_precip_mm"].as_f64().unwrap_or(0.0)),
-            "hydrology" => format!("{} river cells, {} lakes ({} endorheic)", m["river_cells"], m["lakes"], m["endorheic_lakes"]),
+            "hydrology" => format!("{:.0} km of rivers along cell edges, {} lakes ({} endorheic)", m["river_km"].as_f64().unwrap_or(0.0), m["lakes"], m["endorheic_lakes"]),
             "biomes" => {
                 let mut v: Vec<(String, f64)> = m["koppen_share"].as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_f64().unwrap_or(0.0))).collect()).unwrap_or_default();
                 v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
