@@ -291,6 +291,11 @@ pub struct MotionArrow {
 pub struct Sketch {
     /// Start from generated continents (from the seed) instead of an empty ocean.
     pub auto_base: bool,
+    /// Grow continents from the drawing: land and sea strokes are a rough
+    /// layout that the continent generator follows, instead of exact paint.
+    /// Takes precedence over `auto_base`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_drawing: bool,
     pub strokes: Vec<Stroke>,
     pub pins: Vec<PlatePin>,
     pub arrows: Vec<MotionArrow>,
@@ -298,7 +303,35 @@ pub struct Sketch {
 
 impl Default for Sketch {
     fn default() -> Self {
-        Sketch { auto_base: true, strokes: vec![], pins: vec![], arrows: vec![] }
+        Sketch { auto_base: true, from_drawing: false, strokes: vec![], pins: vec![], arrows: vec![] }
+    }
+}
+
+/// What the continent sketch starts from.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SketchBase {
+    /// Continents generated from the seed; strokes paint over them.
+    Generated,
+    /// An empty ocean; strokes paint land exactly.
+    Ocean,
+    /// Continents grown from the drawing by the generator.
+    Drawing,
+}
+
+impl Sketch {
+    pub fn base(&self) -> SketchBase {
+        if self.from_drawing {
+            SketchBase::Drawing
+        } else if self.auto_base {
+            SketchBase::Generated
+        } else {
+            SketchBase::Ocean
+        }
+    }
+    pub fn set_base(&mut self, b: SketchBase) {
+        self.from_drawing = b == SketchBase::Drawing;
+        self.auto_base = b == SketchBase::Generated;
     }
 }
 

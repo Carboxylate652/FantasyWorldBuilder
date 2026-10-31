@@ -1,7 +1,7 @@
 import './style.css';
 import * as api from './api';
 import { Grid, angle, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
-import { BOUNDARY, DEPOSITS, ERA_NAMES, INSTITUTION_NAMES, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, stateColor, type LayerId, type Legend } from './layers';
+import { BOUNDARY, DEPOSITS, ERA_NAMES, INSTITUTION_NAMES, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, sketchColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
 import { EDITOR_TOOLS, LIVE_STEPS, STAGE2_START, STAGE3_START, STAGE4_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
@@ -23,7 +23,7 @@ type Status = {
   steps: StepStatus[];
   params: any;
   edits: {
-    elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_strokes: number; pins: any[]; arrows: any[];
+    elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_base: 'generated' | 'ocean' | 'drawing'; sketch_strokes: number; pins: any[]; arrows: any[];
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
     site_pins: number; sites: { lat: number; lon: number; population: number }[];
     fertility_strokes: number; attraction_strokes: number; band_pins: { lat: number; lon: number; bands: number }[];
@@ -185,6 +185,8 @@ async function refreshLayer() {
   let stale = false;
   let missing = false;
   for (const name of def.fields) {
+    // The drawing outline belongs to worlds grown from a drawing only.
+    if (name === 'drawing' && S.status!.edits.sketch_base !== 'drawing') continue;
     const d = await getField(name, def.monthly && ['temp', 'precip', 'wind_u', 'wind_v'].includes(name) ? S.month : null);
     if (d) {
       f[name] = d.values;
@@ -1622,15 +1624,26 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
 
   const body = h('div', { class: 'card-body' }, h('p', { class: 'muted' }, ui.blurb));
   const form = h('div', { class: 'form' });
-  for (const p of ui.params) form.append(paramInput(p));
+  // Sketch parameters that only one base uses are shown with that base.
+  const base = S.status!.edits.sketch_base;
+  const unused = (p: Param) => (p.key === 'auto_continents' && base !== 'generated') || (p.key === 'drawing_freedom_km' && base !== 'drawing');
+  for (const p of ui.params) if (!unused(p)) form.append(paramInput(p));
   body.append(form);
 
   // Step-specific extras.
   const e = S.status!.edits;
   if (ui.key === 'sketch') {
+    const sm = ss.state === 'done' ? ss.meta : null;
+    form.prepend(h('label', {}, h('span', { title: 'What the strokes work on' }, 'Start from'),
+      h('select', { onchange: (ev: Event) => mutate('set_sketch_base', { value: (ev.target as HTMLSelectElement).value }, 'sketch') },
+        ...([['generated', 'Generated continents (seed)'], ['drawing', 'My drawing (procedural)'], ['ocean', 'Empty ocean (exact paint)']] as const)
+          .map(([v, label]) => h('option', { value: v, selected: e.sketch_base === v }, label)))));
     body.append(
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: e.auto_base, onchange: (ev: Event) => mutate('set_auto_base', { value: (ev.target as HTMLInputElement).checked }, 'sketch') }), 'Start from generated continents'),
-      h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.sketch_strokes} strokes`),
+      h('p', { class: 'muted' }, e.sketch_base === 'drawing'
+        ? 'Draw a rough layout with the land and sea brushes. The generator gives it natural coasts, peninsulas, gulfs and islands, and keeps each landmass’s size; another seed gives other details. “Freedom from the drawing” sets how far coasts may stray.'
+        : e.sketch_base === 'generated' ? 'Strokes paint over the continents generated from the seed.' : 'Strokes paint land exactly; coast noise only decides soft brush edges.'),
+      h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.sketch_strokes} strokes`
+        + (sm?.drawing_kept !== undefined && e.sketch_base === 'drawing' ? ` · ${Math.round(sm.drawing_kept * 100)}% of the drawn land is land` : '')),
         h('button', { class: 'small', disabled: !e.sketch_strokes && !e.pins.length && !e.arrows.length, onclick: () => confirm('Clear all sketch strokes, pins and arrows?') && mutate('clear_layer', { layer: 'sketch' }, 'sketch') }, 'Clear sketch')),
     );
   }
@@ -2334,13 +2347,19 @@ function paintPreview(d: Extract<Drag, { kind: 'stroke' }>, p: Vec3) {
   const r = S.brush.radius_km / R0;
   const sk = S.cache.get('sketch|null')?.values as Float32Array | undefined;
   const hint = S.cache.get('mountain_hint|null')?.values as Float32Array | undefined;
-  const target = tool === 'land' || tool === 'sea' ? sk : hint;
+  const land = S.cache.get('land|null')?.values as Uint8Array | undefined;
+  // Grown from the drawing: land and sea strokes change the drawing (its
+  // outline moves); the continents follow when the step runs.
+  const drawing = S.status!.edits.sketch_base === 'drawing' ? S.cache.get('drawing|null')?.values as Float32Array | undefined : undefined;
+  const target = tool === 'land' || tool === 'sea' ? drawing ?? sk : hint;
   if (!target) return;
+  const fields = { sketch: sk, land: drawing ? land : undefined, mountain_hint: hint, drawing };
   const goal = tool === 'land' ? 1 : tool === 'sea' ? -1 : tool === 'mountain' ? 1 : 0;
   const inner = Math.min(0.98, S.brush.hardness);
   const reach = d.gen ? r * (1 + S.brush.scatter) : r;
   const freq = R0 / Math.max(10, S.brush.grain_km);
   const octaves = scatterOctaves(S.brush.grain_km, g.spacing * R0);
+  const touched = new Set<number>();
   g.within(p, reach, (c, dist) => {
     const prev = d.dmin.get(c) ?? Infinity;
     if (dist >= prev) return;
@@ -2362,18 +2381,17 @@ function paintPreview(d: Extract<Drag, { kind: 'stroke' }>, p: Vec3) {
     if (!d.base.has(c)) d.base.set(c, target[c]);
     const b = d.base.get(c)!;
     target[c] = b + (goal - b) * w;
-    // Recolour the cell the way the sketch layer does.
-    const v = sk ? sk[c] : -1;
-    const land = v > 0;
-    let col = land ? [118, 160, 90] : [38, 78, 128];
-    const soft = 1 - Math.abs(v);
-    col = col.map((x) => x + soft * 25);
-    const hv = hint ? hint[c] : 0;
-    if (hv > 0.02) col = col.map((x, k) => x + ([150, 95, 60][k] - x) * Math.min(1, hv));
-    S.colors![c * 4] = col[0];
-    S.colors![c * 4 + 1] = col[1];
-    S.colors![c * 4 + 2] = col[2];
+    touched.add(c);
+    // The outline also changes on the neighbours' side.
+    if (drawing) for (const j of g.neighbors(c)) touched.add(j);
   });
+  // Recolour the cells the way the sketch layer does.
+  for (const c of touched) {
+    const col = sketchColor(g, fields, c);
+    S.colors![c * 4] = Math.min(255, col[0]);
+    S.colors![c * 4 + 1] = Math.min(255, col[1]);
+    S.colors![c * 4 + 2] = Math.min(255, col[2]);
+  }
   R.setColors(S.colors);
 }
 

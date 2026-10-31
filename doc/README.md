@@ -26,7 +26,7 @@ The design document this project is built from is [`Fantasy World Maker — Prop
 | Stage | Step | Produces |
 | --- | --- | --- |
 | 1 · Make the planet | 1 Planet parameters | Radius, tilt, day and year length, solar constant, seed |
-| | 2 Continent sketch | Land/sea mask and mountain hints from your strokes (or an automatic sketch) |
+| | 2 Continent sketch | Land/sea mask and mountain hints from your strokes, over generated continents, on an empty ocean, or as a rough drawing the generator grows continents from |
 | | 3 Plates | Plates with crust type and motion |
 | | 4 Tectonic relief | Elevation from plate boundaries, hotspots and noise; old mountains from noise; sea-floor age; stress |
 | | 5 Climate | Monthly temperature, precipitation and winds |

@@ -50,11 +50,14 @@ pub struct SketchParams {
     pub coast_scale_km: f64,
     /// Number of continents when the sketch is generated automatically (0 = noise only).
     pub auto_continents: u32,
+    /// When continents are grown from your drawing: how far, in km, the
+    /// generated coasts may stray from the drawn ones (0 = the drawing exactly).
+    pub drawing_freedom_km: f64,
 }
 
 impl Default for SketchParams {
     fn default() -> Self {
-        SketchParams { coast_roughness: 0.55, coast_scale_km: 900.0, auto_continents: 5 }
+        SketchParams { coast_roughness: 0.55, coast_scale_km: 900.0, auto_continents: 5, drawing_freedom_km: 500.0 }
     }
 }
 

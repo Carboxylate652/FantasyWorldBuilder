@@ -1501,3 +1501,94 @@ fn culture_editor_and_locks() {
     let rep = worldcore::validate::validate(&mut w);
     assert!(rep.errors.is_empty(), "{:?}", rep.errors);
 }
+
+#[test]
+fn continents_grow_from_the_drawing() {
+    use worldcore::api::{handle, ProgressState, Reply, Session};
+    use worldcore::edits::SketchBase;
+    use worldcore::fields::Field;
+    use worldcore::graph;
+    let mut p = small_params(3);
+    p.planet.grid_level = 6;
+    let draw = |w: &mut World| {
+        let st = |tool, r: f64, pts: &[[f64; 2]]| Stroke { tool, radius_km: r, hardness: 0.5, points: pts.to_vec(), ..Default::default() };
+        w.edits.add_stroke(st(Tool::Land, 1200.0, &[[40.0, -100.0], [48.0, -80.0], [30.0, -85.0]]));
+        w.edits.add_stroke(st(Tool::Sea, 450.0, &[[47.0, -92.0]]));
+        w.edits.add_stroke(st(Tool::Land, 900.0, &[[-15.0, 30.0], [-30.0, 35.0]]));
+        w.edits.add_stroke(st(Tool::Land, 500.0, &[[10.0, 150.0]]));
+    };
+    let sketch = |p: &WorldParams, base: SketchBase| {
+        let mut w = World::new(p.clone());
+        w.edits.sketch.set_base(base);
+        draw(&mut w);
+        w.run_to(Step::Sketch, &|_, _, _| {});
+        let land = match w.field("land") { Some((Field::U8(v), _, _)) => v.clone(), _ => panic!() };
+        let drawing = match w.field("drawing") { Some((Field::F32(v), _, _)) => Some(v.clone()), _ => None };
+        (w.meta(Step::Sketch).cloned().unwrap(), land, drawing)
+    };
+    let grid = Grid::new(p.planet.grid_level);
+    let area = |f: &dyn Fn(usize) -> bool| (0..grid.len()).filter(|&i| f(i)).map(|i| grid.area[i]).sum::<f64>();
+
+    let (m, land, drawing) = sketch(&p, SketchBase::Drawing);
+    let d = drawing.expect("the drawing is kept for the map");
+    assert_eq!(m["base"], "drawing");
+    let drawn_area = area(&|i| d[i] > 0.0);
+    let land_area = area(&|i| land[i] == 1);
+    assert!((land_area / drawn_area - 1.0).abs() < 0.1, "the land area is the drawn one: {land_area} vs {drawn_area}");
+    let kept = m["drawing_kept"].as_f64().unwrap();
+    let precision = m["drawing_precision"].as_f64().unwrap();
+    assert!(kept > 0.7 && precision > 0.7, "the land follows the drawing: kept {kept}, precision {precision}");
+    assert!(kept < 0.97, "the generator reshapes the coasts: kept {kept}");
+
+    // Each drawn landmass keeps about its drawn size (measured over the
+    // cells nearest to it).
+    let (comp, masses) = graph::components(&grid, |i| d[i] > 0.0);
+    assert_eq!(masses.len(), 3);
+    let src: Vec<(u32, f64, u32)> = (0..grid.len()).filter(|&i| d[i] > 0.0).map(|i| (i as u32, 0.0, comp[i])).collect();
+    let near = graph::multi_source(&grid, &src, f64::INFINITY, |_, _, _, len| Some(len));
+    for (k, mass) in masses.iter().enumerate() {
+        let want: f64 = mass.iter().map(|&c| grid.area[c as usize]).sum();
+        let got = area(&|i| near.label[i] == k as u32 && land[i] == 1);
+        assert!((got / want - 1.0).abs() < 0.3, "landmass {k} keeps its size: {got} vs {want}");
+    }
+
+    // Another seed: other coasts, the same layout.
+    let mut p2 = p.clone();
+    p2.planet.seed = 4;
+    let (m2, land2, _) = sketch(&p2, SketchBase::Drawing);
+    let differ = area(&|i| land[i] != land2[i]);
+    assert!(differ > 0.05 * drawn_area, "another seed gives other details: {differ} vs {drawn_area}");
+    assert!(m2["drawing_kept"].as_f64().unwrap() > 0.7);
+
+    // No freedom: exactly what the same strokes paint on an empty ocean.
+    let mut p0 = p.clone();
+    p0.sketch.drawing_freedom_km = 0.0;
+    let (_, exact, _) = sketch(&p0, SketchBase::Drawing);
+    let (mo, ocean, od) = sketch(&p, SketchBase::Ocean);
+    assert_eq!(exact, ocean);
+    assert!(od.is_none() && mo["drawing_kept"].is_null());
+
+    // The freedom is part of the cache key only for drawings, so other
+    // worlds keep theirs.
+    let mut e = worldcore::edits::Edits::default();
+    let mut pf = p.clone();
+    pf.sketch.drawing_freedom_km = 900.0;
+    use worldcore::stages::input_hashes;
+    assert_eq!(input_hashes(&p, &e), input_hashes(&pf, &e));
+    e.sketch.set_base(SketchBase::Drawing);
+    assert_ne!(input_hashes(&p, &e)[1], input_hashes(&pf, &e)[1]);
+    assert_eq!(input_hashes(&p, &e)[0], input_hashes(&pf, &e)[0]);
+
+    // The API switches the base, and undo switches it back.
+    let session = std::sync::Mutex::new(Session::new(p.clone()));
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(ProgressState::default()));
+    let call = |cmd: &str, args: serde_json::Value| match handle(&session, &progress, cmd, args).unwrap() {
+        Reply::Json(v) => v,
+        _ => panic!(),
+    };
+    assert_eq!(call("status", serde_json::json!({}))["edits"]["sketch_base"], "generated");
+    assert_eq!(call("set_sketch_base", serde_json::json!({ "value": "drawing" }))["edits"]["sketch_base"], "drawing");
+    assert_eq!(call("set_auto_base", serde_json::json!({ "value": false }))["edits"]["sketch_base"], "ocean");
+    assert_eq!(call("undo", serde_json::json!({}))["edits"]["sketch_base"], "drawing");
+    assert_eq!(call("undo", serde_json::json!({}))["edits"]["sketch_base"], "generated");
+}

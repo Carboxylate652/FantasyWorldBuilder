@@ -8,9 +8,12 @@ Stage 4 has its own document: [nations.md](nations.md). Parameter names below ar
 Radius (default 6,371 km), axial tilt (23.4°), day and year length, orbital eccentricity and perihelion, solar constant (1,361 W/m²), greenhouse strength, target ocean fraction, seed and grid level (6 preview · 7 fast · **8 default** · 9 high detail).
 
 ### 2. Continent sketch (`stages/sketch.rs`)
-- **Input:** your strokes (*Land*, *Sea*, *Mountains here*, *Erase hint*, and the scatter brushes), or, with no strokes, an automatic sketch of *Auto continents* blobs aiming at the target ocean fraction.
+- **Input:** your strokes (*Land*, *Sea*, *Mountains here*, *Erase hint*, and the scatter brushes) on one of three bases (*Start from*):
+  - **Generated continents** (default): *Generated continents* blobs plus domain-warped noise, thresholded at the target ocean fraction; strokes paint over them.
+  - **Empty ocean:** strokes paint land exactly; coast noise only decides soft brush edges.
+  - **My drawing (procedural):** land and sea strokes are a rough layout. The drawn coast (where the painted value changes sign) becomes a signed distance in units of *Freedom from the drawing* (capped at three freedoms); seeded domain-warped noise with features about six freedoms across down to a few cells (amplitude 3.5 freedoms per unit noise, so coasts shift by about half the freedom) and the coastline noise (*Coast roughness*, *Coast feature size*) are added. Each drawn landmass then gets an offset so the cells nearest to it hold as much land as was drawn for it (offsets blend to half and half across the borders between landmasses' areas, so there are no seams), and a final threshold matches the total drawn land area. Freedom 0 (below half a cell) gives the drawing exactly. The meta reports `drawn_land_fraction`, `drawing_kept` (share of drawn land that is land) and `drawing_precision` (share of land that was drawn).
 - **Scatter brushes** break a stroke's edge with seeded fractal noise (*Scatter* amount, *Grain* size): ragged coasts, bays, fjords and offshore islands up to one radius beyond the rim. The UI preview uses the same noise as the core.
-- **Output fields:** `sketch` (soft land value), `land`, `mountain_hint`.
+- **Output fields:** `sketch` (soft land value), `land`, `mountain_hint`, and `drawing` (the painted layout) when starting from a drawing.
 
 ### 3. Plates (`stages/plates.rs`)
 - Continental plates are seeded inside landmasses, oceanic plates fill the oceans; all grow by a noisy weighted flood fill. Some continental plates take adjacent ocean (passive margins), others stop at the coast (active margins). Minor plates form along major boundaries.

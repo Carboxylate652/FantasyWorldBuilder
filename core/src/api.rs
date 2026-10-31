@@ -1,7 +1,7 @@
 //! Command interface shared by the Tauri app and the headless HTTP server.
 //! Every command takes JSON arguments and returns either JSON or raw bytes.
 
-use crate::edits::{EditLayer, Edits, Imports, MotionArrow, PlatePin, Sketch, Stroke};
+use crate::edits::{EditLayer, Edits, Imports, MotionArrow, PlatePin, Sketch, SketchBase, Stroke};
 use crate::export::{export, ExportOptions};
 use crate::fields::Field;
 use crate::params::WorldParams;
@@ -44,7 +44,8 @@ enum EditHistory {
     Layers(Vec<(EditLayer, LayerState)>),
     Pins(Vec<PlatePin>),
     Arrows(Vec<MotionArrow>),
-    AutoBase(bool),
+    /// The sketch base: (auto_base, from_drawing).
+    AutoBase(bool, bool),
     Imports(Imports),
 }
 
@@ -96,7 +97,7 @@ impl EditHistory {
             }
             EditHistory::Pins(mut saved) => { std::mem::swap(&mut saved, &mut edits.sketch.pins); EditHistory::Pins(saved) }
             EditHistory::Arrows(mut saved) => { std::mem::swap(&mut saved, &mut edits.sketch.arrows); EditHistory::Arrows(saved) }
-            EditHistory::AutoBase(saved) => EditHistory::AutoBase(std::mem::replace(&mut edits.sketch.auto_base, saved)),
+            EditHistory::AutoBase(a, d) => EditHistory::AutoBase(std::mem::replace(&mut edits.sketch.auto_base, a), std::mem::replace(&mut edits.sketch.from_drawing, d)),
             EditHistory::Imports(mut saved) => { std::mem::swap(&mut saved, &mut edits.imports); EditHistory::Imports(saved) }
         }
     }
@@ -320,6 +321,7 @@ impl Session {
             "params": self.world.params,
             "edits": {
                 "auto_base": e.sketch.auto_base,
+                "sketch_base": e.sketch.base(),
                 "sketch_strokes": e.sketch.strokes.len(),
                 "pins": e.sketch.pins,
                 "arrows": e.sketch.arrows,
@@ -680,11 +682,18 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             st["imported"] = json!(taken.iter().map(|(l, n)| json!({ "layer": l.key(), "edits": n })).collect::<Vec<_>>());
             Ok(Reply::Json(st))
         }
-        "set_auto_base" => {
-            let v: bool = arg(&args, "value")?;
-            if v != s.world.edits.sketch.auto_base {
-                s.remember(EditHistory::AutoBase(s.world.edits.sketch.auto_base));
-                s.world.edits.sketch.auto_base = v;
+        "set_auto_base" | "set_sketch_base" => {
+            // set_auto_base { value: bool }: generated continents or an empty ocean.
+            // set_sketch_base { value: "generated" | "ocean" | "drawing" }.
+            let b = if cmd == "set_auto_base" {
+                if arg::<bool>(&args, "value")? { SketchBase::Generated } else { SketchBase::Ocean }
+            } else {
+                arg::<SketchBase>(&args, "value")?
+            };
+            let sk = &s.world.edits.sketch;
+            if b != sk.base() {
+                s.remember(EditHistory::AutoBase(sk.auto_base, sk.from_drawing));
+                s.world.edits.sketch.set_base(b);
             }
             Ok(Reply::Json(s.status()))
         }

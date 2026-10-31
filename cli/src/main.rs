@@ -37,6 +37,11 @@ USAGE:
   worldgen overrides <project-dir> prune     remove every edit that no longer applies
   worldgen overrides <project-dir> export <file> [--layers a,b]
   worldgen overrides <project-dir> import <file> [--layers a,b] [--replace]
+  worldgen sketch-base <project-dir> generated|drawing|ocean [--freedom KM] [--run]
+                                             what the continent sketch starts from: continents from
+                                             the seed, continents grown from the land/sea strokes
+                                             (a rough drawing; --freedom: how far coasts may stray),
+                                             or an empty ocean painted exactly
   worldgen edit <project-dir> --tool TOOL --at LAT,LON[;LAT,LON...] [--value V] [--radius KM]
                 [--strength S] [--hardness H] [--name NAME] [--run]
                                              add one override stroke (tools as in the app:
@@ -162,7 +167,10 @@ fn summary(w: &World) {
         }
         let extra = match st.key {
             "planet" => format!("{} cells, {:.0} km spacing", m["cells"], m["spacing_km"].as_f64().unwrap_or(0.0)),
-            "sketch" => format!("land {:.1}%", m["land_fraction"].as_f64().unwrap_or(0.0) * 100.0),
+            "sketch" => match m["drawing_kept"].as_f64() {
+                Some(k) => format!("land {:.1}%, grown from the drawing ({:.0}% of the drawn land is land)", m["land_fraction"].as_f64().unwrap_or(0.0) * 100.0, k * 100.0),
+                None => format!("land {:.1}%", m["land_fraction"].as_f64().unwrap_or(0.0) * 100.0),
+            },
             "plates" => format!("{} plates ({} continental), {} landmasses", m["plate_count"], m["continental_plates"], m["landmasses"]),
             "relief" => format!("elevation {:.0}..{:.0} m", m["min_elevation_m"].as_f64().unwrap_or(0.0), m["max_elevation_m"].as_f64().unwrap_or(0.0)),
             "climate" => format!("global mean {:.1} °C, {:.0} mm/yr", m["global_mean_temp_c"].as_f64().unwrap_or(0.0), m["global_precip_mm"].as_f64().unwrap_or(0.0)),
@@ -381,6 +389,7 @@ fn main() {
         }
         "overrides" => overrides(&args),
         "edit" => edit(&args),
+        "sketch-base" => sketch_base(&args),
         "version" => println!("worldgen {}", fwm_update::current_version()),
         "guide" => guide(&args),
         "directive" => {
@@ -669,6 +678,33 @@ fn edit(args: &Args) {
         w.edits.add_stroke(st);
     }
     println!("added a {} edit to layer {} ({} edits)", args.get("tool").unwrap_or(""), layer.key(), w.edits.count(layer));
+    if args.flag("run") {
+        run_world(&mut w, LAST);
+        summary(&w);
+    }
+    w.save(&dir).unwrap_or_else(|e| die(&e.to_string()));
+}
+
+/// `worldgen sketch-base`: what the continent sketch starts from.
+fn sketch_base(args: &Args) {
+    let dir = PathBuf::from(args.pos.get(1).unwrap_or_else(|| die("missing project dir")));
+    let base: worldcore::edits::SketchBase = serde_json::from_value(serde_json::json!(args.pos.get(2).unwrap_or_else(|| die("missing base: generated, drawing or ocean"))))
+        .unwrap_or_else(|_| die("the base is generated, drawing or ocean"));
+    let mut w = World::load(&dir).unwrap_or_else(|e| die(&e));
+    w.edits.sketch.set_base(base);
+    if args.get("freedom").is_some() {
+        w.params.sketch.drawing_freedom_km = args.num("freedom", w.params.sketch.drawing_freedom_km).max(0.0);
+    }
+    println!(
+        "the continent sketch starts from {} ({} sketch strokes{})",
+        match base {
+            worldcore::edits::SketchBase::Generated => "continents generated from the seed",
+            worldcore::edits::SketchBase::Drawing => "the drawing",
+            worldcore::edits::SketchBase::Ocean => "an empty ocean",
+        },
+        w.edits.sketch.strokes.len(),
+        if base == worldcore::edits::SketchBase::Drawing { format!(", freedom {} km", w.params.sketch.drawing_freedom_km) } else { String::new() }
+    );
     if args.flag("run") {
         run_world(&mut w, LAST);
         summary(&w);

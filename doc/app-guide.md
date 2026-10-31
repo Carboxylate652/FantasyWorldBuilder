@@ -19,7 +19,7 @@ Changing a parameter marks that step and the later ones as stale; *Auto-update* 
 | Step | Tool (shortcut) | What it does |
 | --- | --- | --- |
 | any | Navigate (V) | Drag to rotate or pan, scroll to zoom; right-drag navigates with any tool |
-| Sketch | Land (L), Sea (S) | Paint land or sea with a soft brush |
+| Sketch | Land (L), Sea (S) | Paint land or sea with a soft brush; with *Start from: My drawing*, a rough layout the generated continents follow |
 | | Mountains here (M), Erase hint | Mountain hint strokes raise ridged relief |
 | | Scatter land (N), Scatter sea, Scatter mountains | The same with a fractal edge (*Scatter* amount, *Grain* size): ragged coasts, fjords, offshore islands |
 | Plates | Plate pin (P), Motion arrow (A), Plate paint | Force a plate seed, set a plate's motion by dragging, reassign cells |
@@ -40,6 +40,8 @@ Changing a parameter marks that step and the later ones as stale; *Auto-update* 
 **Map editor** (*Edit map*, any step): Merge provinces (U), Merge states (drag from the one absorbed onto the absorber, even across a strait), Province → state, Grow province / Grow state, Rename province / Rename state, Paint goods (Q: a trade good, cash crop or deposit, before the culture simulation), and the culture editor's Merge cultures, Paint culture, Split by line, Rename culture and Lock / unlock.
 
 **Shortcuts:** `Ctrl+Z` / `Ctrl+Y` undo/redo, `Ctrl+S` save, `[` `]` brush size, `G` / `F` globe / flat.
+
+**Continents from a drawing:** in the Continent sketch card, set *Start from* to *My drawing (procedural)* and paint a rough layout with *Land* and *Sea* (a big brush is fine; a sea stroke carves a gulf or strait). With *Auto-update* on, each stroke grows natural continents from the drawing at once: coasts with peninsulas, gulfs and islands, each landmass about as large as drawn. The drawing stays outlined in yellow on the Sketch layer. *Freedom from the drawing* sets how far coasts may stray (0 = exactly the drawing); a new seed gives other coasts on the same layout. The other bases are *Generated continents* (from the seed; strokes paint over them) and *Empty ocean* (strokes paint land exactly).
 
 ## Map layers
 

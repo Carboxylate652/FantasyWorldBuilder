@@ -229,7 +229,20 @@ pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 3, 2, 6, 7, 2, 6, 4, 7, 6, 7];
 pub fn input_hashes(p: &WorldParams, e: &Edits) -> [u64; N_STEPS] {
     let pl = &p.planet;
     let h0 = hash::json(&("planet", pl.seed, pl.grid_level, pl.radius_km));
-    let h1 = hash::combine(h0, hash::json(&("sketch", &p.sketch, pl.ocean_fraction, e.sketch.auto_base, &e.sketch.strokes)));
+    // The drawing base and its freedom are hashed only when in use, so other
+    // worlds keep their cache keys (the key struct serializes like the
+    // sketch parameters did before the freedom was added).
+    #[derive(Serialize)]
+    struct SketchKey {
+        coast_roughness: f64,
+        coast_scale_km: f64,
+        auto_continents: u32,
+    }
+    let sk = SketchKey { coast_roughness: p.sketch.coast_roughness, coast_scale_km: p.sketch.coast_scale_km, auto_continents: p.sketch.auto_continents };
+    let mut h1 = hash::combine(h0, hash::json(&("sketch", &sk, pl.ocean_fraction, e.sketch.auto_base, &e.sketch.strokes)));
+    if e.sketch.from_drawing {
+        h1 = hash::combine(h1, hash::json(&("drawing", p.sketch.drawing_freedom_km)));
+    }
     let h2 = hash::combine(h1, hash::json(&("plates", &p.plates, &e.sketch.pins, &e.sketch.arrows, &e.overrides.plates)));
     let h3 = hash::combine(h2, hash::json(&("relief", &p.tectonics, &e.overrides.elevation, &e.imports.elevation)));
     let h4 = hash::combine(

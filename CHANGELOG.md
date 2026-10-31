@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Continents from your drawing, in one step.
+
+- **Start from: My drawing (procedural)** in the Continent sketch card, beside *Generated continents* (from the seed) and *Empty ocean* (exact paint). Land and sea strokes become a rough layout that the continent generator follows: the drawn coasts are softened by distance, seeded noise adds peninsulas, gulfs, bays and offshore islands, and each drawn landmass keeps its drawn area. No more trying seed after seed for continents in the right places: draw them, and another seed gives other coasts on the same layout.
+- **Freedom from the drawing (km)** (default 500) sets how far coasts may stray from the drawn ones; 0 gives the drawing exactly, as on an empty ocean. *Coast roughness* and *Coast feature size* shape the small bays and islets, as on generated continents.
+- The sketch layer outlines your drawing in yellow over the result, and the outline follows the brush while you paint; the card shows how much of the drawn land became land (about 75–85% at the default freedom).
+- `set_sketch_base` (`generated`, `drawing` or `ocean`) in the API, `worldgen sketch-base <dir> generated|drawing|ocean [--freedom KM] [--run]` on the command line. Other worlds keep their results: the new setting only enters the cache key of worlds that start from a drawing.
+
 Rivers run between cells, like Civilization V's.
 
 - **Rivers along cell edges:** water still flows from cell to cell, but each river's line now runs along the boundaries between cells, from corner to corner. A river is the line between the two cells on its banks, both of which count as riverside (water, floodplains, harbours).

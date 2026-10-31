@@ -25,6 +25,7 @@ Every parameter of the twelve steps, with its default and meaning. This file is 
 | `coast_roughness` | Coast roughness (0–1.5) | `0.55` | Amplitude of coastline noise added to soft sketch edges (0 = exact brush edges). |
 | `coast_scale_km` | Coast feature size (km) (100–3000) | `900.0` | Feature scale of the coastline noise, in km. |
 | `auto_continents` | Generated continents (0–12) | `5` | Number of continents when the sketch is generated automatically (0 = noise only). |
+| `drawing_freedom_km` | Freedom from the drawing (km) (0–2000) | `500.0` | When continents are grown from your drawing: how far, in km, the generated coasts may stray from the drawn ones (0 = the drawing exactly). |
 
 ## Plates (step 3)
 

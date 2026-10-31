@@ -135,14 +135,15 @@ export const STEPS: StepUI[] = [
       p('planet', 'perihelion_deg', 'Perihelion longitude (°)', 0, 360, 1),
       p('planet', 'solar_constant', 'Solar constant (W/m²)', 600, 2500, 1),
       p('planet', 'greenhouse', 'Greenhouse strength', 0.1, 8, 0.05, '1 = Earth. Each doubling adds about 30 W/m² of forcing.'),
-      p('planet', 'ocean_fraction', 'Target ocean fraction', 0.05, 0.95, 0.01, 'Used when continents are generated automatically.'),
+      p('planet', 'ocean_fraction', 'Target ocean fraction', 0.05, 0.95, 0.01, 'Used when continents are generated from the seed. Grown from a drawing, they keep the drawn land area.'),
     ],
   },
   {
     key: 'sketch', title: 'Continent sketch', layer: 'sketch', tools: ['land', 'sea', 'scatter_land', 'scatter_sea', 'mountain', 'scatter_mountain', 'erase_hint'],
-    blurb: 'Paint where the land is. Soft brush edges let coastline noise decide the exact shore.',
+    blurb: 'Paint where the land is, over generated continents, on an empty ocean, or as a rough drawing the generator turns into continents.',
     params: [
-      p('sketch', 'auto_continents', 'Generated continents', 0, 12, 1, 'Only used when “Start from generated continents” is on.'),
+      p('sketch', 'auto_continents', 'Generated continents', 0, 12, 1, 'Only used when starting from generated continents.'),
+      p('sketch', 'drawing_freedom_km', 'Freedom from the drawing (km)', 0, 2000, 10, 'Only used when starting from your drawing: how far generated coasts may stray from the drawn ones. 0 = the drawing exactly.'),
       p('sketch', 'coast_roughness', 'Coast roughness', 0, 1.5, 0.05),
       p('sketch', 'coast_scale_km', 'Coast feature size (km)', 100, 3000, 10),
     ],
