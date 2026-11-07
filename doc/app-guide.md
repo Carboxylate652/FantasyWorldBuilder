@@ -5,7 +5,7 @@ The desktop app (Tauri) and the browser UI (`worldgen serve --static app/dist`, 
 ## Layout
 
 - **Top bar:** New, Open…, Save, Save as…, Export…, Undo/Redo, Globe / Flat map, map layer, month (for monthly layers), *Overrides* (with the number of edits), *Edit map*, stage buttons *Stage 1*–*Stage 4* (a check mark when done), *Next: Stage N* / *Generate all*, and the version button (update settings).
-- **Second row:** overlays — Rivers, Borders, Wind, Plate motion, Pins — and globe relief exaggeration.
+- **Second row:** overlays — Rivers, Borders, Wind, Plate motion, Pins, Latitudes — and globe relief exaggeration. *Latitudes* draws reference lines on the globe and the flat map: the equator (solid) and 30° and 60° north and south (dashed), under every other overlay; it is on by default and the choice is remembered.
 - **Left panel:** the twelve step cards in four stages. Each card has its parameters, a *Run to step N* button and a status (done, stale, not run) with its run time. Opening a card switches to its map layer and its tools.
 - **Tool box** (over the map): the open step's tools, the brush size and the tool's value.
 - **Step-by-step panel** (over the map, Cultures and Nations cards): see [steering.md](steering.md). In Stage 4 it shows the current time and step length, stops before an institution is born to let you pick its birthplace among the gold-starred candidates (or *Let chance decide*; uncheck *Ask me where institutions are born* to let chance always decide), and lists institutions, empires and tags in the World tab.

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Latitude lines:** the globe and the flat map mark the equator (solid) and 30° and 60° north and south (dashed) for reference, under rivers, borders and the other overlays. The *Latitudes* toggle in the overlay row turns them off (remembered).
+
 Continents from your drawing, in one step.
 
 - **Start from: My drawing (procedural)** in the Continent sketch card, beside *Generated continents* (from the seed) and *Empty ocean* (exact paint). Land and sea strokes become a rough layout that the continent generator follows: the drawn coasts are softened by distance, seeded noise adds peninsulas, gulfs, bays and offshore islands, and each drawn landmass keeps its drawn area. No more trying seed after seed for continents in the right places: draw them, and another seed gives other coasts on the same layout.

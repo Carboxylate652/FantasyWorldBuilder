@@ -59,7 +59,11 @@ const S = {
   /** Version of this build and the last update check. */
   version: '',
   update: null as UpdateCheck | null,
-  overlays: { rivers: true, wind: false, motion: false, edits: true, borders: false },
+  overlays: {
+    rivers: true, wind: false, motion: false, edits: true, borders: false,
+    /** Reference latitudes (remembered between sessions). */
+    latitudes: (() => { try { return localStorage.getItem('fwm.latitudes') !== '0'; } catch { return true; } })(),
+  },
   political: null as Political | null,
   exag: 0,
   autoRun: true,
@@ -278,10 +282,49 @@ function arrow(L: Lines, p: Vec3, de: number, dn: number, col: [number, number, 
   }
 }
 
+/** Reference latitudes: the equator (solid) and 30° and 60° north and south (dashed). */
+const LATITUDES_DEG = [0, 30, -30, 60, -60];
+
+function drawLatitudes(elev: ArrayLike<number> | undefined) {
+  if (!S.overlays.latitudes || !S.grid) {
+    R.setGraticule(null, null);
+    return;
+  }
+  const g = S.grid;
+  const R0 = S.status!.params.planet.radius_km * 1000;
+  let hint: number | undefined;
+  // With relief exaggeration on the globe, keep the line above the raised land around it.
+  const lift = (p: Vec3) => {
+    if (!elev || S.exag <= 0) return 0;
+    const c = g.nearest(p, hint);
+    hint = c;
+    let m = Math.max(0, elev[c]);
+    for (const j of g.neighbors(c)) m = Math.max(m, elev[j]);
+    return (S.exag * m) / R0;
+  };
+  const L = new Lines();
+  const step = 0.5; // degrees of longitude per segment
+  for (const lat of LATITUDES_DEG) {
+    const equator = lat === 0;
+    const col: [number, number, number, number] = equator ? [1, 1, 1, 0.6] : [1, 1, 1, 0.42];
+    for (let lon = -180; lon < 180; lon += step) {
+      // Dashes of 3° with 2° gaps, except on the equator.
+      if (!equator && (lon + 180) % 5 >= 3) continue;
+      const a = fromLatLon((lat * Math.PI) / 180, (lon * Math.PI) / 180);
+      const b = fromLatLon((lat * Math.PI) / 180, ((lon + step) * Math.PI) / 180);
+      L.seg(a, b, col, 0.0018, lift(a), lift(b));
+    }
+  }
+  const [gl3, fl] = L.sets();
+  R.setGraticule(gl3, fl);
+}
+
 async function refreshOverlays() {
   const g = S.grid!;
   const exagLift = (i: number, elev: ArrayLike<number> | undefined) =>
     elev && S.exag > 0 ? (S.exag * Math.max(0, elev[i])) / (S.status!.params.planet.radius_km * 1000) : 0;
+
+  drawLatitudes(S.overlays.latitudes && S.exag > 0 ? (await getField('elevation'))?.values : undefined);
 
   // Rivers run along cell edges, from cell corner to cell corner (where the
   // borders are drawn), as ribbons whose on-screen width follows the real
@@ -719,9 +762,10 @@ function renderTopbar() {
     S.month = v === '' ? null : Number(v);
     refreshLayer();
   } }, h('option', { value: '', selected: S.month === null }, 'Annual'), ...MONTHS.map((m, i) => h('option', { value: i, selected: S.month === i }, m)));
-  const ov = (key: keyof typeof S.overlays, label: string) =>
-    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: S.overlays[key], onchange: (e: Event) => {
+  const ov = (key: keyof typeof S.overlays, label: string, title?: string) =>
+    h('label', { class: 'check', title: title ?? '' }, h('input', { type: 'checkbox', checked: S.overlays[key], onchange: (e: Event) => {
       S.overlays[key] = (e.target as HTMLInputElement).checked;
+      if (key === 'latitudes') try { localStorage.setItem('fwm.latitudes', S.overlays.latitudes ? '1' : '0'); } catch { /* ignore */ }
       renderTopbar();
       refreshOverlays();
     } }), label);
@@ -737,6 +781,7 @@ function renderTopbar() {
       btn('Flat map', () => setView(1), { class: R.mode === 1 ? 'on' : '' })),
     h('div', { class: 'group' }, layerSel, monthSel),
     h('div', { class: 'group' }, ov('rivers', 'Rivers'), ov('borders', 'Borders'), ov('wind', 'Wind'), ov('motion', 'Plate motion'), ov('edits', 'Pins'),
+      ov('latitudes', 'Latitudes', 'Reference lines: the equator (solid) and 30° and 60° north and south (dashed)'),
       h('label', { class: 'check', title: 'Relief exaggeration on the globe' }, 'Relief',
         h('input', { type: 'range', min: 0, max: 40, step: 1, value: S.exag, oninput: (e: Event) => { S.exag = Number((e.target as HTMLInputElement).value); refreshLayer(); } }))),
     h('div', { class: 'spacer' }),
