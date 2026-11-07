@@ -1,7 +1,7 @@
 import './style.css';
 import * as api from './api';
 import { Grid, angle, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
-import { BOUNDARY, DEPOSITS, ERA_NAMES, INSTITUTION_NAMES, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, stateColor, type LayerId, type Legend } from './layers';
+import { BOUNDARY, DEPOSITS, ERA_NAMES, INSTITUTION_NAMES, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, sketchColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
 import { EDITOR_TOOLS, LIVE_STEPS, STAGE2_START, STAGE3_START, STAGE4_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
@@ -23,10 +23,11 @@ type Status = {
   steps: StepStatus[];
   params: any;
   edits: {
-    elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_strokes: number; pins: any[]; arrows: any[];
+    elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_base: 'generated' | 'ocean' | 'drawing'; sketch_strokes: number; pins: any[]; arrows: any[];
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
     site_pins: number; sites: { lat: number; lon: number; population: number }[];
     fertility_strokes: number; attraction_strokes: number; band_pins: { lat: number; lon: number; bands: number }[];
+    culture_edits?: number;
     nation_seeds?: { lat: number; lon: number; size: number; name: string }[];
   };
   grid: { level: number; cells: number; spacing_km: number };
@@ -58,7 +59,11 @@ const S = {
   /** Version of this build and the last update check. */
   version: '',
   update: null as UpdateCheck | null,
-  overlays: { rivers: true, wind: false, motion: false, edits: true, borders: false },
+  overlays: {
+    rivers: true, wind: false, motion: false, edits: true, borders: false,
+    /** Reference latitudes (remembered between sessions). */
+    latitudes: (() => { try { return localStorage.getItem('fwm.latitudes') !== '0'; } catch { return true; } })(),
+  },
   political: null as Political | null,
   exag: 0,
   autoRun: true,
@@ -184,6 +189,8 @@ async function refreshLayer() {
   let stale = false;
   let missing = false;
   for (const name of def.fields) {
+    // The drawing outline belongs to worlds grown from a drawing only.
+    if (name === 'drawing' && S.status!.edits.sketch_base !== 'drawing') continue;
     const d = await getField(name, def.monthly && ['temp', 'precip', 'wind_u', 'wind_v'].includes(name) ? S.month : null);
     if (d) {
       f[name] = d.values;
@@ -275,39 +282,77 @@ function arrow(L: Lines, p: Vec3, de: number, dn: number, col: [number, number, 
   }
 }
 
+/** Reference latitudes: the equator (solid) and 30° and 60° north and south (dashed). */
+const LATITUDES_DEG = [0, 30, -30, 60, -60];
+
+function drawLatitudes(elev: ArrayLike<number> | undefined) {
+  if (!S.overlays.latitudes || !S.grid) {
+    R.setGraticule(null, null);
+    return;
+  }
+  const g = S.grid;
+  const R0 = S.status!.params.planet.radius_km * 1000;
+  let hint: number | undefined;
+  // With relief exaggeration on the globe, keep the line above the raised land around it.
+  const lift = (p: Vec3) => {
+    if (!elev || S.exag <= 0) return 0;
+    const c = g.nearest(p, hint);
+    hint = c;
+    let m = Math.max(0, elev[c]);
+    for (const j of g.neighbors(c)) m = Math.max(m, elev[j]);
+    return (S.exag * m) / R0;
+  };
+  const L = new Lines();
+  const step = 0.5; // degrees of longitude per segment
+  for (const lat of LATITUDES_DEG) {
+    const equator = lat === 0;
+    const col: [number, number, number, number] = equator ? [1, 1, 1, 0.6] : [1, 1, 1, 0.42];
+    for (let lon = -180; lon < 180; lon += step) {
+      // Dashes of 3° with 2° gaps, except on the equator.
+      if (!equator && (lon + 180) % 5 >= 3) continue;
+      const a = fromLatLon((lat * Math.PI) / 180, (lon * Math.PI) / 180);
+      const b = fromLatLon((lat * Math.PI) / 180, ((lon + step) * Math.PI) / 180);
+      L.seg(a, b, col, 0.0018, lift(a), lift(b));
+    }
+  }
+  const [gl3, fl] = L.sets();
+  R.setGraticule(gl3, fl);
+}
+
 async function refreshOverlays() {
   const g = S.grid!;
   const exagLift = (i: number, elev: ArrayLike<number> | undefined) =>
     elev && S.exag > 0 ? (S.exag * Math.max(0, elev[i])) / (S.status!.params.planet.radius_km * 1000) : 0;
 
-  // Rivers as ribbons whose on-screen width follows the real bankfull width
-  // (log scale: ~0.8 px for a 60 m stream, ~5 px for a 2 km great river).
-  const width = S.overlays.rivers ? await getField('river_width') : null;
-  const recv = width ? await getField('receiver') : null;
-  if (width && recv && !width.stale) {
-    const elev = (await getField('elevation'))?.values;
-    const wv = width.values, rc = recv.values;
+  drawLatitudes(S.overlays.latitudes && S.exag > 0 ? (await getField('elevation'))?.values : undefined);
+
+  // Rivers run along cell edges, from cell corner to cell corner (where the
+  // borders are drawn), as ribbons whose on-screen width follows the real
+  // bankfull width (log scale: ~0.8 px for a 60 m stream, ~5 px for a 2 km great river).
+  const width = S.overlays.rivers ? await getField('river_seg_width') : null;
+  const to = width ? await getField('river_to') : null;
+  const elevF = width || S.layer === 'barrier' ? (await getField('elevation'))?.values : undefined;
+  if (width && to && !width.stale) {
+    const wv = width.values, tv = to.values;
     const segs: number[] = [];
-    for (let i = 0; i < g.n; i++) if (wv[i] > 0 && rc[i] >= 0) segs.push(i);
-    const mk = (): RibbonSet => ({ a: new Float32Array(segs.length * 3), b: new Float32Array(segs.length * 3), width: new Float32Array(segs.length), color: new Float32Array(segs.length * 4), count: segs.length });
-    const gl3 = mk(), fl = mk();
-    segs.forEach((i, k) => {
-      const r = rc[i];
-      const t = Math.min(1, Math.max(0, Math.log(wv[i] / 60) / Math.log(2000 / 60)));
-      const px = 0.8 + 4.2 * t;
-      const col = [0.32 - 0.22 * t, 0.58 - 0.3 * t, 0.95 - 0.15 * t, 0.85 + 0.15 * t];
-      const pa = surface(g.p(i), 0.0025 + exagLift(i, elev)), pb = surface(g.p(r), 0.0025 + exagLift(r, elev));
-      gl3.a.set(pa, k * 3); gl3.b.set(pb, k * 3);
-      const [la, loa] = toLatLon(g.p(i));
-      let [lb, lob] = toLatLon(g.p(r));
-      if (lob - loa > Math.PI) lob -= 2 * Math.PI;
-      if (lob - loa < -Math.PI) lob += 2 * Math.PI;
-      fl.a.set([loa, la, 0], k * 3); fl.b.set([lob, lb, 0], k * 3);
-      gl3.width[k] = fl.width[k] = px;
-      gl3.color.set(col, k * 4); fl.color.set(col, k * 4);
+    for (let t = 0; t < g.t; t++) if (wv[t] > 0 && tv[t] >= 0) segs.push(t);
+    const [gl3, fl] = cornerRibbons(g, segs, tv, elevF, (t) => {
+      const k = Math.min(1, Math.max(0, Math.log(wv[t] / 60) / Math.log(2000 / 60)));
+      return [0.8 + 4.2 * k, [0.32 - 0.22 * k, 0.58 - 0.3 * k, 0.95 - 0.15 * k, 0.85 + 0.15 * k]];
     });
     R.setRibbons('rivers', gl3, fl);
   } else R.setRibbons('rivers', null, null);
+
+  // On the barrier layer: border rivers (red) and backbone rivers (green) on their edges.
+  const roles = S.layer === 'barrier' ? await getField('river_seg_role') : null;
+  const rto = roles ? await getField('river_to') : null;
+  if (roles && rto && !roles.stale) {
+    const rv = roles.values, tv = rto.values;
+    const segs: number[] = [];
+    for (let t = 0; t < g.t; t++) if (rv[t] > 0 && tv[t] >= 0) segs.push(t);
+    const [gl3, fl] = cornerRibbons(g, segs, tv, elevF, (t) => [7, rv[t] === 1 ? [0.92, 0.24, 0.2, 1] : [0.24, 0.82, 0.47, 1]]);
+    R.setRibbons('river_roles', gl3, fl);
+  } else R.setRibbons('river_roles', null, null);
 
   // Winds (sampled on the first 2,562 cells = the level-4 sub-grid)
   if (S.overlays.wind) {
@@ -456,6 +501,41 @@ async function drawTransportIcons() {
     const [a, b] = L.sets();
     R.setOverlay('transport', a, b);
   } else R.setOverlay('transport', null, null);
+}
+
+/** Position of cell corner t (the centroid of its triangle, as the renderer draws it). */
+function cornerPos(g: Grid, t: number): Vec3 {
+  const [p, q, r] = [g.p(g.tris[t * 3]), g.p(g.tris[t * 3 + 1]), g.p(g.tris[t * 3 + 2])];
+  const s: Vec3 = [p[0] + q[0] + r[0], p[1] + q[1] + r[1], p[2] + q[2] + r[2]];
+  const l = Math.hypot(...s);
+  return [s[0] / l, s[1] / l, s[2] / l];
+}
+
+/** Globe and flat ribbons for river segments from corner t to corner to[t];
+ *  `style` gives each segment's width (px) and colour. */
+function cornerRibbons(g: Grid, segs: number[], to: ArrayLike<number>, elev: ArrayLike<number> | undefined, style: (t: number) => [number, number[]]): [RibbonSet, RibbonSet] {
+  const mk = (): RibbonSet => ({ a: new Float32Array(segs.length * 3), b: new Float32Array(segs.length * 3), width: new Float32Array(segs.length), color: new Float32Array(segs.length * 4), count: segs.length });
+  const gl3 = mk(), fl = mk();
+  const R0 = S.status!.params.planet.radius_km * 1000;
+  const lift = (t: number) => {
+    if (!elev || S.exag <= 0) return 0.0025;
+    const e = (Math.max(0, elev[g.tris[t * 3]]) + Math.max(0, elev[g.tris[t * 3 + 1]]) + Math.max(0, elev[g.tris[t * 3 + 2]])) / 3;
+    return 0.0025 + (S.exag * e) / R0;
+  };
+  segs.forEach((t, k) => {
+    const u = to[t];
+    const [px, col] = style(t);
+    const ca = cornerPos(g, t), cb = cornerPos(g, u);
+    gl3.a.set(surface(ca, lift(t)), k * 3); gl3.b.set(surface(cb, lift(u)), k * 3);
+    const [la, loa] = toLatLon(ca);
+    let [lb, lob] = toLatLon(cb);
+    if (lob - loa > Math.PI) lob -= 2 * Math.PI;
+    if (lob - loa < -Math.PI) lob += 2 * Math.PI;
+    fl.a.set([loa, la, 0], k * 3); fl.b.set([lob, lb, 0], k * 3);
+    gl3.width[k] = fl.width[k] = px;
+    gl3.color.set(col, k * 4); fl.color.set(col, k * 4);
+  });
+  return [gl3, fl];
 }
 
 /** Cell-edge segments between neighbouring cells whose values differ (and pass `keep`):
@@ -682,9 +762,10 @@ function renderTopbar() {
     S.month = v === '' ? null : Number(v);
     refreshLayer();
   } }, h('option', { value: '', selected: S.month === null }, 'Annual'), ...MONTHS.map((m, i) => h('option', { value: i, selected: S.month === i }, m)));
-  const ov = (key: keyof typeof S.overlays, label: string) =>
-    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: S.overlays[key], onchange: (e: Event) => {
+  const ov = (key: keyof typeof S.overlays, label: string, title?: string) =>
+    h('label', { class: 'check', title: title ?? '' }, h('input', { type: 'checkbox', checked: S.overlays[key], onchange: (e: Event) => {
       S.overlays[key] = (e.target as HTMLInputElement).checked;
+      if (key === 'latitudes') try { localStorage.setItem('fwm.latitudes', S.overlays.latitudes ? '1' : '0'); } catch { /* ignore */ }
       renderTopbar();
       refreshOverlays();
     } }), label);
@@ -700,6 +781,7 @@ function renderTopbar() {
       btn('Flat map', () => setView(1), { class: R.mode === 1 ? 'on' : '' })),
     h('div', { class: 'group' }, layerSel, monthSel),
     h('div', { class: 'group' }, ov('rivers', 'Rivers'), ov('borders', 'Borders'), ov('wind', 'Wind'), ov('motion', 'Plate motion'), ov('edits', 'Pins'),
+      ov('latitudes', 'Latitudes', 'Reference lines: the equator (solid) and 30° and 60° north and south (dashed)'),
       h('label', { class: 'check', title: 'Relief exaggeration on the globe' }, 'Relief',
         h('input', { type: 'range', min: 0, max: 40, step: 1, value: S.exag, oninput: (e: Event) => { S.exag = Number((e.target as HTMLInputElement).value); refreshLayer(); } }))),
     h('div', { class: 'spacer' }),
@@ -868,7 +950,7 @@ async function onOverrides() {
       await mutate(cmd, args);
       await render();
     };
-    const stale = ['states', 'provinces'].some((k) => S.status!.steps.find((s) => s.key === k)?.state !== 'done');
+    const stale = ['states', 'provinces', 'cultures'].some((k) => S.status!.steps.find((s) => s.key === k)?.state !== 'done');
     const byLayer = new Map<string, any[]>();
     for (const u of r.unapplied) byLayer.set(u.layer, [...(byLayer.get(u.layer) ?? []), u]);
     box.innerHTML = '';
@@ -891,7 +973,7 @@ async function onOverrides() {
             for (const [layer, list] of byLayer) await mutate('remove_edits', { layer, indices: list.map((u) => u.index) });
             await render();
           } }, 'Remove them'))
-        : h('p', { class: 'muted' }, stale ? 'Generate Stage 2 to check that every state and province edit still applies.' : 'Every state and province edit applies to the current map.'),
+        : h('p', { class: 'muted' }, stale ? 'Generate Stages 2 and 3 to check that every state, province and culture edit still applies.' : 'Every state, province and culture edit applies to the current map.'),
       h('div', { class: 'actions' },
         h('button', { disabled: !r.total, onclick: () => exportOverrides([...sel]) }, 'Export…'),
         h('button', { onclick: async () => { if (await importOverrides(replace)) await render(); } }, 'Import…'),
@@ -1587,15 +1669,26 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
 
   const body = h('div', { class: 'card-body' }, h('p', { class: 'muted' }, ui.blurb));
   const form = h('div', { class: 'form' });
-  for (const p of ui.params) form.append(paramInput(p));
+  // Sketch parameters that only one base uses are shown with that base.
+  const base = S.status!.edits.sketch_base;
+  const unused = (p: Param) => (p.key === 'auto_continents' && base !== 'generated') || (p.key === 'drawing_freedom_km' && base !== 'drawing');
+  for (const p of ui.params) if (!unused(p)) form.append(paramInput(p));
   body.append(form);
 
   // Step-specific extras.
   const e = S.status!.edits;
   if (ui.key === 'sketch') {
+    const sm = ss.state === 'done' ? ss.meta : null;
+    form.prepend(h('label', {}, h('span', { title: 'What the strokes work on' }, 'Start from'),
+      h('select', { onchange: (ev: Event) => mutate('set_sketch_base', { value: (ev.target as HTMLSelectElement).value }, 'sketch') },
+        ...([['generated', 'Generated continents (seed)'], ['drawing', 'My drawing (procedural)'], ['ocean', 'Empty ocean (exact paint)']] as const)
+          .map(([v, label]) => h('option', { value: v, selected: e.sketch_base === v }, label)))));
     body.append(
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: e.auto_base, onchange: (ev: Event) => mutate('set_auto_base', { value: (ev.target as HTMLInputElement).checked }, 'sketch') }), 'Start from generated continents'),
-      h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.sketch_strokes} strokes`),
+      h('p', { class: 'muted' }, e.sketch_base === 'drawing'
+        ? 'Draw a rough layout with the land and sea brushes. The generator gives it natural coasts, peninsulas, gulfs and islands, and keeps each landmass’s size; another seed gives other details. “Freedom from the drawing” sets how far coasts may stray.'
+        : e.sketch_base === 'generated' ? 'Strokes paint over the continents generated from the seed.' : 'Strokes paint land exactly; coast noise only decides soft brush edges.'),
+      h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.sketch_strokes} strokes`
+        + (sm?.drawing_kept !== undefined && e.sketch_base === 'drawing' ? ` · ${Math.round(sm.drawing_kept * 100)}% of the drawn land is land` : '')),
         h('button', { class: 'small', disabled: !e.sketch_strokes && !e.pins.length && !e.arrows.length, onclick: () => confirm('Clear all sketch strokes, pins and arrows?') && mutate('clear_layer', { layer: 'sketch' }, 'sketch') }, 'Clear sketch')),
     );
   }
@@ -1650,6 +1743,12 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
         h('button', { class: 'small', disabled: !pins.length, onclick: () => mutate('clear_layer', { layer: 'bands' }, 'cultures') }, 'Clear pins')),
       h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, `${e.attraction_strokes} attraction strokes`),
         h('button', { class: 'small', disabled: !e.attraction_strokes, onclick: () => mutate('clear_layer', { layer: 'attraction' }, 'cultures') }, 'Clear attraction')));
+    const ce = e.culture_edits ?? 0;
+    const locked = S.status!.steps.find((x) => x.key === 'cultures')?.meta?.locked_cultures ?? 0;
+    body.append(h('h4', {}, 'Culture editor'),
+      h('p', { class: 'muted' }, 'Merge, split, paint, re-parent, rename and lock cultures. Edits pick a culture by where you click, apply at the end of the run, and come back whenever Stage 3 re-runs.'),
+      h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, `${ce} culture edits${locked ? `, ${locked} locked culture${locked === 1 ? '' : 's'}` : ''}`),
+        h('button', { class: 'small', disabled: !ce, onclick: () => { if (confirm('Remove every culture edit, locks included?')) mutate('clear_layer', { layer: 'cultures' }, 'cultures'); } }, 'Clear culture edits')));
   }
   if (ui.key === 'nations') {
     const seeds = e.nation_seeds ?? [];
@@ -1804,7 +1903,7 @@ function summary(key: string, m: any): HTMLElement {
       break;
     case 'hydrology': {
       if (m.channel_loss_m3s !== undefined) box.append(stat('Lost in dry channels', `${fmt(m.channel_loss_m3s)} m³/s`));
-      box.append(stat('River cells', fmt(m.river_cells)), stat('Lakes', `${m.lakes} (${m.endorheic_lakes} endorheic)`), stat('Eroded', `${fmt(m.eroded_km3 / 1000)}k km³`));
+      box.append(stat('Rivers', `${fmt(m.river_km ?? 0)} km`), stat('Lakes', `${m.lakes} (${m.endorheic_lakes} endorheic)`), stat('Eroded', `${fmt(m.eroded_km3 / 1000)}k km³`));
       const list = h('div', { class: 'list' });
       (m.major_rivers ?? []).forEach((r: any, i: number) => list.append(h('div', { class: 'item link', onclick: () => R.lookAt(fromLatLon((r.lat * Math.PI) / 180, (r.lon * Math.PI) / 180)) },
         `${i + 1}. ${fmt(r.discharge_m3s)} m³/s · ${fmt(r.width_m ?? 0)} m wide · ${fmt(r.length_km)} km · basin ${fmt(r.basin_mkm2, 2)} M km²`)));
@@ -1907,16 +2006,34 @@ function summary(key: string, m: any): HTMLElement {
             const cc = cultureColor(c.id, c.group).map(Math.round);
             const parent = c.parent ? P.byCulture.get(c.parent) : null;
             const origin = parent ? `Split from ${parent.name} in ${yr(c.founded_year)}` : `Emerged in ${yr(c.founded_year)}`;
-            list.append(h('div', { class: 'item', title: origin },
-              h('span', {}, '\u00a0\u00a0', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name),
+            list.append(h('div', { class: 'item', title: origin + (c.locked ? '. Locked: re-running keeps it as it is.' : '') },
+              h('span', {}, '\u00a0\u00a0', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name, c.locked ? ' 🔒' : ''),
               h('span', { class: 'muted' }, `${fmt(c.population / 1e6, 2)} M · ${c.provinces} prov.${parent ? ' · from ' + parent.name : ''}`)));
           }
         }
+        // Family tree: every living culture under its ancestors (ended ones greyed).
+        const kids = new Map<number, any[]>();
+        const keep = new Set<number>();
+        for (const c of P.cultures) if (c.alive) for (let x: any = c; x && !keep.has(x.id); x = x.parent ? P.byCulture.get(x.parent) : null) keep.add(x.id);
+        for (const c of P.cultures) if (keep.has(c.id)) { const k = c.parent && keep.has(c.parent) ? c.parent : 0; if (!kids.has(k)) kids.set(k, []); kids.get(k)!.push(c); }
+        const tree = h('div', { class: 'list' });
+        const walk = (pid: number, depth: number) => {
+          for (const c of (kids.get(pid) ?? []).sort((a, b) => a.founded_year - b.founded_year || a.id - b.id)) {
+            const cc = cultureColor(c.id, c.group).map(Math.round);
+            const fate = c.alive ? `${fmt(c.population / 1e6, 2)} M` : `${c.fate === 'merged' ? 'merged into ' + (P.byCulture.get(c.fate_other)?.name ?? '?') : 'died out'} in ${yr(c.ended_year)}`;
+            tree.append(h('div', { class: 'item', style: c.alive ? '' : 'opacity:0.55' },
+              h('span', { class: 'tree-name', style: `padding-left:${4 + Math.min(depth, 8) * 10}px` }, depth ? '└ ' : '', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name, c.locked ? ' 🔒' : ''),
+              h('span', { class: 'muted' }, `${yr(c.founded_year)} · ${fate}`)));
+            walk(c.id, depth + 1);
+          }
+        };
+        walk(0, 0);
+        box.append(h('details', {}, h('summary', {}, `Family tree (${keep.size} cultures)`), tree));
         const recent = P.events.filter((e) => e.kind !== 'emerged').slice(-8).reverse();
         if (recent.length) list.append(h('div', { class: 'item' }, h('b', {}, 'Latest events')));
         for (const e of recent) {
           const a = P.byCulture.get(e.culture)?.name ?? `#${e.culture}`, b = P.byCulture.get(e.other)?.name ?? '';
-          const text = e.kind === 'split' ? `${a} split from ${b}` : e.kind === 'merged' ? `${a} merged into ${b}` : `${a} died out`;
+          const text = (e.kind === 'split' ? `${a} split from ${b}` : e.kind === 'merged' ? `${a} merged into ${b}` : `${a} died out`) + (e.edit ? ' (edit)' : '');
           list.append(h('div', { class: 'item' }, h('span', {}, text), h('span', { class: 'muted' }, yr(e.year))));
         }
       });
@@ -2009,6 +2126,7 @@ function renderToolbar() {
     } }), out));
   }
   if (t.value === 'provinces') bb.append(h('label', {}, h('span', {}, 'Provinces (0: default)'), h('input', { type: 'number', step: 1, min: 0, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
+  if (t.value === 'parts') bb.append(h('label', {}, h('span', {}, 'Daughter cultures'), h('input', { type: 'number', step: 1, min: 2, max: 5, value: val, onchange: (e: Event) => setVal(Math.max(2, Math.min(5, Math.round(Number((e.target as HTMLInputElement).value))))) })));
   if (t.value === 'bands') bb.append(h('label', {}, h('span', {}, 'Bands'), h('input', { type: 'number', step: 1, min: 1, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'goods') {
     const goods = TRADE_GOODS.map(([g], i) => [g, i + 1] as const).filter(([g]) => g !== 'none');
@@ -2218,7 +2336,7 @@ function bindCanvas() {
       }
       let name = '';
       if (t.rename) {
-        name = window.prompt(t.id === 'rename_state' ? 'New state name' : 'New province name')?.trim() ?? '';
+        name = window.prompt(t.id === 'rename_state' ? 'New state name' : t.id === 'rename_culture' ? 'New culture name' : 'New province name')?.trim() ?? '';
         if (!name) return;
       }
       if (t.id === 'nation_seed' && !moved) {
@@ -2274,13 +2392,19 @@ function paintPreview(d: Extract<Drag, { kind: 'stroke' }>, p: Vec3) {
   const r = S.brush.radius_km / R0;
   const sk = S.cache.get('sketch|null')?.values as Float32Array | undefined;
   const hint = S.cache.get('mountain_hint|null')?.values as Float32Array | undefined;
-  const target = tool === 'land' || tool === 'sea' ? sk : hint;
+  const land = S.cache.get('land|null')?.values as Uint8Array | undefined;
+  // Grown from the drawing: land and sea strokes change the drawing (its
+  // outline moves); the continents follow when the step runs.
+  const drawing = S.status!.edits.sketch_base === 'drawing' ? S.cache.get('drawing|null')?.values as Float32Array | undefined : undefined;
+  const target = tool === 'land' || tool === 'sea' ? drawing ?? sk : hint;
   if (!target) return;
+  const fields = { sketch: sk, land: drawing ? land : undefined, mountain_hint: hint, drawing };
   const goal = tool === 'land' ? 1 : tool === 'sea' ? -1 : tool === 'mountain' ? 1 : 0;
   const inner = Math.min(0.98, S.brush.hardness);
   const reach = d.gen ? r * (1 + S.brush.scatter) : r;
   const freq = R0 / Math.max(10, S.brush.grain_km);
   const octaves = scatterOctaves(S.brush.grain_km, g.spacing * R0);
+  const touched = new Set<number>();
   g.within(p, reach, (c, dist) => {
     const prev = d.dmin.get(c) ?? Infinity;
     if (dist >= prev) return;
@@ -2302,18 +2426,17 @@ function paintPreview(d: Extract<Drag, { kind: 'stroke' }>, p: Vec3) {
     if (!d.base.has(c)) d.base.set(c, target[c]);
     const b = d.base.get(c)!;
     target[c] = b + (goal - b) * w;
-    // Recolour the cell the way the sketch layer does.
-    const v = sk ? sk[c] : -1;
-    const land = v > 0;
-    let col = land ? [118, 160, 90] : [38, 78, 128];
-    const soft = 1 - Math.abs(v);
-    col = col.map((x) => x + soft * 25);
-    const hv = hint ? hint[c] : 0;
-    if (hv > 0.02) col = col.map((x, k) => x + ([150, 95, 60][k] - x) * Math.min(1, hv));
-    S.colors![c * 4] = col[0];
-    S.colors![c * 4 + 1] = col[1];
-    S.colors![c * 4 + 2] = col[2];
+    touched.add(c);
+    // The outline also changes on the neighbours' side.
+    if (drawing) for (const j of g.neighbors(c)) touched.add(j);
   });
+  // Recolour the cells the way the sketch layer does.
+  for (const c of touched) {
+    const col = sketchColor(g, fields, c);
+    S.colors![c * 4] = Math.min(255, col[0]);
+    S.colors![c * 4 + 1] = Math.min(255, col[1]);
+    S.colors![c * 4 + 2] = Math.min(255, col[2]);
+  }
   R.setColors(S.colors);
 }
 
@@ -2444,7 +2567,7 @@ function describe(d: any): [string, string][] {
   tag = 'land';
   if (d.terrain !== undefined) parts.push(TERRAIN[d.terrain][0]);
   tag = 'water';
-  if (d.river) parts.push(`${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, ${Math.round(d.discharge).toLocaleString()} m³/s, order ${d.river}`);
+  if (d.river) parts.push(`beside a ${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, order ${d.river}`);
   if (d.lake) parts.push(['', 'fresh lake', 'salt lake', 'dry lake'][d.lake]);
   tag = 'land';
   if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
@@ -2486,7 +2609,7 @@ function describe(d: any): [string, string][] {
   tag = 'culture';
   if (d.culture) {
     const c = SIM.cultures.get(d.culture) ?? P?.byCulture.get(d.culture), g = c && P ? P.byGroup.get(c.group) : null;
-    if (c) parts.push(`${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}`);
+    if (c) parts.push(`${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}${c.locked ? ', locked' : ''}`);
   }
   if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
   return out;

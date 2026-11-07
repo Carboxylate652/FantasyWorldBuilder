@@ -264,16 +264,27 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     }
 
     ctx.progress(0.55, "Finding barriers");
+    // Rivers run along cell edges: each segment gets its role from the land
+    // on its two banks, and a border river's barrier sits on the edge itself.
     let w_border = hp.river_border_width_m.max(1.0);
-    let mut river_role = vec![role::NONE; n];
-    for i in 0..n {
-        let w = width[i] as f64;
-        if !land(i) || w <= 0.0 {
+    let river_to = ctx.input.i32("river_to");
+    let seg_width = ctx.input.f32("river_seg_width");
+    let nt = river_to.len();
+    let mut seg_role = vec![role::NONE; nt];
+    for t in 0..nt {
+        if river_to[t] < 0 {
             continue;
         }
-        let fertile = regional[i] as f64 >= hp.river_border_habitability;
-        let arid = (regional_p[i] as f64) < hp.backbone_max_precip_mm;
-        river_role[i] = if w >= w_border && fertile && !arid {
+        let (a, b) = g.corner_edge_cells(t, river_to[t] as usize);
+        let banks: Vec<usize> = [a, b].into_iter().filter(|&c| land(c)).collect();
+        if banks.is_empty() {
+            continue;
+        }
+        let k = banks.len() as f64;
+        let fertile = banks.iter().map(|&c| regional[c] as f64).sum::<f64>() / k >= hp.river_border_habitability;
+        let arid = banks.iter().map(|&c| regional_p[c] as f64).sum::<f64>() / k < hp.backbone_max_precip_mm;
+        let w = seg_width[t] as f64;
+        seg_role[t] = if w >= w_border && fertile && !arid {
             role::BORDER
         } else if w >= w_border / 3.0 && arid {
             role::BACKBONE
@@ -309,17 +320,15 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 terrain::JUNGLE => 0.6 * hp.barrier_marsh,
                 _ => 0.0,
             };
-            if river_role[i] == role::BORDER {
-                let w = width[i] as f64;
-                b += hp.barrier_river * (0.5 + 0.5 * (w / w_border).log2()).clamp(0.5, 1.5);
-            }
             b as f32
         })
         .collect();
 
-    // Barrier paint.
+    // Barrier paint. Erasing takes away the border role of the rivers along
+    // the erased cells.
     let mut scratch = Vec::new();
     let mut painted = 0usize;
+    let mut erased = vec![false; n];
     for s in &ctx.edits.overrides.barriers {
         for (c, w) in stroke_coverage(g, s, r_km, &mut scratch) {
             let c = c as usize;
@@ -330,9 +339,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
                 Tool::BarrierPaint => barrier[c] += (s.value.max(0.0) * w as f64) as f32,
                 Tool::BarrierErase => {
                     barrier[c] *= 1.0 - w;
-                    if w >= 0.5 && river_role[c] == role::BORDER {
-                        river_role[c] = role::NONE;
-                    }
+                    erased[c] |= w >= 0.5;
                 }
                 _ => continue,
             }
@@ -340,25 +347,49 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         }
     }
 
+    // Border rivers' crossing cost, per segment; and per cell, the role of the
+    // rivers along it (border before backbone).
+    let mut seg_barrier = vec![0.0f32; nt];
+    let mut river_role = vec![role::NONE; n];
+    let (mut border_km, mut backbone_km) = (0.0, 0.0);
+    for t in 0..nt {
+        if river_to[t] < 0 {
+            continue;
+        }
+        let u = river_to[t] as usize;
+        let (a, b) = g.corner_edge_cells(t, u);
+        if seg_role[t] == role::BORDER && (erased[a] || erased[b]) {
+            seg_role[t] = role::NONE;
+        }
+        let km = g.corner_pos(t).angle_to(g.corner_pos(u)) * r_km;
+        match seg_role[t] {
+            role::BORDER => {
+                let w = seg_width[t] as f64;
+                seg_barrier[t] = (hp.barrier_river * (0.5 + 0.5 * (w / w_border).log2()).clamp(0.5, 1.5)) as f32;
+                border_km += km;
+            }
+            role::BACKBONE => backbone_km += km,
+            _ => {}
+        }
+        for c in [a, b] {
+            if land(c) && seg_role[t] != role::NONE && river_role[c] != role::BORDER {
+                river_role[c] = seg_role[t];
+            }
+        }
+    }
+
     // Summary.
     let (mut land_a, mut hab_a, mut cap, mut good) = (0.0, 0.0, 0.0, 0.0);
-    let (mut border_km, mut backbone_km) = (0.0, 0.0);
-    let spacing_km = g.spacing * r_km;
-    for i in 0..n {
+    for (i, &h) in hab.iter().enumerate() {
         if !land(i) {
             continue;
         }
         let a = g.area[i] * r2;
         land_a += a;
-        hab_a += a * hab[i] as f64;
-        cap += a * hab[i] as f64;
-        if hab[i] >= 0.4 {
+        hab_a += a * h as f64;
+        cap += a * h as f64;
+        if h >= 0.4 {
             good += a;
-        }
-        match river_role[i] {
-            role::BORDER => border_km += spacing_km,
-            role::BACKBONE => backbone_km += spacing_km,
-            _ => {}
         }
     }
     hab.iter_mut().for_each(|h| *h = h.clamp(0.0, 1.0));
@@ -367,6 +398,9 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     f.put("habitability", Field::F32(hab));
     f.put("barrier", Field::F32(barrier));
     f.put("river_role", Field::U8(river_role));
+    // Per corner: the role and crossing cost of the river segment from it.
+    f.put("river_seg_role", Field::U8(seg_role));
+    f.put("river_seg_barrier", Field::F32(seg_barrier));
     f.put("groundwater", Field::F32(gw.iter().map(|&x| x as f32).collect()));
     f.put("site", Field::F32(site));
     f.put("site_kind", Field::U8(kind_of));

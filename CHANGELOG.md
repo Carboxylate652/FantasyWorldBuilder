@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **Latitude lines:** the globe and the flat map mark the equator (solid) and 30° and 60° north and south (dashed) for reference, under rivers, borders and the other overlays. The *Latitudes* toggle in the overlay row turns them off (remembered).
+
+Continents from your drawing, in one step.
+
+- **Start from: My drawing (procedural)** in the Continent sketch card, beside *Generated continents* (from the seed) and *Empty ocean* (exact paint). Land and sea strokes become a rough layout that the continent generator follows: the drawn coasts are softened by distance, seeded noise adds peninsulas, gulfs, bays and offshore islands, and each drawn landmass keeps its drawn area. No more trying seed after seed for continents in the right places: draw them, and another seed gives other coasts on the same layout.
+- **Freedom from the drawing (km)** (default 500) sets how far coasts may stray from the drawn ones; 0 gives the drawing exactly, as on an empty ocean. *Coast roughness* and *Coast feature size* shape the small bays and islets, as on generated continents.
+- The sketch layer outlines your drawing in yellow over the result, and the outline follows the brush while you paint; the card shows how much of the drawn land became land (about 75–85% at the default freedom).
+- `set_sketch_base` (`generated`, `drawing` or `ocean`) in the API, `worldgen sketch-base <dir> generated|drawing|ocean [--freedom KM] [--run]` on the command line. Other worlds keep their results: the new setting only enters the cache key of worlds that start from a drawing.
+
+Rivers run between cells, like Civilization V's.
+
+- **Rivers along cell edges:** water still flows from cell to cell, but each river's line now runs along the boundaries between cells, from corner to corner. A river is the line between the two cells on its banks, both of which count as riverside (water, floodplains, harbours).
+- **Rivers as borders:** a border river's crossing cost sits on the edge it runs along, so where a state or province border follows a river, it is the river itself, no longer a line beside it that switches banks from cell to cell. Border rivers divide provinces and states at least as often as before (on seeds 1 and 5: 76–78% of their length divides provinces, 49–63% states). Province borders along a river are typed `river` from the river edges themselves.
+- **Barriers layer:** border and backbone rivers are drawn on their edges; *Remove barrier* turns off the border role of the rivers along the erased cells.
+- **Export:** `rivers.png` and `rivers.geojson` follow the cell edges, and `provinces.png` borders are not warped next to rivers, so borders along rivers line up with the river pixels.
+- Hydrology, habitability, states and provinces change for the same seed; projects store four more per-corner river fields (about 17 MB at grid level 8).
+
+Culture editor and locks (M6).
+
+- **Edit cultures by hand** (Cultures card and *Edit map*): *Merge cultures* (drag one onto the culture that absorbs it), *Paint culture* (provinces under the brush join the culture where the stroke starts), *Split by line* (the smaller side of a line across a culture becomes a daughter; a loop makes the part inside a daughter), *Split by contacts* (into 2–5 daughters along the lines where its people are least in touch), *Re-parent* (drag a culture onto its new, older parent), *Rename culture* and *New name* (from its own language).
+- **Locks:** *Lock / unlock* records a culture's provinces and name. Whenever Stage 3 re-runs, even with other settings, the culture keeps exactly those provinces and its name; other edits leave it alone; and Stage 4 history never changes it (no assimilation into or out of it, no settlers replacing or spreading it). This closes the last open check of milestone M5.
+- Edits pick cultures by place, since culture ids change on every run, and apply at the end of the run, so groups, names and tables follow. Edits that no longer apply are listed in the Overrides panel and by `worldgen overrides`; `worldgen edit` takes the new tools too.
+- **Family tree** in the Cultures card: every living culture under its ancestors, ended ones greyed; 🔒 marks locked cultures, and events made by edits say so.
+- Province names are now drawn one province at a time, so an edit only renames the provinces it changes; names differ from before for the same seed.
+
+## 0.3.1
+
 Mountains now shape temperature as well as rain.
 
 - **Foehn:** air that rains out climbing a range comes down the far side warmer. The lee of high, wet ranges is up to about 4 °C warmer in a month (most in the wet season), fading over a few hundred km; windward slopes and crests are unchanged, and so is rain. New *Foehn warming* layer, `foehn` field and *Foehn ×* setting (0–3, default 1); the status line shows the warming.

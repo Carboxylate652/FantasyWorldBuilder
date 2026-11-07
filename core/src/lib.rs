@@ -18,6 +18,7 @@ pub mod names;
 pub mod province_import;
 pub mod noise;
 pub mod params;
+pub mod rivers;
 pub mod rng;
 pub mod stages;
 pub mod validate;

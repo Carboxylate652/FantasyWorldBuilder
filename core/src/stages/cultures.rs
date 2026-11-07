@@ -309,6 +309,9 @@ pub struct CultureSim {
     drift_extra: HashMap<u32, f64>,
     contact_boost: HashMap<(u32, u32), f64>,
     applied: Vec<serde_json::Value>,
+    // Culture editor
+    edits: Vec<CultureEdit>,
+    edit_strokes: Vec<crate::edits::Stroke>,
 }
 
 impl CultureSim {
@@ -460,7 +463,10 @@ impl CultureSim {
             }
         }
         let directives: Vec<crate::directives::Directive> = crate::directives::of_stage(&ctx.edits.overrides.directives, "cultures").into_iter().cloned().collect();
+        let edits = resolve_edits(ctx, &provs, &index, &prov_field);
         Some(CultureSim {
+            edits,
+            edit_strokes: ctx.edits.overrides.cultures.clone(),
             spring_rain: ctx.params.habitability.spring_max_precip_mm,
             seed,
             r_km,
@@ -1044,7 +1050,9 @@ impl CultureSim {
         (raw_groups, gorder)
     }
 
-    fn culture_names(&self) -> (Vec<String>, Rng, HashSet<String>) {
+    /// Names of the first `n` cultures (those the simulation made), from one
+    /// generator in id order.
+    fn culture_names(&self, n: usize) -> (Vec<String>, HashSet<String>) {
         let empty = Vec::new();
         let mut name_rng = Rng::new(self.seed, stream::NAMES + 3);
         let mut used: HashSet<String> = HashSet::new();
@@ -1055,8 +1063,8 @@ impl CultureSim {
                 }
             }
         }
-        let names: Vec<String> = (0..self.cultures.len()).map(|c| self.cultures[c].lang.unique(&mut name_rng, &mut used)).collect();
-        (names, name_rng, used)
+        let names: Vec<String> = (0..n.min(self.cultures.len())).map(|c| self.cultures[c].lang.unique(&mut name_rng, &mut used)).collect();
+        (names, used)
     }
 
     /// The world so far, for the live view and the AI guide: population and
@@ -1081,7 +1089,7 @@ impl CultureSim {
         let (raw_groups, gorder) = self.groups(&cult_pop);
         let gid: HashMap<u32, u32> = gorder.iter().enumerate().map(|(k, &(g, _))| (g, k as u32 + 1)).collect();
         let group_of = |c: usize| -> u32 { if c == 0 || c > n_cult || self.cultures[c - 1].ended.is_some() { 0 } else { gid.get(&raw_groups[c]).copied().unwrap_or(0) } };
-        let (names, _, _) = self.culture_names();
+        let (names, _) = self.culture_names(self.cultures.len());
         // Regions each culture holds most people in.
         let region_names: HashMap<u64, String> = self.table["regions"].as_array().into_iter().flatten().map(|r| (r["id"].as_u64().unwrap_or(0), r["name"].as_str().unwrap_or("").to_string())).collect();
         let mut cult_regions: Vec<BTreeMap<u16, f64>> = vec![BTreeMap::new(); n_cult + 1];
@@ -1141,7 +1149,11 @@ impl CultureSim {
 
     /// Groups, names and tables of the finished run.
     pub fn finish(self, progress: &dyn Fn(f32, &str)) -> StepOutput {
-        let s = self;
+        let mut s = self;
+        // Culture editor, on the bands of the finished run.
+        let n_sim = s.cultures.len();
+        let edited = s.apply_edits();
+        let s = s;
         let cp = &s.cp;
         let (provs, bands, cultures) = (&s.provs, &s.bands, &s.cultures);
         let np = provs.len();
@@ -1172,7 +1184,21 @@ impl CultureSim {
 
         // Names: cultures, groups, then provinces (majority culture's language, or
         // the state's main culture for empty land).
-        let (cult_names, mut name_rng, mut used) = s.culture_names();
+        let (mut cult_names, mut used) = s.culture_names(n_sim);
+        // Cultures made by edits, renames and new names, each from its own
+        // generator so the other names stay as they were.
+        let own_rng = |k: u64, stream_off: u64| Rng::new(s.seed ^ k.wrapping_mul(0x9E37_79B9_7F4A_7C15), stream::NAMES + stream_off);
+        for (c, cu) in cultures.iter().enumerate().skip(n_sim) {
+            let name = cu.lang.unique(&mut own_rng(c as u64 + 1, 7), &mut used);
+            cult_names.push(name);
+        }
+        for (&c, name) in &edited.names {
+            cult_names[c as usize - 1] = name.clone();
+            used.insert(name.clone());
+        }
+        for &(c, seed) in &edited.new_names {
+            cult_names[c as usize - 1] = cultures[c as usize - 1].lang.unique(&mut own_rng(seed ^ (c as u64) << 20, 9), &mut used);
+        }
         let mut state_cult: BTreeMap<u16, BTreeMap<u32, f64>> = BTreeMap::new();
         for p in 0..np {
             if provs[p].state > 0 {
@@ -1202,7 +1228,9 @@ impl CultureSim {
             if c == 0 {
                 continue;
             }
-            let w = cultures[c as usize - 1].lang.unique(&mut name_rng, &mut used);
+            // Each province draws from its own generator, so an edit that
+            // changes one province's culture leaves the other names alone.
+            let w = cultures[c as usize - 1].lang.unique(&mut own_rng(provs[p].id as u64, 5), &mut used);
             // Wasteland keeps its kind of name ("… Desert", "… Peaks", "… Ice").
             let old = &provs[p].name;
             prov_names[p] = match [" Desert", " Peaks", " Ice"].iter().find(|s| old.ends_with(*s)) {
@@ -1238,6 +1266,7 @@ impl CultureSim {
                     "population": cult_pop[c].round(), "provinces": cult_provs[c],
                     "founded_year": year(cu.founded), "ended_year": cu.ended.map(year),
                     "fate": cu.fate, "fate_other": cu.other, "home_region": cu.region,
+                    "locked": edited.locked.contains(&(c as u32)),
                 })
             })
             .collect();
@@ -1347,6 +1376,8 @@ impl CultureSim {
                 "founders": s.founders,
                 "desert_towns_by_cause": desert_towns,
                 "directives": s.applied,
+                "locked_cultures": edited.locked.len(),
+                "unapplied_edits": edited.unapplied,
                 "table": {
                     "cultures": cultures_json,
                     "groups": groups_json,
@@ -1356,6 +1387,472 @@ impl CultureSim {
                 },
             }),
         }
+    }
+}
+
+/// A culture-editor stroke, resolved to provinces when the simulation is set
+/// up. Cultures are picked when the run finishes, by who lives there then.
+struct CultureEdit {
+    index: usize,
+    tool: crate::edits::Tool,
+    /// Land provinces under the first, middle and last point.
+    first: Option<usize>,
+    mid: Option<usize>,
+    last: Option<usize>,
+    /// Paint: provinces mostly under the brush. Split by a loop: provinces
+    /// inside it. Lock: the culture's provinces when it was locked.
+    provs: Vec<usize>,
+    /// Split by an open line: the side of the line each province lies on.
+    side: Vec<i8>,
+    closed: bool,
+}
+
+/// Where a culture edit lands on this map.
+fn resolve_edits(ctx: &Ctx, provs: &[Prov], index: &HashMap<u32, usize>, prov_field: &[u32]) -> Vec<CultureEdit> {
+    use crate::edits::Tool;
+    let strokes = &ctx.edits.overrides.cultures;
+    if strokes.is_empty() {
+        return Vec::new();
+    }
+    let g = ctx.grid;
+    let r_km = ctx.params.planet.radius_km;
+    let land_prov = |c: usize| index.get(&prov_field[c]).copied().filter(|&p| provs[p].kind <= kind::WASTELAND);
+    let at = |ll: [f64; 2]| land_prov(g.nearest(Vec3::from_lat_lon_deg(ll[0], ll[1]), None));
+    let mut cells = vec![0u32; provs.len()];
+    for &id in prov_field {
+        if let Some(&p) = index.get(&id) {
+            cells[p] += 1;
+        }
+    }
+    let mut scratch = Vec::new();
+    strokes
+        .iter()
+        .enumerate()
+        .map(|(k, s)| {
+            let mut e = CultureEdit {
+                index: k,
+                tool: s.tool,
+                first: s.points.first().and_then(|&p| at(p)),
+                mid: s.points.get(s.points.len() / 2).and_then(|&p| at(p)),
+                last: s.points.last().and_then(|&p| at(p)),
+                provs: Vec::new(),
+                side: Vec::new(),
+                closed: false,
+            };
+            match s.tool {
+                Tool::CulturePaint => {
+                    let mut covered = vec![0u32; provs.len()];
+                    for (c, w) in crate::edits::stroke_coverage(g, s, r_km, &mut scratch) {
+                        if w >= 0.5 {
+                            if let Some(p) = land_prov(c as usize) {
+                                covered[p] += 1;
+                            }
+                        }
+                    }
+                    e.provs = (0..provs.len()).filter(|&p| covered[p] > 0 && 2 * covered[p] >= cells[p]).collect();
+                }
+                Tool::CultureSplit if s.points.len() >= 2 => {
+                    let pts: Vec<Vec3> = s.points.iter().map(|p| Vec3::from_lat_lon_deg(p[0], p[1])).collect();
+                    let length: f64 = pts.windows(2).map(|w| w[0].angle_to(w[1])).sum();
+                    let gap = pts[0].angle_to(*pts.last().unwrap());
+                    e.closed = pts.len() >= 4 && gap < 0.2 * length;
+                    if e.closed {
+                        e.provs = (0..provs.len()).filter(|&p| provs[p].kind <= kind::WASTELAND && inside_loop(&pts, provs[p].center)).collect();
+                    } else {
+                        e.side = provs.iter().map(|pr| side_of_line(&pts, pr.center)).collect();
+                    }
+                }
+                Tool::CultureLock => {
+                    let mut ps: Vec<usize> = s.points.iter().skip(1).filter_map(|&p| at(p)).collect();
+                    ps.sort_unstable();
+                    ps.dedup();
+                    e.provs = ps;
+                }
+                _ => {}
+            }
+            e
+        })
+        .collect()
+}
+
+/// Whether `p` lies inside the closed loop `pts` (gnomonic projection about
+/// the loop's centre, then an even-odd test).
+fn inside_loop(pts: &[Vec3], p: Vec3) -> bool {
+    let mut c = Vec3::ZERO;
+    for &q in pts {
+        c += q;
+    }
+    let c = c.normalized();
+    if p.dot(c) <= 0.0 {
+        return false;
+    }
+    let (e1, e2) = c.east_north();
+    let proj = |q: Vec3| -> (f64, f64) {
+        let d = q.dot(c).max(1e-9);
+        let v = q * (1.0 / d);
+        (v.dot(e1), v.dot(e2))
+    };
+    let (x, y) = proj(p);
+    let poly: Vec<(f64, f64)> = pts.iter().map(|&q| proj(q)).collect();
+    let mut inside = false;
+    for i in 0..poly.len() {
+        let (xa, ya) = poly[i];
+        let (xb, yb) = poly[(i + 1) % poly.len()];
+        if (ya > y) != (yb > y) && x < xa + (y - ya) / (yb - ya) * (xb - xa) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// Which side of the line `pts` the point `p` is on, judged against the
+/// nearest segment (+1 left, −1 right, looking along the line).
+fn side_of_line(pts: &[Vec3], p: Vec3) -> i8 {
+    let mut best = (f64::INFINITY, 1i8);
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let ab = b - a;
+        let t = ((p - a).dot(ab) / ab.dot(ab).max(1e-18)).clamp(0.0, 1.0);
+        let d = (p - (a + ab * t)).len();
+        if d < best.0 {
+            best = (d, if a.cross(b).dot(p) >= 0.0 { 1 } else { -1 });
+        }
+    }
+    best.1
+}
+
+/// What the culture edits did, for naming and the tables.
+#[derive(Default)]
+struct EditOutcome {
+    /// Names set by renames and locks.
+    names: BTreeMap<u32, String>,
+    /// Cultures to give a new name from their language (with a seed).
+    new_names: Vec<(u32, u64)>,
+    locked: HashSet<u32>,
+    unapplied: Vec<serde_json::Value>,
+}
+
+impl CultureSim {
+    /// The culture with the most people among `bands` (0 if none).
+    fn majority_of(&self, bands: &[usize]) -> u32 {
+        let mut m: BTreeMap<u32, f64> = BTreeMap::new();
+        for &b in bands {
+            *m.entry(self.bands.culture[b]).or_insert(0.0) += self.bands.pop[b];
+        }
+        m.into_iter().filter(|x| x.0 > 0).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then(b.0.cmp(&a.0))).map_or(0, |x| x.0)
+    }
+
+    fn culture_people(&self) -> Vec<f64> {
+        let mut v = vec![0.0; self.cultures.len() + 1];
+        for b in 0..self.bands.len() {
+            if self.bands.alive[b] {
+                v[self.bands.culture[b] as usize] += self.bands.pop[b];
+            }
+        }
+        v
+    }
+
+    /// Cultures an edit left without people end, merged into `into`.
+    fn retire_emptied(&mut self, before: &[f64], into: u32) {
+        let now = self.culture_people();
+        let year = (self.ticks as f64 * self.cp.years_per_tick).round();
+        for c in 1..before.len() {
+            if before[c] > 0.0 && now[c] <= 0.0 && self.cultures[c - 1].ended.is_none() {
+                let cu = &mut self.cultures[c - 1];
+                cu.ended = Some(self.ticks);
+                cu.fate = "merged";
+                cu.other = into;
+                self.events.push(serde_json::json!({ "year": year, "kind": "merged", "culture": c, "other": into, "edit": true }));
+            }
+        }
+    }
+
+    /// A daughter culture made by an edit, speaking a dialect of its parent's language.
+    fn edit_daughter(&mut self, parent: u32) -> u32 {
+        let id = self.cultures.len() as u32 + 1;
+        let pc = &self.cultures[parent as usize - 1];
+        let (lang, region) = (pc.lang.dialect(self.seed, 20_000 + id as u64), pc.region);
+        self.cultures.push(Culture { parent, founded: self.ticks, ended: None, fate: "", other: 0, lang, region });
+        let year = (self.ticks as f64 * self.cp.years_per_tick).round();
+        self.events.push(serde_json::json!({ "year": year, "kind": "split", "culture": id, "other": parent, "edit": true }));
+        id
+    }
+
+    /// Apply the culture editor's strokes in order, on the bands of the
+    /// finished run: before groups, names and tables are made, so those follow.
+    fn apply_edits(&mut self) -> EditOutcome {
+        use crate::edits::Tool;
+        let mut out = EditOutcome::default();
+        if self.edits.is_empty() {
+            return out;
+        }
+        let edits = std::mem::take(&mut self.edits);
+        let strokes = std::mem::take(&mut self.edit_strokes);
+        let np = self.provs.len();
+        let mut prov_bands: Vec<Vec<usize>> = vec![Vec::new(); np];
+        for b in 0..self.bands.len() {
+            if self.bands.alive[b] {
+                prov_bands[self.bands.prov[b] as usize].push(b);
+            }
+        }
+        let mut protected = vec![false; np];
+        for e in &edits {
+            let s = &strokes[e.index];
+            let fail = |out: &mut EditOutcome, why: &str| out.unapplied.push(super::unapplied("cultures", e.index, s, why));
+            let maj = |sim: &CultureSim, p: Option<usize>| p.map_or(0, |p| sim.majority_of(&prov_bands[p]));
+            match e.tool {
+                Tool::CultureMerge => {
+                    let (a, b) = (maj(self, e.first), maj(self, e.last));
+                    if a == 0 || b == 0 {
+                        fail(&mut out, "no people at one end");
+                    } else if a == b {
+                        fail(&mut out, "both ends are the same culture");
+                    } else if out.locked.contains(&a) || out.locked.contains(&b) {
+                        fail(&mut out, "the culture is locked");
+                    } else {
+                        let before = self.culture_people();
+                        for k in 0..self.bands.len() {
+                            if self.bands.alive[k] && self.bands.culture[k] == a {
+                                self.bands.culture[k] = b;
+                            }
+                        }
+                        self.retire_emptied(&before, b);
+                    }
+                }
+                Tool::CulturePaint => {
+                    let c = maj(self, e.first);
+                    let targets: Vec<usize> = e.provs.iter().copied().filter(|&p| !protected[p]).collect();
+                    if c == 0 {
+                        fail(&mut out, "no people where the stroke starts");
+                    } else if out.locked.contains(&c) {
+                        fail(&mut out, "the culture is locked");
+                    } else if targets.is_empty() {
+                        fail(&mut out, "the brush covers no province (or only locked ones)");
+                    } else {
+                        let before = self.culture_people();
+                        for &p in &targets {
+                            for &k in &prov_bands[p] {
+                                self.bands.culture[k] = c;
+                            }
+                        }
+                        self.retire_emptied(&before, c);
+                    }
+                }
+                Tool::CultureSplit => {
+                    // The culture: the one most of the loop holds, or under the line's middle.
+                    let a = if e.closed {
+                        let all: Vec<usize> = e.provs.iter().flat_map(|&p| prov_bands[p].iter().copied()).collect();
+                        self.majority_of(&all)
+                    } else {
+                        maj(self, e.mid)
+                    };
+                    let own: Vec<usize> = (0..np).filter(|&p| !protected[p] && a > 0 && self.majority_of(&prov_bands[p]) == a).collect();
+                    let part: Vec<usize> = if e.closed {
+                        own.iter().copied().filter(|p| e.provs.binary_search(p).is_ok()).collect()
+                    } else {
+                        let people = |sd: i8| own.iter().filter(|&&p| e.side[p] == sd).map(|&p| prov_bands[p].iter().map(|&k| self.bands.pop[k]).sum::<f64>()).sum::<f64>();
+                        let small = if people(1) <= people(-1) { 1 } else { -1 };
+                        own.iter().copied().filter(|&p| e.side[p] == small).collect()
+                    };
+                    if a == 0 {
+                        fail(&mut out, "no people there");
+                    } else if out.locked.contains(&a) {
+                        fail(&mut out, "the culture is locked");
+                    } else if part.is_empty() || part.len() == own.len() {
+                        fail(&mut out, if e.closed { "the loop does not hold part of the culture" } else { "the line does not cut the culture in two" });
+                    } else {
+                        let d = self.edit_daughter(a);
+                        for &p in &part {
+                            for &k in &prov_bands[p] {
+                                if self.bands.culture[k] == a {
+                                    self.bands.culture[k] = d;
+                                }
+                            }
+                        }
+                    }
+                }
+                Tool::CultureSplitTraits => {
+                    let a = maj(self, e.first);
+                    if a == 0 {
+                        fail(&mut out, "no people there");
+                    } else if out.locked.contains(&a) {
+                        fail(&mut out, "the culture is locked");
+                    } else {
+                        let k = (s.value.round() as usize).clamp(2, 5);
+                        match self.trait_parts(a, k, &prov_bands, &protected) {
+                            Some(parts) => {
+                                for part in parts {
+                                    let d = self.edit_daughter(a);
+                                    for &p in &part {
+                                        for &b in &prov_bands[p] {
+                                            if self.bands.culture[b] == a {
+                                                self.bands.culture[b] = d;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => fail(&mut out, "its people are too closely knit to split; draw a line instead"),
+                        }
+                    }
+                }
+                Tool::CultureReparent => {
+                    let (child, parent) = (maj(self, e.first), maj(self, e.last));
+                    let mut anc = parent;
+                    let mut cyclic = false;
+                    while anc > 0 {
+                        if anc == child {
+                            cyclic = true;
+                            break;
+                        }
+                        anc = self.cultures[anc as usize - 1].parent;
+                    }
+                    if child == 0 || parent == 0 {
+                        fail(&mut out, "no people at one end");
+                    } else if child == parent {
+                        fail(&mut out, "both ends are the same culture");
+                    } else if out.locked.contains(&child) {
+                        fail(&mut out, "the culture is locked");
+                    } else if cyclic {
+                        fail(&mut out, "the new parent descends from this culture");
+                    } else if self.cultures[parent as usize - 1].founded > self.cultures[child as usize - 1].founded {
+                        fail(&mut out, "the new parent is younger than this culture");
+                    } else {
+                        self.cultures[child as usize - 1].parent = parent;
+                    }
+                }
+                Tool::RenameCulture | Tool::CultureNewName => {
+                    let c = maj(self, e.first);
+                    if c == 0 {
+                        fail(&mut out, "no people there");
+                    } else if out.locked.contains(&c) {
+                        fail(&mut out, "the culture is locked");
+                    } else if e.tool == Tool::CultureNewName {
+                        out.new_names.retain(|x| x.0 != c);
+                        out.names.remove(&c);
+                        out.new_names.push((c, s.seed));
+                    } else if s.name.trim().is_empty() {
+                        fail(&mut out, "no name given");
+                    } else {
+                        out.new_names.retain(|x| x.0 != c);
+                        out.names.insert(c, s.name.trim().to_string());
+                    }
+                }
+                Tool::CultureLock => {
+                    let snap: Vec<usize> = e.provs.iter().copied().filter(|&p| !protected[p]).collect();
+                    let all: Vec<usize> = snap.iter().flat_map(|&p| prov_bands[p].iter().copied()).filter(|&k| !out.locked.contains(&self.bands.culture[k])).collect();
+                    let m = self.majority_of(&all);
+                    if snap.is_empty() || m == 0 {
+                        fail(&mut out, "no people left where the culture was");
+                        continue;
+                    }
+                    let before = self.culture_people();
+                    for &p in &snap {
+                        protected[p] = true;
+                        for &k in &prov_bands[p] {
+                            self.bands.culture[k] = m;
+                        }
+                    }
+                    // Its people elsewhere join the culture beside them, spreading
+                    // out from where another culture lives; what no other
+                    // culture reaches becomes a culture of its own.
+                    let free = |sim: &CultureSim, k: usize| sim.bands.culture[k] != m && !out.locked.contains(&sim.bands.culture[k]);
+                    loop {
+                        let mut moved = false;
+                        for q in 0..np {
+                            if protected[q] || !prov_bands[q].iter().any(|&k| self.bands.culture[k] == m) {
+                                continue;
+                            }
+                            let others: Vec<usize> = prov_bands[q].iter().copied().filter(|&k| free(self, k)).collect();
+                            let mut to = self.majority_of(&others);
+                            if to == 0 {
+                                let near: Vec<usize> = self.adj[q].iter().filter(|b| !protected[b.to as usize]).flat_map(|b| prov_bands[b.to as usize].iter().copied()).filter(|&k| free(self, k)).collect();
+                                to = self.majority_of(&near);
+                            }
+                            if to > 0 {
+                                for &k in &prov_bands[q] {
+                                    if self.bands.culture[k] == m {
+                                        self.bands.culture[k] = to;
+                                    }
+                                }
+                                moved = true;
+                            }
+                        }
+                        if !moved {
+                            break;
+                        }
+                    }
+                    let rest: Vec<usize> = (0..np).filter(|&q| !protected[q] && prov_bands[q].iter().any(|&k| self.bands.culture[k] == m)).collect();
+                    if !rest.is_empty() {
+                        let d = self.edit_daughter(m);
+                        for q in rest {
+                            for &k in &prov_bands[q] {
+                                if self.bands.culture[k] == m {
+                                    self.bands.culture[k] = d;
+                                }
+                            }
+                        }
+                    }
+                    self.retire_emptied(&before, m);
+                    if !s.name.trim().is_empty() {
+                        out.new_names.retain(|x| x.0 != m);
+                        out.names.insert(m, s.name.trim().to_string());
+                    }
+                    out.locked.insert(m);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Split culture `a` into `k` parts by who is in touch with whom (Louvain
+    /// on the last check's contact graph among its bands, raising the
+    /// resolution until it falls apart), each province going to the part most
+    /// of its people belong to. The largest part keeps the culture; the
+    /// others (provinces) are returned. None if it does not fall apart.
+    fn trait_parts(&self, a: u32, k: usize, prov_bands: &[Vec<usize>], protected: &[bool]) -> Option<Vec<Vec<usize>>> {
+        let (node_band, edges) = &self.last_graph;
+        let mut local: HashMap<u32, u32> = HashMap::new();
+        let mut members: Vec<usize> = Vec::new();
+        for &nb in node_band.iter() {
+            let b = nb as usize;
+            if b < self.bands.len() && self.bands.alive[b] && self.bands.culture[b] == a && !protected[self.bands.prov[b] as usize] && !local.contains_key(&nb) {
+                local.insert(nb, members.len() as u32);
+                members.push(b);
+            }
+        }
+        if members.len() < k {
+            return None;
+        }
+        let sub: Vec<(u32, u32, f64)> = edges
+            .iter()
+            .filter_map(|&(x, y, w)| Some((*local.get(&node_band[x as usize])?, *local.get(&node_band[y as usize])?, w)))
+            .collect();
+        for res in [1.0, 1.5, 2.5, 4.0, 7.0, 12.0] {
+            let lab = community::louvain(members.len(), &sub, res);
+            // Province → part by people; parts by people.
+            let mut by_prov: BTreeMap<usize, BTreeMap<u32, f64>> = BTreeMap::new();
+            for (i, &b) in members.iter().enumerate() {
+                *by_prov.entry(self.bands.prov[b] as usize).or_default().entry(lab[i]).or_insert(0.0) += self.bands.pop[b];
+            }
+            let mut parts: BTreeMap<u32, (f64, Vec<usize>)> = BTreeMap::new();
+            for (&p, m) in &by_prov {
+                let (&l, _) = m.iter().max_by(|x, y| x.1.partial_cmp(y.1).unwrap().then(y.0.cmp(x.0))).unwrap();
+                let e = parts.entry(l).or_default();
+                e.0 += prov_bands[p].iter().filter(|&&b| self.bands.culture[b] == a).map(|&b| self.bands.pop[b]).sum::<f64>();
+                e.1.push(p);
+            }
+            let mut parts: Vec<(f64, Vec<usize>)> = parts.into_values().collect();
+            parts.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap().then(x.1.cmp(&y.1)));
+            let total: f64 = parts.iter().map(|x| x.0).sum();
+            // Parts with at least 5% of the people count; small ones stay with the largest.
+            let big = parts.iter().filter(|x| x.0 >= 0.05 * total).count();
+            if big >= k {
+                return Some(parts.into_iter().skip(1).take(k - 1).map(|x| x.1).collect());
+            }
+        }
+        None
     }
 }
 

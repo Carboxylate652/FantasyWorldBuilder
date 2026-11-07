@@ -177,6 +177,8 @@ In the air age, when the treasury holds twice the cost and upkeep fits, a nation
 
 Each year `assimilation × dt × (0.5 + integration)` of a ruled province's other cultures takes the ruler's culture; shares under 0.5% are dropped and the majority recomputed.
 
+**Locked cultures** (culture editor) never change: a ruler whose primary culture is locked assimilates no one, a locked culture's share of a province is never taken (only the other cultures' shares shrink), and settlers neither spread a locked culture into empty land nor replace a locked culture in land it holds.
+
 ## Tags and feudal empires
 
 `nations/feudal.rs`. The `tag` directive sets tags (on or off):

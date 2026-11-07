@@ -5,7 +5,7 @@ The desktop app (Tauri) and the browser UI (`worldgen serve --static app/dist`, 
 ## Layout
 
 - **Top bar:** New, Open…, Save, Save as…, Export…, Undo/Redo, Globe / Flat map, map layer, month (for monthly layers), *Overrides* (with the number of edits), *Edit map*, stage buttons *Stage 1*–*Stage 4* (a check mark when done), *Next: Stage N* / *Generate all*, and the version button (update settings).
-- **Second row:** overlays — Rivers, Borders, Wind, Plate motion, Pins — and globe relief exaggeration.
+- **Second row:** overlays — Rivers, Borders, Wind, Plate motion, Pins, Latitudes — and globe relief exaggeration. *Latitudes* draws reference lines on the globe and the flat map: the equator (solid) and 30° and 60° north and south (dashed), under every other overlay; it is on by default and the choice is remembered.
 - **Left panel:** the twelve step cards in four stages. Each card has its parameters, a *Run to step N* button and a status (done, stale, not run) with its run time. Opening a card switches to its map layer and its tools.
 - **Tool box** (over the map): the open step's tools, the brush size and the tool's value.
 - **Step-by-step panel** (over the map, Cultures and Nations cards): see [steering.md](steering.md). In Stage 4 it shows the current time and step length, stops before an institution is born to let you pick its birthplace among the gold-starred candidates (or *Let chance decide*; uncheck *Ask me where institutions are born* to let chance always decide), and lists institutions, empires and tags in the World tab.
@@ -19,7 +19,7 @@ Changing a parameter marks that step and the later ones as stale; *Auto-update* 
 | Step | Tool (shortcut) | What it does |
 | --- | --- | --- |
 | any | Navigate (V) | Drag to rotate or pan, scroll to zoom; right-drag navigates with any tool |
-| Sketch | Land (L), Sea (S) | Paint land or sea with a soft brush |
+| Sketch | Land (L), Sea (S) | Paint land or sea with a soft brush; with *Start from: My drawing*, a rough layout the generated continents follow |
 | | Mountains here (M), Erase hint | Mountain hint strokes raise ridged relief |
 | | Scatter land (N), Scatter sea, Scatter mountains | The same with a fractal edge (*Scatter* amount, *Grain* size): ragged coasts, fjords, offshore islands |
 | Plates | Plate pin (P), Motion arrow (A), Plate paint | Force a plate seed, set a plate's motion by dragging, reassign cells |
@@ -33,12 +33,15 @@ Changing a parameter marks that step and the later ones as stale; *Auto-update* 
 | Provinces | Grow province (O) | The same inside one state; *Import…* for an edited provinces.png |
 | Cultures | Founding band (J), Remove founder | Place founding peoples (number of bands); drag to move; *Pin these* turns random founders into pins |
 | | Attraction (H), Erase attraction | Ghost town (−1) … metropolis (+1) during the culture simulation |
+| | Merge cultures, Paint culture (C), Split by line, Split by contacts, Re-parent, Rename culture, New name, Lock / unlock | The culture editor: drag a culture onto the one that absorbs it or onto its new parent; paint provinces into the culture where the stroke starts; draw a line across a culture (or a loop around part of it) to split it, or click to split it by who is in touch with whom; rename it or draw a new name from its language; lock it so re-running keeps its provinces and name and Stage 4 never changes it (click again to unlock). The Cultures card counts the edits and shows a family tree; 🔒 marks locked cultures |
 | Nations | Nation seed (X), Remove seed | A nation that already exists in the first year: click a province, give a name (or none for its capital's) and a size in provinces (0: the default); drag a seed to move it. The Nations card lists the seeds and the nations placed by chance |
 | | City pin (Y), Remove city pin | In a live Stage 4 run: a boom town or an abandoned city; drag to move |
 
-**Map editor** (*Edit map*, any step): Merge provinces (U), Merge states (drag from the one absorbed onto the absorber, even across a strait), Province → state, Grow province / Grow state, Rename province / Rename state, Paint goods (Q: a trade good, cash crop or deposit, before the culture simulation).
+**Map editor** (*Edit map*, any step): Merge provinces (U), Merge states (drag from the one absorbed onto the absorber, even across a strait), Province → state, Grow province / Grow state, Rename province / Rename state, Paint goods (Q: a trade good, cash crop or deposit, before the culture simulation), and the culture editor's Merge cultures, Paint culture, Split by line, Rename culture and Lock / unlock.
 
 **Shortcuts:** `Ctrl+Z` / `Ctrl+Y` undo/redo, `Ctrl+S` save, `[` `]` brush size, `G` / `F` globe / flat.
+
+**Continents from a drawing:** in the Continent sketch card, set *Start from* to *My drawing (procedural)* and paint a rough layout with *Land* and *Sea* (a big brush is fine; a sea stroke carves a gulf or strait). With *Auto-update* on, each stroke grows natural continents from the drawing at once: coasts with peninsulas, gulfs and islands, each landmass about as large as drawn. The drawing stays outlined in yellow on the Sketch layer. *Freedom from the drawing* sets how far coasts may stray (0 = exactly the drawing); a new seed gives other coasts on the same layout. The other bases are *Generated continents* (from the seed; strokes paint over them) and *Empty ocean* (strokes paint land exactly).
 
 ## Map layers
 

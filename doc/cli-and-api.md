@@ -20,6 +20,7 @@ worldgen overrides <project-dir> [list]
 worldgen overrides <project-dir> clear <layer> | remove <layer> <i,j,...> | prune
 worldgen overrides <project-dir> export <file> [--layers a,b]
 worldgen overrides <project-dir> import <file> [--layers a,b] [--replace]
+worldgen sketch-base <project-dir> generated|drawing|ocean [--freedom KM] [--run]
 worldgen edit <project-dir> --tool TOOL --at LAT,LON[;LAT,LON...] [--value V] [--radius KM] [--name NAME] [--run]
 worldgen directive <project-dir> --stage cultures|nations --at N [--month 1-12] --action NAME [--args JSON] [--note TEXT] [--run]
 worldgen directive --list
@@ -40,6 +41,7 @@ worldgen serve [--port 8765] [--static app/dist] [--project DIR]
 | `validate` | Consistency checks (exit code 1 on errors; stale steps and unapplied edits are warnings) |
 | `info`, `stats` | Step summaries (one line per step, Stage 4 with era and transport); zonal climate statistics |
 | `overrides` | List, clear, remove, prune, export and import override layers |
+| `sketch-base` | What the continent sketch starts from: `generated` (continents from the seed), `drawing` (continents grown from the land and sea strokes; `--freedom` sets how far coasts may stray, in km) or `ocean` (strokes paint land exactly). Draw with `edit --tool land --radius 900 --at …` |
 | `edit` | Apply an app tool by name in snake case (`province_merge`, `fertility_paint`, `band_pin`, `goods_paint`, …); a drag is two or more `--at` points |
 | `directive` | Add a directive at generation/year `--at`; `--list` prints every action and its argument schema |
 | `guide`, `guide-setup` | A guided history without the app; store the provider settings |
@@ -64,7 +66,7 @@ The desktop shell (Tauri command `api`) and `worldgen serve` (POST `/api/<cmd>` 
 | `clear_layer`, `overrides`, `remove_edits` | Manage override layers; list unapplied edits |
 | `clear_results` | `{ from? }`: drop the results of a step and every later one, or (without `from`) every stale result; edits and parameters stay |
 | `export_overrides`, `import_overrides` | Override bundles |
-| `set_auto_base` | Base for the automatic sketch |
+| `set_sketch_base` | `{ value: "generated" \| "drawing" \| "ocean" }`: what the continent sketch starts from (`set_auto_base { value: bool }` still picks generated or ocean) |
 | `import_heightmap`, `import_provinces`, `validate_provinces` | Imports |
 | `political` | The political tables (provinces, states, regions, continents, cultures, nations, events, railways, pins) for the UI |
 | `run` | Run steps up to a target (progress is reported while running) |

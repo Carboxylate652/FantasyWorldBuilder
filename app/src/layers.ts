@@ -162,7 +162,7 @@ export type LayerDef = {
 };
 
 export const LAYERS: LayerDef[] = [
-  { id: 'sketch', label: 'Sketch', fields: ['sketch', 'land', 'mountain_hint'], smooth: false, group: 'Planet' },
+  { id: 'sketch', label: 'Sketch', fields: ['sketch', 'land', 'mountain_hint', 'drawing'], smooth: false, group: 'Planet' },
   { id: 'plates', label: 'Plates', fields: ['plate', 'crust'], smooth: false, group: 'Planet' },
   { id: 'crust', label: 'Crust & plate motion', fields: ['crust', 'plate'], smooth: false, group: 'Planet' },
   { id: 'boundaries', label: 'Plate boundaries', fields: ['boundary', 'elevation'], smooth: false, group: 'Planet' },
@@ -182,7 +182,7 @@ export const LAYERS: LayerDef[] = [
   { id: 'terrain', label: 'Game terrain', fields: ['terrain', 'elevation'], smooth: false, group: 'Biomes' },
   { id: 'habitability', label: 'Habitability', fields: ['habitability', 'water', 'elevation'], smooth: true, group: 'Political' },
   { id: 'springs', label: 'Groundwater & springs', fields: ['groundwater', 'site', 'site_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
-  { id: 'barrier', label: 'Barriers', fields: ['barrier', 'river_role', 'water', 'elevation'], smooth: false, group: 'Political' },
+  { id: 'barrier', label: 'Barriers', fields: ['barrier', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'states', label: 'States', fields: ['state', 'province', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'regions', label: 'Regions & continents', fields: ['region', 'state', 'continent', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'provinces', label: 'Provinces', fields: ['province', 'province_kind', 'state', 'water', 'elevation'], smooth: false, group: 'Political' },
@@ -252,6 +252,29 @@ export function provinceColor(id: number): RGB {
 
 type F = Record<string, ArrayLike<number> | undefined>;
 
+/** Outline of the drawing when continents grow from it. */
+const DRAWING_LINE: RGB = [250, 222, 120];
+
+/** Colour of one cell of the sketch layer; shared with the live paint preview.
+ *  With a `drawing` field (continents grown from the drawing), the drawn
+ *  coast is outlined on its land side. */
+export function sketchColor(g: Grid, f: F, i: number): RGB {
+  const s = f['sketch'], land = f['land'], hint = f['mountain_hint'], d = f['drawing'];
+  const v = s ? s[i] : -1;
+  const isLand = land ? land[i] === 1 : v > 0;
+  let c: RGB = isLand ? [118, 160, 90] : [38, 78, 128];
+  const soft = 1 - Math.abs(v);
+  c = [c[0] + soft * 25, c[1] + soft * 25, c[2] + soft * 25];
+  const h = hint ? hint[i] : 0;
+  if (h > 0.02) c = mix(c, [150, 95, 60], Math.min(1, h));
+  if (d && d[i] > 0) {
+    for (const j of g.neighbors(i)) {
+      if (d[j] <= 0) return DRAWING_LINE;
+    }
+  }
+  return c;
+}
+
 /** Colour every cell for a layer. Returns RGBA bytes and a legend. */
 export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null, month: number | null): { rgba: Uint8Array; legend: Legend } {
   const n = g.n;
@@ -282,21 +305,12 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
 
   switch (id) {
     case 'sketch': {
-      const s = f['sketch'], land = f['land'], hint = f['mountain_hint'];
-      for (let i = 0; i < n; i++) {
-        const v = s ? s[i] : -1;
-        const isLand = land ? land[i] === 1 : v > 0;
-        let c: RGB = isLand ? [118, 160, 90] : [38, 78, 128];
-        const soft = 1 - Math.abs(v);
-        c = [c[0] + soft * 25, c[1] + soft * 25, c[2] + soft * 25];
-        const h = hint ? hint[i] : 0;
-        if (h > 0.02) c = mix(c, [150, 95, 60], Math.min(1, h));
-        put(i, c);
-      }
+      for (let i = 0; i < n; i++) put(i, sketchColor(g, f, i));
       legend = { title: 'Sketch', items: [
         { color: [118, 160, 90], label: 'Land' }, { color: [38, 78, 128], label: 'Sea' },
         { color: [150, 95, 60], label: '“Mountains here” hint' },
         { color: [150, 170, 160], label: 'Soft edge (coast noise decides)' },
+        ...(f['drawing'] ? [{ color: DRAWING_LINE, label: 'Your drawing (the continents grow from it)' }] : []),
       ] };
       break;
     }
@@ -452,11 +466,10 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       break;
     }
     case 'barrier': {
-      const b = f['barrier'], rr = f['river_role'];
+      // Border and backbone rivers are drawn on their cell edges (overlay).
+      const b = f['barrier'];
       for (let i = 0; i < n; i++) {
         if (isSea(i) || (wm && wm[i] === 2)) { put(i, [32, 48, 78]); continue; }
-        if (rr && rr[i] === 1) { put(i, [235, 60, 50]); continue; }
-        if (rr && rr[i] === 2) { put(i, [60, 210, 120]); continue; }
         put(i, ramp(RAMPS.barrier, b ? b[i] : 0), sh(i));
       }
       legend = { title: 'Crossing cost (barrier)', gradient: { stops: RAMPS.barrier, unit: '' }, items: [

@@ -229,6 +229,49 @@ impl Grid {
         (&self.nbr_len, &self.nbr_rev)
     }
 
+    /// Index in the neighbour arrays of the edge from cell `a` to its neighbour `b`.
+    #[inline]
+    pub fn edge_index(&self, a: usize, b: usize) -> Option<usize> {
+        let s = self.nbr_off[a] as usize;
+        self.neighbors(a).iter().position(|&j| j as usize == b).map(|k| s + k)
+    }
+
+    /// Cell corners are the triangles: corner `t` is where cells `tris[t]` meet.
+    /// Its position is the triangle's centroid, which is where the renderer
+    /// and the border drawing put it.
+    pub fn corner_pos(&self, t: usize) -> Vec3 {
+        let [a, b, c] = self.tris[t];
+        (self.pos[a as usize] + self.pos[b as usize] + self.pos[c as usize]).normalized()
+    }
+
+    /// The corners across each side of every corner: `adj[t][k]` shares with
+    /// `t` the edge between cells `tris[t][k]` and `tris[t][(k + 1) % 3]`, so a
+    /// step from `t` to `adj[t][k]` runs along the boundary of those two cells.
+    pub fn corner_adjacency(&self) -> Vec<[u32; 3]> {
+        (0..self.tris.len())
+            .map(|t| {
+                let tri = self.tris[t];
+                std::array::from_fn(|k| {
+                    let (u, v) = (tri[k], tri[(k + 1) % 3]);
+                    *self
+                        .incident_tris(u as usize)
+                        .iter()
+                        .find(|&&o| o as usize != t && self.tris[o as usize].contains(&v))
+                        .expect("closed mesh edge has two triangles")
+                })
+            })
+            .collect()
+    }
+
+    /// The two cells on either side of the boundary between adjacent corners.
+    pub fn corner_edge_cells(&self, t: usize, u: usize) -> (usize, usize) {
+        let (a, b) = (self.tris[t], self.tris[u]);
+        let mut shared = a.iter().filter(|c| b.contains(c));
+        let x = *shared.next().expect("corners are not adjacent") as usize;
+        let y = *shared.next().expect("corners are not adjacent") as usize;
+        (x, y)
+    }
+
     fn build_start_table(&mut self) {
         let mut table = vec![0u32; TABLE_W * TABLE_H];
         let mut cur = 0usize;

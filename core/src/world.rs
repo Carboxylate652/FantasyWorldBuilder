@@ -137,14 +137,16 @@ impl World {
     /// the sketch changed) never hides a fresh earlier one (relief's). Only
     /// when no fresh step has the field is the latest stale one returned,
     /// flagged stale.
+    /// Fields hold one value per cell, per cell and month, or per cell corner
+    /// (triangle), like the river segments.
     pub fn field(&self, name: &str) -> Option<(&Field, Step, bool)> {
-        let n = self.grid.as_ref().map(|g| g.len())?;
+        let (n, nt) = self.grid.as_ref().map(|g| (g.len(), g.tris.len()))?;
         let h = self.expected_hashes();
         let mut stale_hit = None;
         for &s in STEPS.iter().rev() {
             if let Some(d) = &self.steps[s.index()] {
                 if let Some(f) = d.fields.get(name) {
-                    if f.len() == n || f.len() == 12 * n {
+                    if f.len() == n || f.len() == 12 * n || f.len() == nt {
                         if d.hash == h[s.index()] {
                             return Some((f, s, false));
                         }
@@ -227,6 +229,7 @@ impl World {
         write_json(&dir.join("overrides").join("bands.json"), &self.edits.overrides.bands)?;
         write_json(&dir.join("overrides").join("attraction.json"), &self.edits.overrides.attraction)?;
         write_json(&dir.join("overrides").join("nation_seeds.json"), &self.edits.overrides.nation_seeds)?;
+        write_json(&dir.join("overrides").join("cultures.json"), &self.edits.overrides.cultures)?;
         write_json(&dir.join("overrides").join("directives.json"), &self.edits.overrides.directives)?;
         write_json(&dir.join("imports.json"), &self.edits.imports)?;
         write_json(&dir.join("world.json"), &world)?;
@@ -252,6 +255,7 @@ impl World {
             bands: read_json_optional(&dir.join("overrides").join("bands.json"))?,
             attraction: read_json_optional(&dir.join("overrides").join("attraction.json"))?,
             nation_seeds: read_json_optional(&dir.join("overrides").join("nation_seeds.json"))?,
+            cultures: read_json_optional(&dir.join("overrides").join("cultures.json"))?,
             directives: read_json_optional(&dir.join("overrides").join("directives.json"))?,
         };
         let mut w = World::new(params);

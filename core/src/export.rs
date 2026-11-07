@@ -145,6 +145,9 @@ struct Layers<'a> {
     prov_class: Option<Vec<u8>>,
     prov_rgb: std::collections::HashMap<u32, [u8; 3]>,
     border_noise: Noise,
+    /// Cells on a river's banks: province borders there are not warped, so a
+    /// border along a river stays on the river line.
+    river_bank: Vec<bool>,
 }
 
 fn f32_of<'a>(w: &'a World, name: &str) -> Option<&'a [f32]> {
@@ -193,6 +196,7 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         },
         prov_rgb: province_colors(w),
         border_noise: Noise::new(w.params.planet.seed, stream::BORDER_NOISE),
+        river_bank: if fresh(Step::Hydrology) { f32_of(w, "river_width").map(|v| v.iter().map(|&x| x > 0.0).collect()).unwrap_or_default() } else { Vec::new() },
     };
     let (wpx, hpx) = (opts.width.clamp(64, 32768) as usize, opts.height.clamp(32, 16384) as usize);
     let noise = Noise::new(w.params.planet.seed, stream::EXPORT_NOISE);
@@ -384,13 +388,23 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
     // Rivers.
     if w.is_fresh(Step::Hydrology) {
         progress(0.9, "Drawing rivers");
-        let river = u8_of(w, "river_rank").ok_or("no rivers")?;
-        let recv = match w.field("receiver") {
+        // Rivers run along cell edges, from corner to corner.
+        let to = match w.field("river_to") {
             Some((Field::I32(v), _, _)) => v.as_slice(),
-            _ => return Err("no receivers".into()),
+            _ => return Err("no rivers".into()),
         };
-        let discharge = f32_of(w, "discharge").ok_or("no discharge")?;
-        let img = draw_rivers(&grid, river, recv, discharge, &water, wpx, hpx, opts);
+        let width = f32_of(w, "river_seg_width").ok_or("no river widths")?;
+        let discharge = f32_of(w, "river_seg_discharge").ok_or("no discharge")?;
+        let hp = &w.params.hydrology;
+        let w_thr = hp.width_coeff * hp.river_threshold_m3s.max(1.0).powf(hp.width_exponent);
+        let rank: Vec<u8> = width.iter().map(|&x| if x > 0.0 { (1.0 + 2.0 * (x as f64 / w_thr).log2().max(0.0)).min(9.0) as u8 } else { 0 }).collect();
+        let corner_ll: Vec<(f64, f64)> = (0..to.len())
+            .map(|t| {
+                let (la, lo) = grid.corner_pos(t).lat_lon();
+                (la.to_degrees(), lo.to_degrees())
+            })
+            .collect();
+        let img = draw_rivers(&corner_ll, &rank, to, discharge, &water, wpx, hpx, opts);
         let mut e = encoder(mk("rivers.png")?, png::ColorType::Indexed, png::BitDepth::Eight, Some(river_palette()))
             .write_header()
             .map_err(|e| e.to_string())?;
@@ -400,21 +414,20 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
 
         // Vector rivers with per-vertex width and discharge, for spline-based
         // river renderers (e.g. Victoria 3 style) and GIS tools.
-        let width = f32_of(w, "river_width").ok_or("no river widths")?;
         let mut feats = Vec::new();
-        for (q, chain) in river_chains(grid.len(), river, recv, discharge) {
+        for (q, chain) in river_chains(to, discharge) {
             let mut coords: Vec<[f64; 2]> = Vec::with_capacity(chain.len());
             let mut widths = Vec::with_capacity(chain.len());
             let mut flows = Vec::with_capacity(chain.len());
             for &c in &chain {
-                let lon = grid.lon[c].to_degrees();
+                let (lat, lon) = corner_ll[c];
                 // Keep the line continuous across the antimeridian (lon may leave ±180).
                 let lon = match coords.last() {
                     Some(&[pl, _]) if lon - pl > 180.0 => lon - 360.0,
                     Some(&[pl, _]) if lon - pl < -180.0 => lon + 360.0,
                     _ => lon,
                 };
-                coords.push([(lon * 1e4).round() / 1e4, (grid.lat[c].to_degrees() * 1e4).round() / 1e4]);
+                coords.push([(lon * 1e4).round() / 1e4, (lat * 1e4).round() / 1e4]);
                 // The last vertex is the confluence (or the sea): keep this river's own values there.
                 let idx = flows.len();
                 let k = if idx + 1 == chain.len() && idx > 0 { chain[idx - 1] } else { c };
@@ -464,7 +477,7 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         "terrain_palette": TERRAIN.iter().enumerate().map(|(i, (n, c))| serde_json::json!({"index": i, "name": n, "rgb": c})).collect::<Vec<_>>(),
         "koppen_colors": KOPPEN.iter().map(|(n, c)| serde_json::json!({"class": n, "rgb": c})).collect::<Vec<_>>(),
         "rivers": {"0": "source", "1": "merge (tributary end)", "2": "split", "3-11": "width class: each step is ×√2 in width, from the threshold river (3) up", "254": "land", "255": "water"},
-        "rivers_geojson": "rivers.geojson: one LineString per river from source to confluence or mouth, with width_m and discharge_m3s per vertex (width = a·Q^b)",
+        "rivers_geojson": "rivers.geojson: one LineString per river from source to confluence or mouth, running along cell edges (vertices are cell corners), with width_m and discharge_m3s per vertex (width = a·Q^b)",
         "river_width": { "coeff": w.params.hydrology.width_coeff, "exponent": w.params.hydrology.width_exponent },
         "provinces": {
             "provinces.png": "one unique RGB colour per province, nearest-cell sampling (no anti-aliasing); borders are noise-warped by up to a third of a grid cell; islets and ponds made only by detail noise are removed, stray pieces merged and X-crossings broken up (see province_cleanup)",
@@ -633,7 +646,8 @@ fn province_pixel(g: &Grid, l: &Layers, prov: &[u32], cls: &[u8], noise: &Noise,
 /// matching neighbour of the nearest corner.
 #[allow(clippy::too_many_arguments)]
 fn province_at(g: &Grid, l: &Layers, prov: &[u32], cls: &[u8], p: Vec3, c: [usize; 3], wt: [f64; 3], want: u8) -> Option<u32> {
-    let amp = g.spacing * 0.35;
+    let on_river = !l.river_bank.is_empty() && c.iter().any(|&k| l.river_bank[k]);
+    let amp = if on_river { 0.0 } else { g.spacing * 0.35 };
     let f = 1.0 / (g.spacing * 3.0);
     let warp = Vec3::new(
         l.border_noise.fbm(p, f, 2),
@@ -1197,58 +1211,54 @@ fn write_culture_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>
 
 /// River chains, biggest first: each runs from a source down its main stem to
 /// where it joins a bigger river (inclusive) or reaches water.
-fn river_chains(n: usize, rank: &[u8], recv: &[i32], discharge: &[f32]) -> Vec<(f32, Vec<usize>)> {
-    // Main upstream of each river cell = the river donor with the most discharge.
-    let mut main_up = vec![-1i32; n];
-    for i in 0..n {
-        if rank[i] == 0 {
-            continue;
-        }
-        let r = recv[i];
-        if r >= 0 && rank[r as usize] > 0 {
+/// River courses over the corner tree (`to[t]` ≥ 0 on a river), each from its
+/// source down to where it joins a bigger river or reaches water, with the
+/// discharge it brings there. The last corner is the confluence or the shore.
+fn river_chains(to: &[i32], discharge: &[f32]) -> Vec<(f32, Vec<usize>)> {
+    let nt = to.len();
+    // Main upstream of each river corner = the river donor with the most discharge.
+    let mut main_up = vec![-1i32; nt];
+    for t in 0..nt {
+        let r = to[t];
+        if r >= 0 && to[r as usize] >= 0 {
             let r = r as usize;
-            if main_up[r] < 0 || discharge[i] > discharge[main_up[r] as usize] {
-                main_up[r] = i as i32;
+            if main_up[r] < 0 || discharge[t] > discharge[main_up[r] as usize] {
+                main_up[r] = t as i32;
             }
         }
     }
-    // Chains: from each source down to where it joins a bigger river or water.
     let mut chains: Vec<(f32, Vec<usize>)> = Vec::new();
-    for s in 0..n {
-        if rank[s] == 0 || main_up[s] >= 0 {
+    for s in 0..nt {
+        if to[s] < 0 || main_up[s] >= 0 {
             continue;
         }
         let mut chain = vec![s];
         let mut c = s;
         loop {
-            let r = recv[c];
+            let r = to[c];
             if r < 0 {
                 break;
             }
             let r = r as usize;
             chain.push(r);
-            if rank[r] == 0 || main_up[r] != c as i32 {
+            if to[r] < 0 || main_up[r] != c as i32 {
                 break;
             }
             c = r;
         }
-        // The last cell is the confluence or the sea: rank by this river's own flow.
         let q = discharge[chain[chain.len().saturating_sub(2)]];
         chains.push((q, chain));
     }
     chains.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1[0].cmp(&b.1[0])));
-
     chains
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_rivers(g: &Grid, rank: &[u8], recv: &[i32], discharge: &[f32], water: &[bool], w: usize, h: usize, o: &ExportOptions) -> Vec<u8> {
+fn draw_rivers(corner_ll: &[(f64, f64)], rank: &[u8], to: &[i32], discharge: &[f32], water: &[bool], w: usize, h: usize, o: &ExportOptions) -> Vec<u8> {
     use river_px::*;
     let mut img: Vec<u8> = water.iter().map(|&wt| if wt { WATER } else { LAND }).collect();
-    let n = g.len();
     let to_px = |i: usize| -> Option<(i64, i64)> {
-        let lat = g.lat[i].to_degrees();
-        let lon = g.lon[i].to_degrees();
+        let (lat, lon) = corner_ll[i];
         if lat < o.lat_min || lat > o.lat_max {
             return None;
         }
@@ -1256,7 +1266,7 @@ fn draw_rivers(g: &Grid, rank: &[u8], recv: &[i32], discharge: &[f32], water: &[
         let y = ((o.lat_max - lat) / (o.lat_max - o.lat_min) * h as f64).floor() as i64;
         Some((x.clamp(0, w as i64 - 1), y.clamp(0, h as i64 - 1)))
     };
-    let chains = river_chains(n, rank, recv, discharge);
+    let chains = river_chains(to, discharge);
 
     for (_, chain) in &chains {
         let mut first = true;
