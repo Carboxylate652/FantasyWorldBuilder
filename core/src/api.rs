@@ -1,13 +1,16 @@
 //! Command interface shared by the Tauri app and the headless HTTP server.
 //! Every command takes JSON arguments and returns either JSON or raw bytes.
 
-use crate::edits::{EditLayer, Edits, MotionArrow, PlatePin, Stroke};
+use crate::edits::{EditLayer, Edits, Imports, MotionArrow, PlatePin, Sketch, SketchBase, Stroke};
 use crate::export::{export, ExportOptions};
 use crate::fields::Field;
 use crate::params::WorldParams;
+use crate::stages::cultures::CultureSim;
+use crate::stages::nations::NationSim;
 use crate::stages::{climate, Step, STEPS};
 use crate::world::World;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -28,9 +31,257 @@ pub struct ProgressState {
 pub struct Session {
     pub world: World,
     pub path: Option<PathBuf>,
-    undo: Vec<Edits>,
-    redo: Vec<Edits>,
+    undo: VecDeque<EditHistory>,
+    redo: VecDeque<EditHistory>,
     pub dirty: bool,
+    /// A Stage 3 or 4 simulation running step by step.
+    pub live: Option<Live>,
+}
+
+/// Undo stores only the part an action can change instead of cloning all edit
+/// layers for every brush stroke. Applying an entry yields its redo inverse.
+enum EditHistory {
+    Layers(Vec<(EditLayer, LayerState)>),
+    Pins(Vec<PlatePin>),
+    Arrows(Vec<MotionArrow>),
+    /// The sketch base: (auto_base, from_drawing).
+    AutoBase(bool, bool),
+    Imports(Imports),
+}
+
+enum LayerState {
+    Sketch(Sketch),
+    Strokes(Vec<Stroke>),
+    Directives(Vec<crate::directives::Directive>),
+}
+
+impl LayerState {
+    fn capture(edits: &Edits, layer: EditLayer) -> LayerState {
+        match layer {
+            EditLayer::Sketch => LayerState::Sketch(edits.sketch.clone()),
+            EditLayer::Directives => LayerState::Directives(edits.overrides.directives.clone()),
+            _ => LayerState::Strokes(edits.strokes(layer).clone()),
+        }
+    }
+    fn restore(self, edits: &mut Edits, layer: EditLayer) {
+        match (layer, self) {
+            (EditLayer::Sketch, LayerState::Sketch(v)) => edits.sketch = v,
+            (EditLayer::Directives, LayerState::Directives(v)) => edits.overrides.directives = v,
+            (EditLayer::Plates, LayerState::Strokes(v)) => edits.overrides.plates = v,
+            (EditLayer::Elevation, LayerState::Strokes(v)) => edits.overrides.elevation = v,
+            (EditLayer::Biomes, LayerState::Strokes(v)) => edits.overrides.biomes = v,
+            (EditLayer::Barriers, LayerState::Strokes(v)) => edits.overrides.barriers = v,
+            (EditLayer::States, LayerState::Strokes(v)) => edits.overrides.states = v,
+            (EditLayer::Provinces, LayerState::Strokes(v)) => edits.overrides.provinces = v,
+            (EditLayer::Sites, LayerState::Strokes(v)) => edits.overrides.sites = v,
+            (EditLayer::Fertility, LayerState::Strokes(v)) => edits.overrides.fertility = v,
+            (EditLayer::Bands, LayerState::Strokes(v)) => edits.overrides.bands = v,
+            (EditLayer::Attraction, LayerState::Strokes(v)) => edits.overrides.attraction = v,
+            (EditLayer::NationSeeds, LayerState::Strokes(v)) => edits.overrides.nation_seeds = v,
+            (EditLayer::Cultures, LayerState::Strokes(v)) => edits.overrides.cultures = v,
+            _ => unreachable!("history state does not match edit layer"),
+        }
+    }
+}
+
+impl EditHistory {
+    fn swap(self, edits: &mut Edits) -> EditHistory {
+        match self {
+            EditHistory::Layers(saved) => {
+                let mut inverse = Vec::with_capacity(saved.len());
+                for (layer, state) in saved {
+                    inverse.push((layer, LayerState::capture(edits, layer)));
+                    state.restore(edits, layer);
+                }
+                EditHistory::Layers(inverse)
+            }
+            EditHistory::Pins(mut saved) => { std::mem::swap(&mut saved, &mut edits.sketch.pins); EditHistory::Pins(saved) }
+            EditHistory::Arrows(mut saved) => { std::mem::swap(&mut saved, &mut edits.sketch.arrows); EditHistory::Arrows(saved) }
+            EditHistory::AutoBase(a, d) => EditHistory::AutoBase(std::mem::replace(&mut edits.sketch.auto_base, a), std::mem::replace(&mut edits.sketch.from_drawing, d)),
+            EditHistory::Imports(mut saved) => { std::mem::swap(&mut saved, &mut edits.imports); EditHistory::Imports(saved) }
+        }
+    }
+}
+
+pub enum LiveSim {
+    Cultures(Box<CultureSim>),
+    Nations(Box<NationSim>),
+}
+
+/// A live simulation and what it was started from, so a commit can tell
+/// whether its result is still the one a fresh run would give.
+pub struct Live {
+    pub sim: LiveSim,
+    step: Step,
+    upstream_hash: u64,
+    inputs: Value,
+    millis: u64,
+    cache: Option<(Value, crate::fields::Fields)>,
+}
+
+impl Live {
+    pub fn stage(&self) -> &'static str {
+        self.step.key()
+    }
+
+    pub fn done(&self) -> bool {
+        match &self.sim {
+            LiveSim::Cultures(c) => c.done(),
+            LiveSim::Nations(n) => n.done(),
+        }
+    }
+
+    /// Where the run stands: the next generation (Stage 3) or year (Stage 4).
+    pub fn position(&self) -> i64 {
+        match &self.sim {
+            LiveSim::Cultures(c) => c.t as i64,
+            LiveSim::Nations(n) => n.year as i64,
+        }
+    }
+
+    /// The next generation (Stage 3), or month counted from year 0 (Stage 4).
+    fn clock(&self) -> i64 {
+        match &self.sim {
+            LiveSim::Cultures(c) => c.t as i64,
+            LiveSim::Nations(n) => n.time(),
+        }
+    }
+
+    /// When a directive issued now applies: (generation or year, month).
+    fn when(&self) -> (i64, u8) {
+        match &self.sim {
+            LiveSim::Cultures(c) => (c.t as i64, 0),
+            LiveSim::Nations(n) => (n.year as i64, n.month()),
+        }
+    }
+
+    fn step_once(&mut self, progress: &dyn Fn(f32, &str)) {
+        let t0 = std::time::Instant::now();
+        match &mut self.sim {
+            LiveSim::Cultures(c) => c.tick(progress),
+            LiveSim::Nations(n) => n.step(progress),
+        }
+        self.millis += t0.elapsed().as_millis() as u64;
+        self.cache = None;
+    }
+
+    /// Era label at the current position (stepping "to the next era" stops when it changes).
+    fn era(&self) -> String {
+        match &self.sim {
+            LiveSim::Cultures(c) => format!("{}", c.era_of(c.t.min(c.ticks().saturating_sub(1)))),
+            LiveSim::Nations(n) => n.era().to_string(),
+        }
+    }
+
+    pub fn snapshot(&mut self) -> &(Value, crate::fields::Fields) {
+        if self.cache.is_none() {
+            let (mut v, f) = match &self.sim {
+                LiveSim::Cultures(c) => c.snapshot(),
+                LiveSim::Nations(n) => n.snapshot(),
+            };
+            v["done"] = json!(self.done());
+            v["position"] = json!(self.position());
+            if let LiveSim::Nations(n) = &self.sim {
+                v["month"] = json!(n.month());
+            }
+            self.cache = Some((v, f));
+        }
+        self.cache.as_ref().unwrap()
+    }
+
+    fn info(&self) -> Value {
+        let (end, unit, month) = match &self.sim {
+            LiveSim::Cultures(c) => (c.ticks() as i64, "generation", None),
+            LiveSim::Nations(n) => (n.end_year() as i64, "year", Some(n.month())),
+        };
+        json!({ "stage": self.stage(), "position": self.position(), "month": month, "end": end, "unit": unit, "done": self.done() })
+    }
+}
+
+/// What adding a culture-editor stroke does.
+pub enum CultureEdit {
+    Add(Stroke),
+    /// Remove these lock strokes (the culture was locked: the click unlocks it).
+    Unlock(Vec<usize>),
+}
+
+/// Check a culture-editor stroke against the current Stage 3 result. A lock
+/// records the culture's provinces and name as they are now, or unlocks a
+/// locked culture; an edit aimed at a locked culture is refused.
+pub fn prepare_culture_edit(w: &mut World, mut st: Stroke) -> Result<CultureEdit, String> {
+    use crate::edits::Tool;
+    use crate::vec3::Vec3;
+    let g = w.grid();
+    let fresh = w.is_fresh(Step::Cultures);
+    let cell = |ll: [f64; 2]| g.nearest(Vec3::from_lat_lon_deg(ll[0], ll[1]), None);
+    let cult_field: Option<Vec<u16>> = match w.field("culture") {
+        Some((Field::U16(v), _, false)) => Some(v.clone()),
+        _ => None,
+    };
+    let culture_at = |ll: [f64; 2]| cult_field.as_ref().map_or(0, |v| v[cell(ll)] as u32);
+    let rows = w.meta(Step::Cultures).and_then(|m| m["table"]["cultures"].as_array().cloned()).unwrap_or_default();
+    let row = |c: u32| rows.iter().find(|r| r["id"].as_u64() == Some(c as u64));
+    let locked = |c: u32| row(c).is_some_and(|r| r["locked"].as_bool().unwrap_or(false));
+    let name = |c: u32| row(c).and_then(|r| r["name"].as_str()).unwrap_or("This culture").to_string();
+    if st.tool == Tool::CultureLock {
+        if !fresh || cult_field.is_none() {
+            return Err("Run the Cultures step first: a lock records the culture as it is now.".into());
+        }
+        let c = culture_at(st.points[0]);
+        if c == 0 {
+            return Err("No culture here.".into());
+        }
+        if locked(c) {
+            let idx: Vec<usize> = w.edits.overrides.cultures.iter().enumerate().filter(|(_, s)| s.tool == Tool::CultureLock && s.points.iter().skip(1).any(|&p| culture_at(p) == c)).map(|(k, _)| k).collect();
+            return if idx.is_empty() { Err(format!("Could not find the lock of {}.", name(c))) } else { Ok(CultureEdit::Unlock(idx)) };
+        }
+        // Its provinces now: the centre of every province where it is the majority.
+        let prov_field: Vec<u32> = match w.field("province") {
+            Some((Field::U32(v), _, _)) => v.clone(),
+            _ => return Err("Run the Provinces step first.".into()),
+        };
+        let cf = cult_field.as_ref().unwrap();
+        let ids: std::collections::BTreeSet<u32> = (0..cf.len()).filter(|&i| cf[i] as u32 == c).map(|i| prov_field[i]).collect();
+        let centres: Vec<[f64; 2]> = w
+            .meta(Step::Provinces)
+            .and_then(|m| m["table"]["provinces"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter(|p| p["id"].as_u64().is_some_and(|id| ids.contains(&(id as u32))))
+            .filter_map(|p| Some([p["center"][0].as_f64()?, p["center"][1].as_f64()?]))
+            .collect();
+        if centres.is_empty() {
+            return Err(format!("{} holds no province.", name(c)));
+        }
+        st.points.truncate(1);
+        st.points.extend(centres);
+        st.name = name(c);
+        return Ok(CultureEdit::Add(st));
+    }
+    if fresh {
+        let ends: Vec<[f64; 2]> = match st.tool {
+            Tool::CultureMerge | Tool::CultureReparent => vec![st.points[0], *st.points.last().unwrap()],
+            Tool::CultureSplit => vec![st.points[st.points.len() / 2]],
+            _ => vec![st.points[0]],
+        };
+        if let Some(c) = ends.iter().map(|&p| culture_at(p)).find(|&c| c > 0 && locked(c)) {
+            return Err(format!("{} is locked: unlock it first.", name(c)));
+        }
+    }
+    if st.tool == Tool::CultureNewName && st.seed == 0 {
+        // A different name each time, and the same one when the edit replays.
+        let p = st.points[0];
+        st.seed = (w.edits.overrides.cultures.len() as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (p[0] * 1e4) as i64 as u64 ^ ((p[1] * 1e4) as i64 as u64).rotate_left(29);
+    }
+    Ok(CultureEdit::Add(st))
+}
+
+/// The inputs a live run depends on besides upstream steps and its directives.
+fn live_inputs(w: &World, step: Step) -> Value {
+    match step {
+        Step::Cultures => json!([w.params.cultures, w.edits.overrides.bands, w.edits.overrides.attraction, w.edits.overrides.cultures]),
+        _ => json!([w.params.nations, w.edits.overrides.nation_seeds]),
+    }
 }
 
 impl Default for Session {
@@ -41,16 +292,25 @@ impl Default for Session {
 
 impl Session {
     pub fn new(params: WorldParams) -> Session {
-        Session { world: World::new(params), path: None, undo: vec![], redo: vec![], dirty: false }
+        Session { world: World::new(params), path: None, undo: VecDeque::new(), redo: VecDeque::new(), dirty: false, live: None }
     }
 
-    fn snapshot(&mut self) {
-        self.undo.push(self.world.edits.clone());
+    fn remember(&mut self, state: EditHistory) {
+        self.undo.push_back(state);
         if self.undo.len() > 500 {
-            self.undo.remove(0);
+            self.undo.pop_front();
         }
         self.redo.clear();
         self.dirty = true;
+    }
+
+    fn snapshot_layers(&mut self, layers: &[EditLayer]) {
+        let mut unique = Vec::new();
+        for &layer in layers {
+            if !unique.contains(&layer) { unique.push(layer); }
+        }
+        let state = EditHistory::Layers(unique.into_iter().map(|l| (l, LayerState::capture(&self.world.edits, l))).collect());
+        self.remember(state);
     }
 
     pub fn status(&mut self) -> Value {
@@ -61,6 +321,7 @@ impl Session {
             "params": self.world.params,
             "edits": {
                 "auto_base": e.sketch.auto_base,
+                "sketch_base": e.sketch.base(),
                 "sketch_strokes": e.sketch.strokes.len(),
                 "pins": e.sketch.pins,
                 "arrows": e.sketch.arrows,
@@ -73,6 +334,8 @@ impl Session {
                 "site_pins": e.overrides.sites.len(),
                 "fertility_strokes": e.overrides.fertility.len(),
                 "attraction_strokes": e.overrides.attraction.len(),
+                "culture_edits": e.overrides.cultures.len(),
+                "nation_seeds": e.overrides.nation_seeds.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "size": s.value, "name": s.name }))).collect::<Vec<_>>(),
                 "band_pins": e.overrides.bands.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "bands": s.value }))).collect::<Vec<_>>(),
                 "sites": e.overrides.sites.iter().filter_map(|s| s.points.first().map(|p| json!({ "lat": p[0], "lon": p[1], "population": s.value }))).collect::<Vec<_>>(),
                 "elevation_import": e.imports.elevation,
@@ -84,6 +347,7 @@ impl Session {
             "can_undo": !self.undo.is_empty(),
             "can_redo": !self.redo.is_empty(),
             "dirty": self.dirty,
+            "live": self.live.as_ref().map(|l| l.info()),
         })
     }
 }
@@ -97,7 +361,7 @@ pub fn overrides_report(w: &World) -> Value {
         .map(|&l| json!({ "layer": l.key(), "title": l.title(), "step": l.step().key(), "edits": w.edits.count(l) }))
         .collect();
     let mut unapplied = Vec::new();
-    for st in [Step::States, Step::Provinces] {
+    for st in [Step::States, Step::Provinces, Step::Cultures] {
         if let Some(m) = w.meta(st) {
             if let Some(a) = m["unapplied_edits"].as_array() {
                 // Indices refer to the run's edits: drop entries the layer no longer has.
@@ -115,6 +379,19 @@ fn layer_list(w: &World, names: Option<Vec<String>>) -> Result<Vec<EditLayer>, S
         Some(v) => v.iter().map(|k| EditLayer::from_key(k).ok_or(format!("unknown layer `{k}`"))).collect(),
         None => Ok(EditLayer::ALL.into_iter().filter(|&l| w.edits.count(l) > 0).collect()),
     }
+}
+
+fn live_unit_is_year(sim: &LiveSim) -> bool {
+    matches!(sim, LiveSim::Nations(_))
+}
+
+/// The live simulation's summary (for the UI and the AI guide) and the session status.
+fn sim_state(s: &mut Session) -> Result<Reply, String> {
+    let live = s.live.as_mut().ok_or("no live simulation")?;
+    let summary = live.snapshot().0.clone();
+    let mut st = s.status();
+    st["sim"] = summary;
+    Ok(Reply::Json(st))
 }
 
 fn arg<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, String> {
@@ -226,6 +503,12 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 }
                 return Ok(Reply::Bytes(field_bytes(&Field::F32(v), stale, step, None, n)));
             }
+            if let Some(live) = s.live.as_mut() {
+                let step = live.step;
+                if let Some(f) = live.snapshot().1.get(&name) {
+                    return Ok(Reply::Bytes(field_bytes(f, false, step, month, n)));
+                }
+            }
             match s.world.field(&name) {
                 Some((f, step, stale)) => Ok(Reply::Bytes(field_bytes(f, stale, step, month, n))),
                 None => Err(format!("field `{name}` is not available")),
@@ -264,9 +547,16 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             out.insert("cell".into(), json!(cell));
             out.insert("lat".into(), json!(g.lat[cell].to_degrees()));
             out.insert("lon".into(), json!(g.lon[cell].to_degrees()));
+            // Later steps shadow earlier ones, but a stale result never hides
+            // a fresh one: stale steps only fill in names not yet known.
+            let hashes = s.world.expected_hashes();
             for &st in STEPS.iter() {
                 let Some(d) = &s.world.steps[st.index()] else { continue };
+                let stale = d.hash != hashes[st.index()];
                 for (name, f) in &d.fields.0 {
+                    if stale && out.contains_key(name) {
+                        continue;
+                    }
                     let v = match f {
                         Field::F32(v) if v.len() == 12 * n => match month {
                             Some(m) => json!(v[m * n + cell]),
@@ -277,6 +567,19 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                         Field::U16(v) if v.len() == n => json!(v[cell]),
                         Field::U32(v) if v.len() == n => json!(v[cell]),
                         Field::I32(v) if v.len() == n => json!(v[cell]),
+                        _ => continue,
+                    };
+                    out.insert(name.clone(), v);
+                }
+            }
+            // A live simulation's values shadow the committed ones.
+            if let Some(live) = s.live.as_mut() {
+                for (name, f) in &live.snapshot().1 .0 {
+                    let v = match f {
+                        Field::F32(v) if v.len() == n => json!(v[cell]),
+                        Field::U8(v) if v.len() == n => json!(v[cell]),
+                        Field::U16(v) if v.len() == n => json!(v[cell]),
+                        Field::U32(v) if v.len() == n => json!(v[cell]),
                         _ => continue,
                     };
                     out.insert(name.clone(), v);
@@ -297,37 +600,46 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             if st.points.is_empty() {
                 return Err("empty stroke".into());
             }
-            s.snapshot();
-            s.world.edits.add_stroke(st);
+            let layer = st.tool.layer();
+            let action = if layer == EditLayer::Cultures { prepare_culture_edit(&mut s.world, st)? } else { CultureEdit::Add(st) };
+            s.snapshot_layers(&[layer]);
+            match action {
+                CultureEdit::Add(st) => s.world.edits.add_stroke(st),
+                CultureEdit::Unlock(idx) => {
+                    s.world.edits.remove_strokes(EditLayer::Cultures, &idx);
+                }
+            }
             Ok(Reply::Json(s.status()))
         }
         "add_pin" => {
             let p: PlatePin = arg(&args, "pin")?;
-            s.snapshot();
+            s.remember(EditHistory::Pins(s.world.edits.sketch.pins.clone()));
             s.world.edits.sketch.pins.push(p);
             Ok(Reply::Json(s.status()))
         }
         "add_arrow" => {
             let a: MotionArrow = arg(&args, "arrow")?;
-            s.snapshot();
+            s.remember(EditHistory::Arrows(s.world.edits.sketch.arrows.clone()));
             s.world.edits.sketch.arrows.push(a);
             Ok(Reply::Json(s.status()))
         }
         "remove_pin" | "remove_arrow" => {
             let i: usize = arg(&args, "index")?;
-            s.snapshot();
-            let sk = &mut s.world.edits.sketch;
-            if cmd == "remove_pin" && i < sk.pins.len() {
-                sk.pins.remove(i);
-            } else if cmd == "remove_arrow" && i < sk.arrows.len() {
-                sk.arrows.remove(i);
+            if cmd == "remove_pin" && i < s.world.edits.sketch.pins.len() {
+                s.remember(EditHistory::Pins(s.world.edits.sketch.pins.clone()));
+                s.world.edits.sketch.pins.remove(i);
+            } else if cmd == "remove_arrow" && i < s.world.edits.sketch.arrows.len() {
+                s.remember(EditHistory::Arrows(s.world.edits.sketch.arrows.clone()));
+                s.world.edits.sketch.arrows.remove(i);
             }
             Ok(Reply::Json(s.status()))
         }
         "clear_layer" => {
             let layer: EditLayer = arg(&args, "layer")?;
-            s.snapshot();
-            s.world.edits.clear_layer(layer);
+            if s.world.edits.count(layer) > 0 {
+                s.snapshot_layers(&[layer]);
+                s.world.edits.clear_layer(layer);
+            }
             Ok(Reply::Json(s.status()))
         }
         "overrides" => Ok(Reply::Json(overrides_report(&s.world))),
@@ -335,8 +647,11 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             // { layer, indices }: drop strokes, e.g. the unapplied ones.
             let layer: EditLayer = arg(&args, "layer")?;
             let idx: Vec<usize> = arg(&args, "indices")?;
-            s.snapshot();
-            let removed = s.world.edits.remove_strokes(layer, &idx);
+            let len = if layer == EditLayer::Directives { s.world.edits.overrides.directives.len() } else { s.world.edits.strokes(layer).len() };
+            let removed = if idx.iter().any(|&i| i < len) {
+                s.snapshot_layers(&[layer]);
+                s.world.edits.remove_strokes(layer, &idx)
+            } else { 0 };
             let mut st = s.status();
             st["removed"] = json!(removed);
             Ok(Reply::Json(st))
@@ -359,17 +674,26 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             let b: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
             let mut edits = s.world.edits.clone();
             let taken = edits.apply_bundle(&b, only.as_deref(), replace)?;
-            s.snapshot();
-            s.world.edits = edits;
+            if !taken.is_empty() {
+                s.snapshot_layers(&taken.iter().map(|x| x.0).collect::<Vec<_>>());
+                s.world.edits = edits;
+            }
             let mut st = s.status();
             st["imported"] = json!(taken.iter().map(|(l, n)| json!({ "layer": l.key(), "edits": n })).collect::<Vec<_>>());
             Ok(Reply::Json(st))
         }
-        "set_auto_base" => {
-            let v: bool = arg(&args, "value")?;
-            if v != s.world.edits.sketch.auto_base {
-                s.snapshot();
-                s.world.edits.sketch.auto_base = v;
+        "set_auto_base" | "set_sketch_base" => {
+            // set_auto_base { value: bool }: generated continents or an empty ocean.
+            // set_sketch_base { value: "generated" | "ocean" | "drawing" }.
+            let b = if cmd == "set_auto_base" {
+                if arg::<bool>(&args, "value")? { SketchBase::Generated } else { SketchBase::Ocean }
+            } else {
+                arg::<SketchBase>(&args, "value")?
+            };
+            let sk = &s.world.edits.sketch;
+            if b != sk.base() {
+                s.remember(EditHistory::AutoBase(sk.auto_base, sk.from_drawing));
+                s.world.edits.sketch.set_base(b);
             }
             Ok(Reply::Json(s.status()))
         }
@@ -387,7 +711,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 }
                 None => None,
             };
-            s.snapshot();
+            s.remember(EditHistory::Imports(s.world.edits.imports.clone()));
             s.world.edits.imports.elevation = imp;
             Ok(Reply::Json(s.status()))
         }
@@ -406,7 +730,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 }
                 None => (None, Value::Null),
             };
-            s.snapshot();
+            s.remember(EditHistory::Imports(s.world.edits.imports.clone()));
             s.world.edits.imports.provinces = imp;
             let mut st = s.status();
             st["report"] = report;
@@ -436,13 +760,25 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                     t["culture_groups"] = c["groups"].clone();
                     t["culture_events"] = c["events"].clone();
                 }
+                if s.world.is_fresh(Step::Nations) {
+                    if let Some(nm) = pick(Step::Nations) {
+                        t["nations"] = nm["nations"].clone();
+                        t["nation_events"] = nm["events"].clone();
+                        t["railways"] = nm["railways"].clone();
+                        t["city_pins"] = nm["pins"].clone();
+                        t["cities"] = nm["cities"].clone();
+                    }
+                }
             }
             Ok(Reply::Json(t))
         }
         "undo" | "redo" => {
-            let (from, to) = if cmd == "undo" { (&mut s.undo, &mut s.redo) } else { (&mut s.redo, &mut s.undo) };
-            if let Some(e) = from.pop() {
-                to.push(std::mem::replace(&mut s.world.edits, e));
+            // A live run cannot take back what it already simulated: undo ends it.
+            s.live = None;
+            let entry = if cmd == "undo" { s.undo.pop_back() } else { s.redo.pop_back() };
+            if let Some(entry) = entry {
+                let inverse = entry.swap(&mut s.world.edits);
+                if cmd == "undo" { s.redo.push_back(inverse); } else { s.undo.push_back(inverse); }
                 s.dirty = true;
             }
             Ok(Reply::Json(s.status()))
@@ -509,6 +845,215 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             Ok(Reply::Json(serde_json::to_value(res?).unwrap()))
         }
         "fingerprint" => Ok(Reply::Json(json!(s.world.fingerprint()))),
+        "sim_actions" => {
+            // The directives a stage offers (also the AI guide's tools).
+            let stage: String = arg(&args, "stage")?;
+            Ok(Reply::Json(json!(crate::directives::actions_for(&stage).iter().map(|a| json!({ "name": a.name, "description": a.description, "schema": a.schema })).collect::<Vec<_>>())))
+        }
+        "sim_start" => {
+            // { stage: "cultures" | "nations" }: earlier steps are brought up to date first.
+            let stage: String = arg(&args, "stage")?;
+            let step = match stage.as_str() {
+                "cultures" => Step::Cultures,
+                "nations" => Step::Nations,
+                _ => return Err(format!("`{stage}` has no step-by-step simulation (cultures, nations)")),
+            };
+            set_progress(progress, |p| *p = ProgressState { running: true, task: "sim".into(), ..Default::default() });
+            let pr = progress.clone();
+            let sim = s.world.with_ctx(step, &move |st: Step, f: f32, m: &str| set_progress(&pr, |p| {
+                p.step = st.key().into();
+                p.frac = f;
+                p.msg = m.into();
+            }), |ctx| match step {
+                Step::Cultures => CultureSim::new(ctx).map(|c| LiveSim::Cultures(Box::new(c))),
+                _ => NationSim::new(ctx).map(|n| LiveSim::Nations(Box::new(n))),
+            });
+            set_progress(progress, |p| p.running = false);
+            let sim = sim.ok_or("nothing to simulate: no land can hold people")?;
+            let k = step.index();
+            s.live = Some(Live { sim, step, upstream_hash: s.world.expected_hashes()[k - 1], inputs: live_inputs(&s.world, step), millis: 0, cache: None });
+            s.dirty = true;
+            sim_state(s)
+        }
+        "sim_step" => {
+            // { steps?, years?, months?, to?: "era" | "end", stop_at_choice? }
+            // — one step (a generation, or the current step length) by
+            // default. With stop_at_choice, Stage 4 stops before an
+            // institution is born so the user can choose its birthplace.
+            let live = s.live.as_mut().ok_or("no live simulation; start one first")?;
+            let years: Option<f64> = arg(&args, "years")?;
+            let months: Option<i64> = arg(&args, "months")?;
+            let to: Option<String> = arg(&args, "to")?;
+            let stop_at_choice = arg::<Option<bool>>(&args, "stop_at_choice")?.unwrap_or(false);
+            let mut steps: u64 = arg::<Option<u64>>(&args, "steps")?.unwrap_or(1);
+            // Stage 4 steps vary in length: step until the month is reached.
+            let mut target: Option<i64> = None;
+            if years.is_some() || months.is_some() {
+                let m = months.unwrap_or(0) + years.map_or(0, |y| (y * 12.0).round() as i64);
+                match &live.sim {
+                    LiveSim::Cultures(c) => steps = (m as f64 / 12.0 / c.years_per_tick().max(1e-9)).ceil().max(1.0) as u64,
+                    LiveSim::Nations(n) => {
+                        target = Some(n.time() + m.max(1));
+                        steps = u64::MAX;
+                    }
+                }
+            }
+            set_progress(progress, |p| *p = ProgressState { running: true, task: "sim".into(), step: live.stage().into(), ..Default::default() });
+            let era0 = live.era();
+            let mut k = 0u64;
+            let pr = progress.clone();
+            let report = move |_f: f32, m: &str| set_progress(&pr, |p| p.msg = m.to_string());
+            while !live.done() {
+                if stop_at_choice && matches!(&live.sim, LiveSim::Nations(n) if n.pending_institution().is_some()) {
+                    break;
+                }
+                match to.as_deref() {
+                    Some("end") => {}
+                    Some("era") if live.era() != era0 => break,
+                    Some("era") => {}
+                    _ if k >= steps => break,
+                    _ if target.is_some_and(|t| live.clock() >= t) => break,
+                    _ => {}
+                }
+                live.step_once(&report);
+                k += 1;
+                if k % 5 == 0 {
+                    let pos = live.position();
+                    set_progress(progress, |p| {
+                        p.frac = 0.0;
+                        p.msg = format!("{} {}", if live_unit_is_year(&live.sim) { "Year" } else { "Generation" }, pos);
+                    });
+                }
+            }
+            set_progress(progress, |p| p.running = false);
+            sim_state(s)
+        }
+        "sim_state" => sim_state(s),
+        "sim_directive" => {
+            // { action, args, note?, by? }: applies from the next step on, and
+            // is stored with the other directives so re-runs replay it.
+            let live = s.live.as_ref().ok_or("no live simulation; start one first")?;
+            let (at, month) = live.when();
+            let d = crate::directives::Directive {
+                stage: live.stage().into(),
+                at,
+                month,
+                action: arg(&args, "action")?,
+                args: args.get("args").cloned().unwrap_or(json!({})),
+                note: arg::<Option<String>>(&args, "note")?.unwrap_or_default(),
+                by: arg::<Option<String>>(&args, "by")?.unwrap_or_else(|| "user".into()),
+            };
+            crate::directives::validate(&d)?;
+            if live.done() {
+                return Err("the simulation has reached its end; restart it to steer it".into());
+            }
+            s.snapshot_layers(&[EditLayer::Directives]);
+            s.world.edits.overrides.directives.push(d.clone());
+            let live = s.live.as_mut().unwrap();
+            match &mut live.sim {
+                LiveSim::Cultures(c) => c.add_directive(d),
+                LiveSim::Nations(n) => n.add_directive(d),
+            }
+            live.cache = None;
+            sim_state(s)
+        }
+        "sim_commit" => {
+            // Run to the end and keep the result as the step's output.
+            let mut live = s.live.take().ok_or("no live simulation")?;
+            set_progress(progress, |p| *p = ProgressState { running: true, task: "sim".into(), step: live.stage().into(), ..Default::default() });
+            let pr = progress.clone();
+            let report = move |f: f32, m: &str| set_progress(&pr, |p| {
+                p.frac = f;
+                p.msg = m.into();
+            });
+            while !live.done() {
+                live.step_once(&report);
+            }
+            let step = live.step;
+            let k = step.index();
+            // Same inputs as a fresh run (upstream, parameters, edits, directives)? Then keep the result.
+            let fresh_dirs: Vec<crate::directives::Directive> = crate::directives::of_stage(&s.world.edits.overrides.directives, step.key()).into_iter().cloned().collect();
+            let sim_dirs = match &live.sim {
+                LiveSim::Cultures(c) => c.directives().to_vec(),
+                LiveSim::Nations(n) => n.directives().to_vec(),
+            };
+            let same = s.world.expected_hashes()[k - 1] == live.upstream_hash && live_inputs(&s.world, step) == live.inputs && fresh_dirs == sim_dirs;
+            if same {
+                let millis = live.millis;
+                let out = match live.sim {
+                    LiveSim::Cultures(c) => c.finish(&report),
+                    LiveSim::Nations(n) => n.finish(),
+                };
+                s.world.put_step(step, out, millis);
+            } else {
+                let pr = progress.clone();
+                s.world.run_to(step, &move |st: Step, f: f32, m: &str| set_progress(&pr, |p| {
+                    p.step = st.key().into();
+                    p.frac = f;
+                    p.msg = m.into();
+                }));
+            }
+            set_progress(progress, |p| p.running = false);
+            s.dirty = true;
+            let mut st = s.status();
+            st["committed"] = json!(step.key());
+            st["replayed"] = json!(!same);
+            Ok(Reply::Json(st))
+        }
+        "clear_results" => {
+            // { from?: step } drops that step's result and every later one;
+            // without `from`, every stale result. Edits are kept.
+            let from: Option<String> = arg(&args, "from")?;
+            let cleared = match from {
+                Some(k) => {
+                    let step = Step::from_key(&k).ok_or_else(|| format!("unknown step `{k}`"))?;
+                    if s.live.as_ref().is_some_and(|l| l.step.index() >= step.index()) {
+                        s.live = None;
+                    }
+                    s.world.clear_from(step)
+                }
+                None => {
+                    let fresh: Vec<bool> = STEPS.iter().map(|&st| s.world.is_fresh(st)).collect();
+                    if s.live.as_ref().is_some_and(|l| !fresh[l.step.index() - 1]) {
+                        s.live = None;
+                    }
+                    s.world.clear_stale()
+                }
+            };
+            if cleared > 0 {
+                s.dirty = true;
+            }
+            let mut st = s.status();
+            st["cleared"] = json!(cleared);
+            Ok(Reply::Json(st))
+        }
+        "sim_cancel" => {
+            s.live = None;
+            Ok(Reply::Json(s.status()))
+        }
         _ => Err(format!("unknown command `{cmd}`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::edits::Tool;
+
+    #[test]
+    fn layer_history_swaps_only_the_changed_layer() {
+        let mut edits = Edits::default();
+        edits.add_stroke(Stroke { tool: Tool::PlatePaint, value: 1.0, points: vec![[0.0, 0.0]], ..Default::default() });
+        edits.add_stroke(Stroke { tool: Tool::Raise, value: 100.0, points: vec![[1.0, 1.0]], ..Default::default() });
+        let saved = EditHistory::Layers(vec![(EditLayer::Plates, LayerState::capture(&edits, EditLayer::Plates))]);
+        edits.add_stroke(Stroke { tool: Tool::PlatePaint, value: 2.0, points: vec![[2.0, 2.0]], ..Default::default() });
+        edits.add_stroke(Stroke { tool: Tool::Raise, value: 200.0, points: vec![[3.0, 3.0]], ..Default::default() });
+
+        let redo = saved.swap(&mut edits);
+        assert_eq!(edits.overrides.plates.len(), 1);
+        assert_eq!(edits.overrides.elevation.len(), 2, "unrelated layer changed by undo");
+        let _undo = redo.swap(&mut edits);
+        assert_eq!(edits.overrides.plates.len(), 2);
+        assert_eq!(edits.overrides.elevation.len(), 2);
     }
 }

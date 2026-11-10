@@ -84,6 +84,8 @@ export const RAMPS: Record<string, Stop[]> = {
   wind: [[0, [30, 40, 90]], [3, [50, 110, 170]], [6, [90, 180, 160]], [9, [220, 220, 110]], [13, [240, 140, 60]], [18, [200, 50, 60]]],
   habit: [[0, [120, 100, 85]], [0.15, [190, 160, 110]], [0.35, [220, 210, 120]], [0.6, [130, 190, 90]], [0.85, [40, 140, 60]], [1, [20, 100, 50]]],
   barrier: [[0, [235, 232, 220]], [1, [215, 200, 160]], [3, [190, 140, 90]], [6, [140, 80, 70]], [10, [70, 40, 60]]],
+  foehn: [[0, [235, 230, 215]], [0.5, [245, 205, 140]], [1, [240, 160, 80]], [2, [205, 85, 50]], [3, [140, 25, 40]]],
+  old: [[0, [225, 210, 160]], [400, [210, 170, 100]], [1000, [175, 110, 60]], [2000, [100, 50, 35]]],
   age: [[0, [250, 60, 60]], [20, [250, 170, 40]], [60, [240, 240, 120]], [120, [80, 170, 200]], [200, [40, 50, 140]]],
 };
 
@@ -146,8 +148,9 @@ export type Legend = { title: string; items?: LegendItem[]; gradient?: { stops: 
 
 export type LayerId =
   | 'sketch' | 'plates' | 'crust' | 'boundaries' | 'elevation' | 'temperature' | 'precipitation'
-  | 'continentality' | 'currents' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress'
-  | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population' | 'attraction';
+  | 'continentality' | 'currents' | 'foehn' | 'wind' | 'ocean_age' | 'koppen' | 'terrain' | 'discharge' | 'erosion' | 'stress' | 'old_relief'
+  | 'habitability' | 'barrier' | 'springs' | 'states' | 'regions' | 'provinces' | 'resources' | 'cultures' | 'culture_groups' | 'population' | 'attraction'
+  | 'nations' | 'railways' | 'transport' | 'eras' | 'institutions' | 'realms' | 'city_growth';
 
 export type LayerDef = {
   id: LayerId;
@@ -159,25 +162,27 @@ export type LayerDef = {
 };
 
 export const LAYERS: LayerDef[] = [
-  { id: 'sketch', label: 'Sketch', fields: ['sketch', 'land', 'mountain_hint'], smooth: false, group: 'Planet' },
+  { id: 'sketch', label: 'Sketch', fields: ['sketch', 'land', 'mountain_hint', 'drawing'], smooth: false, group: 'Planet' },
   { id: 'plates', label: 'Plates', fields: ['plate', 'crust'], smooth: false, group: 'Planet' },
   { id: 'crust', label: 'Crust & plate motion', fields: ['crust', 'plate'], smooth: false, group: 'Planet' },
   { id: 'boundaries', label: 'Plate boundaries', fields: ['boundary', 'elevation'], smooth: false, group: 'Planet' },
   { id: 'elevation', label: 'Elevation', fields: ['elevation', 'water'], smooth: true, group: 'Planet' },
   { id: 'stress', label: 'Tectonic stress', fields: ['stress'], smooth: true, group: 'Planet' },
+  { id: 'old_relief', label: 'Old mountains', fields: ['old_relief', 'elevation'], smooth: true, group: 'Planet' },
   { id: 'ocean_age', label: 'Sea-floor age', fields: ['ocean_age', 'elevation'], smooth: true, group: 'Planet' },
   { id: 'temperature', label: 'Temperature', fields: ['temp', 'elevation'], monthly: true, smooth: true, group: 'Climate' },
   { id: 'precipitation', label: 'Precipitation', fields: ['precip', 'elevation'], monthly: true, smooth: true, group: 'Climate' },
   { id: 'wind', label: 'Wind speed', fields: ['wind_u', 'wind_v', 'elevation'], monthly: true, smooth: true, group: 'Climate' },
   { id: 'continentality', label: 'Continentality', fields: ['continentality', 'elevation'], smooth: true, group: 'Climate' },
   { id: 'currents', label: 'Coastal currents', fields: ['current_offset', 'elevation'], smooth: true, group: 'Climate' },
+  { id: 'foehn', label: 'Foehn warming', fields: ['foehn', 'elevation'], smooth: true, group: 'Climate' },
   { id: 'discharge', label: 'Rivers & lakes', fields: ['discharge', 'elevation', 'lake', 'water'], smooth: false, group: 'Water' },
   { id: 'erosion', label: 'Erosion / deposition', fields: ['erosion', 'elevation'], smooth: true, group: 'Water' },
   { id: 'koppen', label: 'Köppen climate', fields: ['koppen', 'elevation'], smooth: false, group: 'Biomes' },
   { id: 'terrain', label: 'Game terrain', fields: ['terrain', 'elevation'], smooth: false, group: 'Biomes' },
   { id: 'habitability', label: 'Habitability', fields: ['habitability', 'water', 'elevation'], smooth: true, group: 'Political' },
   { id: 'springs', label: 'Groundwater & springs', fields: ['groundwater', 'site', 'site_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
-  { id: 'barrier', label: 'Barriers', fields: ['barrier', 'river_role', 'water', 'elevation'], smooth: false, group: 'Political' },
+  { id: 'barrier', label: 'Barriers', fields: ['barrier', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'states', label: 'States', fields: ['state', 'province', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'regions', label: 'Regions & continents', fields: ['region', 'state', 'continent', 'water', 'elevation'], smooth: false, group: 'Political' },
   { id: 'provinces', label: 'Provinces', fields: ['province', 'province_kind', 'state', 'water', 'elevation'], smooth: false, group: 'Political' },
@@ -186,7 +191,20 @@ export const LAYERS: LayerDef[] = [
   { id: 'culture_groups', label: 'Culture groups', fields: ['culture_group', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'attraction', label: 'Attraction', fields: ['attraction', 'population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
   { id: 'population', label: 'Population density', fields: ['population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Cultures' },
+  { id: 'nations', label: 'Nations', fields: ['owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'railways', label: 'Railways', fields: ['railway', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'transport', label: 'Transport', fields: ['road', 'railway', 'port', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'eras', label: 'Eras', fields: ['nation_era', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'institutions', label: 'Institutions', fields: ['institutions', 'institution', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'realms', label: 'Realms & empires', fields: ['realm', 'imperial', 'owner', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
+  { id: 'city_growth', label: 'City growth', fields: ['nation_attraction', 'nation_population', 'province_kind', 'water', 'elevation'], smooth: false, group: 'Nations' },
 ];
+
+/** Stage 4 eras (core/src/stages/nations.rs ERA_NAMES), early to late. */
+export const ERA_NAMES = ['Early', 'Gunpowder', 'Ocean shipping', 'Industry', 'Fertilizer', 'Motor age', 'Air age'];
+/** Stage 4 institutions (core/src/stages/nations/institutions.rs), one per era after the first. */
+export const INSTITUTION_NAMES = ['Gunpowder', 'Navigation', 'Industrialisation', 'Synthetic fertilizer', 'Motorisation', 'Aviation'];
+const ERA_COLORS: RGB[] = [[120, 95, 70], [160, 120, 70], [70, 120, 160], [175, 60, 45], [90, 160, 70], [230, 150, 30], [190, 60, 170]];
 
 /** Same colours as states.png (core/src/export.rs state_color). */
 export function stateColor(id: number): RGB {
@@ -213,6 +231,11 @@ export function cultureColor(id: number, group: number): RGB {
   return hsl(h, 0.42 + 0.12 * (id % 3), 0.42 + 0.07 * (id % 4)).map((v) => Math.floor(v)) as RGB;
 }
 
+/** Nation colour (same formula as nation_color in core/src/stages/nations.rs). */
+export function nationColor(id: number): RGB {
+  return hsl((id * 137.508 + 20) % 360, 0.5 + 0.15 * (id % 3), 0.42 + 0.08 * (id % 4)).map((v) => Math.floor(v)) as RGB;
+}
+
 export function groupColor(group: number): RGB {
   return hsl((group * 137.508) % 360, 0.55, 0.5).map((v) => Math.floor(v)) as RGB;
 }
@@ -228,6 +251,29 @@ export function provinceColor(id: number): RGB {
 
 
 type F = Record<string, ArrayLike<number> | undefined>;
+
+/** Outline of the drawing when continents grow from it. */
+const DRAWING_LINE: RGB = [250, 222, 120];
+
+/** Colour of one cell of the sketch layer; shared with the live paint preview.
+ *  With a `drawing` field (continents grown from the drawing), the drawn
+ *  coast is outlined on its land side. */
+export function sketchColor(g: Grid, f: F, i: number): RGB {
+  const s = f['sketch'], land = f['land'], hint = f['mountain_hint'], d = f['drawing'];
+  const v = s ? s[i] : -1;
+  const isLand = land ? land[i] === 1 : v > 0;
+  let c: RGB = isLand ? [118, 160, 90] : [38, 78, 128];
+  const soft = 1 - Math.abs(v);
+  c = [c[0] + soft * 25, c[1] + soft * 25, c[2] + soft * 25];
+  const h = hint ? hint[i] : 0;
+  if (h > 0.02) c = mix(c, [150, 95, 60], Math.min(1, h));
+  if (d && d[i] > 0) {
+    for (const j of g.neighbors(i)) {
+      if (d[j] <= 0) return DRAWING_LINE;
+    }
+  }
+  return c;
+}
 
 /** Colour every cell for a layer. Returns RGBA bytes and a legend. */
 export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null, month: number | null): { rgba: Uint8Array; legend: Legend } {
@@ -259,21 +305,12 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
 
   switch (id) {
     case 'sketch': {
-      const s = f['sketch'], land = f['land'], hint = f['mountain_hint'];
-      for (let i = 0; i < n; i++) {
-        const v = s ? s[i] : -1;
-        const isLand = land ? land[i] === 1 : v > 0;
-        let c: RGB = isLand ? [118, 160, 90] : [38, 78, 128];
-        const soft = 1 - Math.abs(v);
-        c = [c[0] + soft * 25, c[1] + soft * 25, c[2] + soft * 25];
-        const h = hint ? hint[i] : 0;
-        if (h > 0.02) c = mix(c, [150, 95, 60], Math.min(1, h));
-        put(i, c);
-      }
+      for (let i = 0; i < n; i++) put(i, sketchColor(g, f, i));
       legend = { title: 'Sketch', items: [
         { color: [118, 160, 90], label: 'Land' }, { color: [38, 78, 128], label: 'Sea' },
         { color: [150, 95, 60], label: '“Mountains here” hint' },
         { color: [150, 170, 160], label: 'Soft edge (coast noise decides)' },
+        ...(f['drawing'] ? [{ color: DRAWING_LINE, label: 'Your drawing (the continents grow from it)' }] : []),
       ] };
       break;
     }
@@ -318,6 +355,18 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       legend = { title: 'Tectonic stress', gradient: { stops: RAMPS.unit, unit: '' } };
       break;
     }
+    case 'old_relief': {
+      // Height added by old (noise) mountains over grey land; plate relief stays grey.
+      const o = f['old_relief'];
+      for (let i = 0; i < n; i++) {
+        const v = o ? o[i] : 0;
+        if (elev && elev[i] <= 0) put(i, [70, 90, 115], 1);
+        else if (v > 20) put(i, ramp(RAMPS.old, v), sh(i));
+        else put(i, grey(i), sh(i));
+      }
+      legend = { title: 'Old mountains (height added)', gradient: { stops: RAMPS.old, unit: 'm' } };
+      break;
+    }
     case 'ocean_age': {
       const a = f['ocean_age'];
       for (let i = 0; i < n; i++) put(i, elev && elev[i] > 0 ? grey(i) : ramp(RAMPS.age, a ? a[i] : 0), elev && elev[i] > 0 ? sh(i) : 1);
@@ -354,6 +403,18 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       const c = f['current_offset'];
       for (let i = 0; i < n; i++) put(i, ramp(RAMPS.diverging, (c ? c[i] : 0) / 5), elev && elev[i] > 0 ? sh(i) * 0.9 : 1);
       legend = { title: 'Coastal current offset', gradient: { stops: RAMPS.diverging.map(([v, c]) => [v * 5, c] as Stop), unit: '°C' } };
+      break;
+    }
+    case 'foehn': {
+      // Annual mean warming from Foehn on the lee of ranges, over grey land.
+      const fw = f['foehn'];
+      for (let i = 0; i < n; i++) {
+        const v = fw ? fw[i] : 0;
+        if (elev && elev[i] <= 0) put(i, [70, 90, 115], 1);
+        else if (v > 0.05) put(i, ramp(RAMPS.foehn, v), sh(i));
+        else put(i, grey(i), sh(i));
+      }
+      legend = { title: 'Foehn warming (annual mean)', gradient: { stops: RAMPS.foehn, unit: '°C' } };
       break;
     }
     case 'discharge': {
@@ -405,11 +466,10 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       break;
     }
     case 'barrier': {
-      const b = f['barrier'], rr = f['river_role'];
+      // Border and backbone rivers are drawn on their cell edges (overlay).
+      const b = f['barrier'];
       for (let i = 0; i < n; i++) {
         if (isSea(i) || (wm && wm[i] === 2)) { put(i, [32, 48, 78]); continue; }
-        if (rr && rr[i] === 1) { put(i, [235, 60, 50]); continue; }
-        if (rr && rr[i] === 2) { put(i, [60, 210, 120]); continue; }
         put(i, ramp(RAMPS.barrier, b ? b[i] : 0), sh(i));
       }
       legend = { title: 'Crossing cost (barrier)', gradient: { stops: RAMPS.barrier, unit: '' }, items: [
@@ -484,6 +544,124 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
         { color: [20, 20, 20], label: 'Group border' },
         ...(id === 'cultures' ? [{ color: [90, 90, 90] as RGB, label: 'Thin line: culture border' }] : []),
         { color: [150, 146, 138], label: 'Unsettled land' },
+      ] };
+      break;
+    }
+    case 'nations':
+    case 'railways': {
+      const ow = f['owner'], rw = f['railway'], pk = f['province_kind'];
+      const rail = id === 'railways';
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const o = ow ? ow[i] : 0;
+        let c: RGB = o ? nationColor(o) : [150, 146, 138];
+        if (rail) {
+          c = mix(c, [205, 200, 190], 0.65);
+          const r = rw ? rw[i] : 0;
+          if (r === 3) c = [30, 90, 220];
+          else if (r === 2) c = [200, 30, 30];
+          else if (r === 1) c = [35, 35, 35];
+        }
+        put(i, c, 0.88 + 0.12 * sh(i));
+      }
+      legend = rail
+        ? { title: 'Railways (industrial era)', items: [{ color: [35, 35, 35], label: 'Track' }, { color: [200, 30, 30], label: 'Station' }, { color: [30, 90, 220], label: 'Junction (change lines)' }, { color: [150, 146, 138], label: 'No ruler' }] }
+        : { title: 'Nations (hover for the owner)', items: [{ color: [20, 20, 20], label: 'Border' }, { color: [150, 146, 138], label: 'No ruler' }] };
+      break;
+    }
+    case 'transport': {
+      // Roads fill the province by quality; railways are grey stripes over
+      // them; stations, junctions, ports and airports are icons over the map
+      // (drawn as an overlay).
+      const ow = f['owner'], rd = f['road'], rw = f['railway'], pt = f['port'], pk = f['province_kind'];
+      const pos = g.pos;
+      // Stripes about three cells apart, whatever the grid resolution.
+      const period = 3 * Math.sqrt(41253 / n);
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const o = ow ? ow[i] : 0;
+        let c: RGB = mix(o ? nationColor(o) : [150, 146, 138], [205, 200, 190], 0.75);
+        const q = rd ? rd[i] : 0;
+        if (q === 3) c = [235, 140, 30];
+        else if (q === 2) c = [130, 90, 55];
+        else if (q === 1) c = mix(c, [180, 150, 110], 0.7);
+        if (pt && pt[i] === 1) c = mix(c, [90, 150, 200], 0.25);
+        if (rw && rw[i] > 0) {
+          // Diagonal stripes in geographic coordinates.
+          const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+          const lat = Math.asin(Math.max(-1, Math.min(1, z))) * 57.2958, lon = Math.atan2(y, x) * 57.2958;
+          if (((Math.floor((lat + lon) / (period / 2)) % 2) + 2) % 2 === 0) c = [95, 95, 100];
+        }
+        put(i, c, 0.88 + 0.12 * sh(i));
+      }
+      legend = { title: 'Transport: roads fill, railways striped, icons for stations, ports and airports', items: [
+        { color: [180, 150, 110], label: 'Track' }, { color: [130, 90, 55], label: 'Paved road' }, { color: [235, 140, 30], label: 'Highway (motor age)' },
+        { color: [95, 95, 100], label: 'Railway (stripes)' }, { color: [200, 30, 30], label: '■ Station' }, { color: [30, 90, 220], label: '◆ Junction' },
+        { color: [20, 90, 170], label: '⚓ Port' }, { color: [140, 40, 170], label: '✈ Airport' }, { color: [150, 185, 205], label: 'Good harbour, no port yet' },
+      ] };
+      break;
+    }
+    case 'institutions': {
+      // Institutions embraced in order (each era's idea), with the newest
+      // born institution's presence brightening the frontier.
+      const im = f['institutions'], pr = f['institution'], pk = f['province_kind'];
+      let newest = 0;
+      if (im) for (let i = 0; i < n; i++) newest = Math.max(newest, im[i]);
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const m = im ? im[i] : 0;
+        let cnt = 0;
+        while (cnt < 6 && (m >> cnt) & 1) cnt++;
+        let c: RGB = cnt ? ERA_COLORS[cnt] : [150, 146, 138];
+        const p = pr ? pr[i] : 0;
+        if (p > 0.05 && p < 0.9) c = mix(c, [255, 240, 150], 0.25 + 0.5 * p);
+        put(i, c, 0.88 + 0.12 * sh(i));
+      }
+      legend = { title: 'Institutions embraced (each opens an era); light: the newest spreading', items: [
+        ...INSTITUTION_NAMES.map((name, k) => ({ color: ERA_COLORS[k + 1], label: name })), { color: [255, 240, 150] as RGB, label: 'Newest, spreading' }, { color: [150, 146, 138] as RGB, label: 'None yet' },
+      ] };
+      break;
+    }
+    case 'realms': {
+      // Feudal realms: every member of an empire takes its emperor's colour;
+      // imperial territory is brighter, land outside it darker.
+      const rl = f['realm'], imp = f['imperial'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const r = rl ? rl[i] : 0;
+        let c: RGB = r ? nationColor(r) : [150, 146, 138];
+        if (imp && imp[i]) c = mix(c, [255, 235, 160], 0.2);
+        put(i, c, 0.88 + 0.12 * sh(i));
+      }
+      legend = { title: 'Realms (feudal empires take the emperor\'s colour)', items: [{ color: [255, 235, 160], label: 'Tint: imperial territory' }, { color: [20, 20, 20], label: 'Border between realms' }, { color: [150, 146, 138], label: 'No ruler' }] };
+      break;
+    }
+    case 'eras': {
+      const er = f['nation_era'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const e = er ? er[i] : 0;
+        put(i, e ? ERA_COLORS[e - 1] : [150, 146, 138], 0.88 + 0.12 * sh(i));
+      }
+      legend = { title: 'Era of each nation (its own technology)', items: [...ERA_NAMES.map((name, k) => ({ color: ERA_COLORS[k], label: name })), { color: [150, 146, 138] as RGB, label: 'No ruler' }] };
+      break;
+    }
+    case 'city_growth': {
+      const at = f['nation_attraction'], pk = f['province_kind'];
+      for (let i = 0; i < n; i++) {
+        const k = pk ? pk[i] : isSea(i) ? 3 : 0;
+        if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
+        const a = at ? at[i] : 0;
+        const c: RGB = a > 0 ? mix([200, 196, 186], [230, 150, 20], Math.min(1, a * 1.5)) : mix([200, 196, 186], [120, 40, 40], Math.min(1, -a * 1.5));
+        put(i, c, 0.85 + 0.15 * sh(i));
+      }
+      legend = { title: 'City growth (Stage 4 attraction)', items: [
+        { color: [230, 150, 20], label: 'Draws people: capital, station, city pin' }, { color: [200, 196, 186], label: 'Neutral' }, { color: [120, 40, 40], label: 'Loses people: war devastation, abandoned' },
       ] };
       break;
     }

@@ -37,6 +37,10 @@ pub struct Grid {
     pub tris: Vec<[u32; 3]>,
     nbr_off: Vec<u32>,
     nbr: Vec<u32>,
+    /// Angular length of each directed neighbour edge, aligned with `nbr`.
+    nbr_len: Vec<f64>,
+    /// Index in `nbr` of the same edge in the opposite direction.
+    nbr_rev: Vec<u32>,
     vtri_off: Vec<u32>,
     vtri: Vec<u32>,
     /// Cell area on the unit sphere (steradians); sums to 4π.
@@ -137,6 +141,19 @@ impl Grid {
             }
         }
 
+        // Static edge geometry is used by many Dijkstra passes. Compute it
+        // once instead of repeatedly evaluating acos in every stage.
+        let mut nbr_len = vec![0.0f64; nbr.len()];
+        let mut nbr_rev = vec![u32::MAX; nbr.len()];
+        for i in 0..n {
+            for e in off[i] as usize..off[i + 1] as usize {
+                let j = nbr[e] as usize;
+                nbr_len[e] = pos[i].angle_to(pos[j]);
+                let r = (off[j] as usize..off[j + 1] as usize).find(|&q| nbr[q] as usize == i).expect("closed mesh edge has no reverse");
+                nbr_rev[e] = r as u32;
+            }
+        }
+
         // Cell areas from the chord triangles, normalised to 4π.
         let mut area = vec![0.0f64; n];
         for t in &tris {
@@ -173,6 +190,8 @@ impl Grid {
             tris,
             nbr_off: off,
             nbr,
+            nbr_len,
+            nbr_rev,
             vtri_off: fill_offsets_from(&deg),
             vtri,
             area,
@@ -202,6 +221,55 @@ impl Grid {
     /// CSR neighbour arrays (offsets, indices) for export to the UI.
     pub fn neighbor_csr(&self) -> (&[u32], &[u32]) {
         (&self.nbr_off, &self.nbr)
+    }
+
+    /// Directed edge lengths (radians) and reverse-edge indices, both aligned
+    /// with the neighbour indices returned by `neighbor_csr`.
+    pub fn neighbor_geometry(&self) -> (&[f64], &[u32]) {
+        (&self.nbr_len, &self.nbr_rev)
+    }
+
+    /// Index in the neighbour arrays of the edge from cell `a` to its neighbour `b`.
+    #[inline]
+    pub fn edge_index(&self, a: usize, b: usize) -> Option<usize> {
+        let s = self.nbr_off[a] as usize;
+        self.neighbors(a).iter().position(|&j| j as usize == b).map(|k| s + k)
+    }
+
+    /// Cell corners are the triangles: corner `t` is where cells `tris[t]` meet.
+    /// Its position is the triangle's centroid, which is where the renderer
+    /// and the border drawing put it.
+    pub fn corner_pos(&self, t: usize) -> Vec3 {
+        let [a, b, c] = self.tris[t];
+        (self.pos[a as usize] + self.pos[b as usize] + self.pos[c as usize]).normalized()
+    }
+
+    /// The corners across each side of every corner: `adj[t][k]` shares with
+    /// `t` the edge between cells `tris[t][k]` and `tris[t][(k + 1) % 3]`, so a
+    /// step from `t` to `adj[t][k]` runs along the boundary of those two cells.
+    pub fn corner_adjacency(&self) -> Vec<[u32; 3]> {
+        (0..self.tris.len())
+            .map(|t| {
+                let tri = self.tris[t];
+                std::array::from_fn(|k| {
+                    let (u, v) = (tri[k], tri[(k + 1) % 3]);
+                    *self
+                        .incident_tris(u as usize)
+                        .iter()
+                        .find(|&&o| o as usize != t && self.tris[o as usize].contains(&v))
+                        .expect("closed mesh edge has two triangles")
+                })
+            })
+            .collect()
+    }
+
+    /// The two cells on either side of the boundary between adjacent corners.
+    pub fn corner_edge_cells(&self, t: usize, u: usize) -> (usize, usize) {
+        let (a, b) = (self.tris[t], self.tris[u]);
+        let mut shared = a.iter().filter(|c| b.contains(c));
+        let x = *shared.next().expect("corners are not adjacent") as usize;
+        let y = *shared.next().expect("corners are not adjacent") as usize;
+        (x, y)
     }
 
     fn build_start_table(&mut self) {

@@ -234,6 +234,7 @@ export class Renderer {
   private lineBuf: WebGLBuffer;
   private lineColBuf: WebGLBuffer;
   private overlays: Map<string, { globe: LineSet; flat: LineSet }> = new Map();
+  private graticule: { globe: LineSet; flat: LineSet } | null = null;
   private ribbonProg: WebGLProgram;
   private ribbonVao: WebGLVertexArrayObject;
   private ribbonBufs: Record<string, WebGLBuffer> = {};
@@ -344,6 +345,12 @@ export class Renderer {
     this.requestDraw();
   }
 
+  /** Reference lines drawn under every other overlay (null removes them). */
+  setGraticule(globe: LineSet | null, flat: LineSet | null) {
+    this.graticule = globe && flat ? { globe, flat } : null;
+    this.requestDraw();
+  }
+
   setRibbons(name: string, globe: RibbonSet | null, flat: RibbonSet | null) {
     if (!globe || !flat) this.ribbons.delete(name);
     else this.ribbons.set(name, { globe, flat });
@@ -419,6 +426,9 @@ export class Renderer {
       gl.drawArraysInstanced(gl.TRIANGLES, 0, this.triCount * 3, 3);
     }
 
+    // Reference lines (latitudes), right on the map: under rivers, borders and every other overlay.
+    if (this.graticule) this.drawLines([this.mode === 0 ? this.graticule.globe : this.graticule.flat], mvp, fl);
+
     // Ribbons (rivers), drawn under the line overlays.
     if (this.ribbons.size) {
       gl.useProgram(this.ribbonProg);
@@ -447,7 +457,13 @@ export class Renderer {
       gl.disable(gl.BLEND);
     }
 
-    // Overlays.
+    // Line overlays (wind, plate motion, hairline borders, markers).
+    this.drawLines([...this.overlays.values()].map((ov) => (this.mode === 0 ? ov.globe : ov.flat)), mvp, fl);
+  }
+
+  /** Hairlines (GL lines) over the map; on the flat map, also one world to each side. */
+  private drawLines(sets: LineSet[], mvp: M4, fl: [number, number, number, number]) {
+    const gl = this.gl;
     gl.useProgram(this.line);
     gl.bindVertexArray(this.lineVao);
     const L = (n: string) => gl.getUniformLocation(this.line, n);
@@ -456,8 +472,7 @@ export class Renderer {
     gl.uniform4f(L('uFlat'), fl[0], fl[1], fl[2], fl[3]);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    for (const ov of this.overlays.values()) {
-      const set = this.mode === 0 ? ov.globe : ov.flat;
+    for (const set of sets) {
       if (set.count === 0) continue;
       gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
       gl.bufferData(gl.ARRAY_BUFFER, set.pos, gl.DYNAMIC_DRAW);

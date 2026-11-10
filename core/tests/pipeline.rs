@@ -27,6 +27,16 @@ fn grid_counts_and_topology() {
                 pent += 1;
             }
         }
+        let (off, nbr) = g.neighbor_csr();
+        let (len, rev) = g.neighbor_geometry();
+        for i in 0..g.len() {
+            for e in off[i] as usize..off[i + 1] as usize {
+                let r = rev[e] as usize;
+                assert_eq!(nbr[r] as usize, i);
+                assert_eq!(len[e], g.pos[i].angle_to(g.pos[nbr[e] as usize]));
+                assert!((len[e] - len[r]).abs() < 1e-15);
+            }
+        }
         assert_eq!(pent, 12);
         let total: f64 = g.area.iter().sum();
         assert!((total - 4.0 * std::f64::consts::PI).abs() < 1e-9);
@@ -95,6 +105,34 @@ fn deterministic_and_round_trips() {
     assert_eq!(c.edits, a.edits);
     assert!(STEPS.iter().all(|&s| c.is_fresh(s)));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn malformed_optional_project_file_is_reported() {
+    let dir = std::env::temp_dir().join(format!("fwm-corrupt-{}", std::process::id()));
+    let w = World::new(small_params(17));
+    w.save(&dir).unwrap();
+    std::fs::write(dir.join("overrides/barriers.json"), b"not json").unwrap();
+    let err = World::load(&dir).err().expect("corrupt override should fail to load");
+    assert!(err.contains("barriers.json"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn coarse_climate_cache_preserves_results_across_level_changes() {
+    let mut params = small_params(7);
+    params.climate.climate_level = 4;
+    let mut a = World::new(params.clone());
+    a.run_to(Step::Climate, &|_, _, _| {});
+    let expected = a.fingerprint();
+    let mut b = World::new(params);
+    b.run_to(Step::Climate, &|_, _, _| {});
+    assert_eq!(b.fingerprint(), expected, "cached coarse grid changed the result");
+    b.params.planet.grid_level = 6;
+    b.run_to(Step::Climate, &|_, _, _| {});
+    b.params.planet.grid_level = 5;
+    b.run_to(Step::Climate, &|_, _, _| {});
+    assert_eq!(b.fingerprint(), expected, "replacing the cache changed the result");
 }
 
 #[test]
@@ -246,7 +284,9 @@ fn springs_resources_and_site_pins() {
     assert!(w.meta(Step::Cultures).unwrap()["desert_towns"].is_u64());
 
     // Pin a town in the driest land province that has people around.
-    let dry = land.iter().filter(|p| !p["river"].as_bool().unwrap()).min_by(|a, b| a["rain_mm"].as_f64().partial_cmp(&b["rain_mm"].as_f64()).unwrap()).unwrap();
+    let people = &w.meta(Step::Cultures).unwrap()["table"]["provinces"];
+    let peopled = |id: u64| people.as_array().unwrap().iter().any(|c| c["id"].as_u64() == Some(id) && c["population"].as_f64().unwrap_or(0.0) >= 1000.0);
+    let dry = land.iter().filter(|p| !p["river"].as_bool().unwrap() && peopled(p["id"].as_u64().unwrap())).min_by(|a, b| a["rain_mm"].as_f64().partial_cmp(&b["rain_mm"].as_f64()).unwrap()).unwrap();
     let (lat, lon) = (dry["center"][0].as_f64().unwrap(), dry["center"][1].as_f64().unwrap());
     let pid = dry["id"].as_u64().unwrap();
     w.edits.add_stroke(Stroke { tool: Tool::SitePin, value: 40_000.0, points: vec![[lat, lon]], ..Default::default() });
@@ -588,4 +628,967 @@ fn cash_crops_oil_and_goods_editor() {
     let o2 = find(&with_oil["id"]);
     assert!(!o2["resources"].as_array().unwrap().iter().any(|r| r == "oil"));
     assert_eq!(o2["trade_good"], good_before);
+}
+
+#[test]
+fn live_steps_and_directives_match_a_fresh_run() {
+    use std::sync::{Arc, Mutex};
+    use worldcore::api::{handle, ProgressState, Reply, Session};
+    let mut p = small_params(17);
+    p.cultures.ticks = 60;
+    p.nations.start_year = 1300;
+    let session = Mutex::new(Session::new(p.clone()));
+    let progress = Arc::new(Mutex::new(ProgressState::default()));
+    let call = |cmd: &str, args: serde_json::Value| -> serde_json::Value {
+        match handle(&session, &progress, cmd, args) {
+            Ok(Reply::Json(v)) => v,
+            Ok(Reply::Bytes(_)) => serde_json::Value::Null,
+            Err(e) => panic!("{cmd}: {e}"),
+        }
+    };
+    // Stage 3, stepped in uneven chunks with directives along the way.
+    let st = call("sim_start", serde_json::json!({ "stage": "cultures" }));
+    assert_eq!(st["live"]["position"], 0.0);
+    let region = st["sim"]["cultures"].as_array().map(|_| 1).unwrap_or(1);
+    call("sim_step", serde_json::json!({ "steps": 7 }));
+    call("sim_directive", serde_json::json!({ "action": "catastrophe", "args": { "regions": [region], "severity": 0.6 }, "note": "the great plague" }));
+    let st = call("sim_step", serde_json::json!({ "to": "era" }));
+    let c1 = st["sim"]["cultures"][0]["id"].as_u64().unwrap_or(1);
+    call("sim_directive", serde_json::json!({ "action": "drift", "args": { "culture": c1, "factor": 8.0, "years": 300 } }));
+    call("sim_directive", serde_json::json!({ "action": "settle", "args": { "province": st["sim"]["cultures"][0]["regions"][0]["id"], "bands": 3, "culture": null } }));
+    assert!(handle(&session, &progress, "sim_directive", serde_json::json!({ "action": "war", "args": {} })).is_err(), "Stage 4 action refused in Stage 3");
+    call("sim_step", serde_json::json!({ "years": 230 }));
+    let st = call("sim_commit", serde_json::json!({}));
+    assert_eq!(st["replayed"], false, "the live result is kept");
+    // Stage 4 the same way.
+    let st = call("sim_start", serde_json::json!({ "stage": "nations" }));
+    assert_eq!(st["live"]["position"], 1300);
+    let st = call("sim_step", serde_json::json!({ "years": 120 }));
+    let n1 = st["sim"]["nations"][0]["id"].as_u64().expect("nations formed");
+    let n2 = st["sim"]["nations"][1]["id"].as_u64().unwrap_or(n1);
+    call("sim_directive", serde_json::json!({ "action": "aggression", "args": { "nation": n1, "factor": 4.0, "years": 200 } }));
+    call("sim_directive", serde_json::json!({ "action": "peace", "args": { "nation": n1, "target": n2, "years": 100 } }));
+    let st = call("sim_step", serde_json::json!({ "steps": 33 }));
+    let n3 = st["sim"]["nations"][0]["id"].as_u64().unwrap();
+    call("sim_directive", serde_json::json!({ "action": "split", "args": { "nation": n1, "culture": null }, "note": "civil war" }));
+    call("sim_directive", serde_json::json!({ "action": "rename", "args": { "nation": n2, "name": "Avalon" } }));
+    // Tags, a feudal empire and a birthplace left to chance replay too.
+    call("sim_directive", serde_json::json!({ "action": "tag", "args": { "scope": "world", "id": null, "tag": "stable_realms", "on": true } }));
+    call("sim_directive", serde_json::json!({ "action": "feudal_empire", "args": { "nation": n3, "on": true, "name": "Holy Empire", "provinces": null, "states": null, "regions": null } }));
+    call("sim_directive", serde_json::json!({ "action": "institution_birth", "args": { "institution": 2, "province": null } }));
+    // Past 1800 steps are six months: a directive in July (month 7).
+    let st = call("sim_step", serde_json::json!({ "years": 400, "months": 6 }));
+    assert_eq!(st["live"]["position"], 1853);
+    assert_eq!(st["live"]["month"], 7);
+    let n4 = st["sim"]["nations"][0]["id"].as_u64().unwrap();
+    call("sim_directive", serde_json::json!({ "action": "reform", "args": { "nation": n4, "years": 20 } }));
+    let st = call("sim_commit", serde_json::json!({}));
+    assert_eq!(st["replayed"], false);
+    let s = session.lock().unwrap();
+    assert_eq!(s.world.edits.overrides.directives.len(), 11);
+    assert!(s.world.edits.overrides.directives.iter().any(|d| d.at == 1853 && d.month == 7));
+    let applied = s.world.meta(Step::Nations).unwrap()["directives"].as_array().unwrap().clone();
+    assert_eq!(applied.len(), 8);
+    assert!(applied.iter().all(|d| d["applied"] == true), "{applied:?}");
+
+    // A fresh world with the same edits gives the same history.
+    let mut fresh = World::new(p);
+    fresh.edits = s.world.edits.clone();
+    fresh.run_to(Step::Nations, &|_, _, _| {});
+    for step in [Step::Cultures, Step::Nations] {
+        assert!(s.world.is_fresh(step));
+        assert_eq!(fresh.meta(step).unwrap()["table"], s.world.meta(step).unwrap()["table"], "{step:?} table");
+        for (name, f) in &s.world.steps[step.index()].as_ref().unwrap().fields.0 {
+            assert!(fresh.steps[step.index()].as_ref().unwrap().fields.get(name) == Some(f), "{step:?} field {name}");
+        }
+    }
+    let names: Vec<&str> = fresh.meta(Step::Nations).unwrap()["table"]["nations"].as_array().unwrap().iter().filter_map(|n| n["name"].as_str()).collect();
+    assert!(names.contains(&"Avalon"), "rename replayed");
+    let empires = fresh.meta(Step::Nations).unwrap()["empires"].as_array().unwrap().clone();
+    assert_eq!(empires.len(), 1);
+    assert!(empires[0]["dissolved"].is_null(), "the empire lasts to the end: {empires:?}");
+}
+
+#[test]
+fn nations_are_consistent() {
+    use worldcore::fields::Field;
+    let mut p = small_params(23);
+    p.cultures.ticks = 60;
+    let mut w = World::new(p);
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m = w.meta(Step::Nations).unwrap().clone();
+    let t = &m["table"];
+    let nations = t["nations"].as_array().unwrap();
+    assert!(m["nations"].as_u64().unwrap() >= 3, "nations: {}", m["nations"]);
+    assert!(m["ruled_share"].as_f64().unwrap() > 0.5);
+    // Owners exist and are alive; members agree with the province table; capitals are owned.
+    let alive: std::collections::HashMap<u64, &serde_json::Value> = nations.iter().filter(|n| n["ended"].is_null()).map(|n| (n["id"].as_u64().unwrap(), n)).collect();
+    let mut count: std::collections::HashMap<u64, u64> = Default::default();
+    let mut owner_of: std::collections::HashMap<u64, u64> = Default::default();
+    for p in t["provinces"].as_array().unwrap() {
+        let o = p["owner"].as_u64().unwrap();
+        owner_of.insert(p["id"].as_u64().unwrap(), o);
+        if o > 0 {
+            assert!(alive.contains_key(&o), "province owned by dead nation {o}");
+            *count.entry(o).or_insert(0) += 1;
+        }
+    }
+    for (id, n) in &alive {
+        assert_eq!(n["provinces"].as_u64().unwrap(), count.get(id).copied().unwrap_or(0), "nation {id} province count");
+        assert_eq!(owner_of.get(&n["capital"].as_u64().unwrap()), Some(id), "nation {id} owns its capital");
+    }
+    for n in nations.iter().filter(|n| !n["ended"].is_null()) {
+        assert_eq!(n["provinces"], 0);
+    }
+    // The owner field matches the table.
+    let (Some((Field::U16(of), _, _)), Some((Field::U32(pf), _, _))) = (w.field("owner"), w.field("province")) else { panic!() };
+    for (i, &id) in pf.iter().enumerate() {
+        if let Some(&o) = owner_of.get(&(id as u64)) {
+            assert_eq!(of[i] as u64, o);
+        }
+    }
+    // Railways run over their owner's provinces as they were when built, and are
+    // listed with stations at both ends.
+    for r in t["railways"].as_array().unwrap() {
+        let path = r["provinces"].as_array().unwrap();
+        let st = r["stations"].as_array().unwrap();
+        assert!(path.len() >= 2 && st.first() == path.first() && st.last() == path.last());
+        assert!(r["opened"].as_i64().unwrap() >= 1830);
+    }
+    let ev = t["events"].as_array().unwrap();
+    assert!(ev.iter().any(|e| e["event"] == "founded"));
+    assert!(ev.windows(2).all(|w| w[0]["year"].as_i64() <= w[1]["year"].as_i64()), "events in order");
+    assert!(worldcore::validate::validate(&mut w).ok);
+}
+
+#[test]
+fn transport_economy_and_eras() {
+    use worldcore::directives::Directive;
+    let mut p = small_params(23);
+    p.cultures.ticks = 60;
+    let mut w = World::new(p);
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m = w.meta(Step::Nations).unwrap().clone();
+    let t = &m["table"];
+    assert_eq!(m["start_date"], 1949);
+    let np = worldcore::params::NationParams::default();
+    let eras = [np.gunpowder_year, np.shipping_year, np.industrial_year, np.fertilizer_year, np.motor_year, np.air_year];
+    // Eras follow institutions: no nation is in an era whose institution
+    // isn't born, and technology stays below the next era's year until the
+    // nation enters it.
+    let born = m["institutions"].as_array().unwrap().iter().filter(|i| !i["born"].is_null()).count();
+    let alive: Vec<&serde_json::Value> = t["nations"].as_array().unwrap().iter().filter(|n| n["ended"].is_null()).collect();
+    for n in &alive {
+        let tech = n["tech"].as_f64().unwrap();
+        let era = n["era_index"].as_u64().unwrap() as usize;
+        assert!(era <= born, "{}: era {era} with {born} institutions born", n["name"]);
+        if era < 6 {
+            // (tech is rounded to a tenth)
+            assert!(tech < eras[era] as f64 + 0.05, "{}: tech {tech}, era {era}", n["name"]);
+        }
+        assert!(tech <= 1949.0 + np.tech_lead_years + 0.1);
+        let i = n["integration"].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&i));
+    }
+    let owner: std::collections::HashMap<u64, u64> = t["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["owner"].as_u64().unwrap())).collect();
+    // Roads join neighbours; highways and airports only in the motor and air ages.
+    let pt = w.meta(Step::Provinces).unwrap()["table"].clone();
+    let adj: std::collections::HashSet<(u64, u64)> = pt["adjacency"].as_array().unwrap().iter().map(|a| (a["from"].as_u64().unwrap(), a["to"].as_u64().unwrap())).collect();
+    let roads = t["roads"].as_array().unwrap();
+    assert!(!roads.is_empty(), "no roads");
+    for r in roads {
+        let (a, b) = (r["from"].as_u64().unwrap(), r["to"].as_u64().unwrap());
+        assert!(adj.contains(&(a, b)) || adj.contains(&(b, a)), "road {a}–{b} is not a border");
+        assert!((1..=3).contains(&r["quality"].as_u64().unwrap()));
+    }
+    let air_age = alive.iter().any(|n| n["era_index"].as_u64().unwrap() >= 6);
+    for a in t["airports"].as_array().unwrap() {
+        assert!(air_age, "airport without the air age");
+        assert!(a["opened"].as_i64().unwrap() >= 1800);
+    }
+    // Lines have stations at both ends; junctions are stations of two or more
+    // open lines, and the province table agrees.
+    let lines = t["railways"].as_array().unwrap();
+    for l in lines {
+        let path = l["provinces"].as_array().unwrap();
+        let st = l["stations"].as_array().unwrap();
+        assert!(path.len() >= 2 && st.first() == path.first() && st.last() == path.last());
+        assert!(l["km"].as_f64().unwrap() > 0.0);
+    }
+    let rail: std::collections::HashMap<u64, u64> = t["provinces"].as_array().unwrap().iter().map(|p| (p["id"].as_u64().unwrap(), p["railway"].as_u64().unwrap())).collect();
+    for s in t["stations"].as_array().unwrap() {
+        let n = s["lines"].as_array().unwrap().len();
+        assert_eq!(s["junction"].as_bool().unwrap(), n > 1);
+        assert_eq!(rail[&s["province"].as_u64().unwrap()], if n > 1 { 3 } else { 2 });
+    }
+    // Steering: in 1948 the largest nation leaps ahead, gets a windfall, and
+    // builds a highway, a railway and an airport to an interior province.
+    let big = alive.iter().max_by_key(|n| n["population"].as_u64().unwrap()).unwrap();
+    let (nid, cap) = (big["id"].as_u64().unwrap(), big["capital"].as_u64().unwrap());
+    let mine: Vec<u64> = owner.iter().filter(|(_, &o)| o == nid).map(|(&p, _)| p).collect();
+    let interior = |p: u64| adj.iter().filter(|(a, b)| *a == p || *b == p).all(|(a, b)| owner.get(if *a == p { b } else { a }).is_some_and(|&o| o == nid));
+    let mut far: Vec<u64> = mine.iter().copied().filter(|&p| p != cap && interior(p)).collect();
+    far.sort();
+    let to = *far.last().or(mine.iter().find(|&&p| p != cap)).expect("a second province");
+    let d = |action: &str, args: serde_json::Value| Directive { stage: "nations".into(), at: 1948, month: 0, action: action.into(), args, note: String::new(), by: "user".into() };
+    w.edits.overrides.directives = vec![
+        d("tech", serde_json::json!({ "nation": nid, "years": 200 })),
+        d("subsidy", serde_json::json!({ "nation": nid, "years": 5 })),
+        d("build_road", serde_json::json!({ "nation": nid, "from": cap, "to": to, "quality": 3 })),
+        d("railway", serde_json::json!({ "nation": nid, "from": to, "to": cap })),
+        d("airport", serde_json::json!({ "nation": nid, "province": to })),
+    ];
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m2 = w.meta(Step::Nations).unwrap().clone();
+    for a in m2["directives"].as_array().unwrap() {
+        assert_eq!(a["applied"], true, "{a}");
+    }
+    let t2 = &m2["table"];
+    let n2 = t2["nations"].as_array().unwrap().iter().find(|n| n["id"] == nid).unwrap();
+    assert_eq!(n2["era"], "air age");
+    assert!(t2["roads"].as_array().unwrap().iter().any(|r| r["quality"] == 3 && (r["from"] == cap || r["to"] == cap)), "highway from the capital");
+    assert!(t2["airports"].as_array().unwrap().iter().any(|a| a["province"] == to));
+    assert!(t2["railways"].as_array().unwrap().iter().any(|l| l["opened"] == 1948 && l["owner"] == nid), "railway of 1948");
+    assert!(worldcore::validate::validate(&mut w).ok);
+}
+
+#[test]
+fn institutions_ports_and_step_schedule() {
+    use worldcore::api::{handle, ProgressState, Reply, Session};
+    let mut p = small_params(23);
+    p.cultures.ticks = 60;
+    let session = std::sync::Mutex::new(Session::new(p));
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(ProgressState::default()));
+    let call = |cmd: &str, args: serde_json::Value| -> serde_json::Value {
+        match handle(&session, &progress, cmd, args) {
+            Ok(Reply::Json(v)) => v,
+            Ok(Reply::Bytes(_)) => serde_json::Value::Null,
+            Err(e) => panic!("{cmd}: {e}"),
+        }
+    };
+    let st = call("sim_start", serde_json::json!({ "stage": "nations" }));
+    // Time is counted in whole months. Steps shorten toward the present: 24
+    // months, then 12 from 1400, then 6 from 1800.
+    assert_eq!(st["sim"]["step_months"], 24);
+    assert_eq!(st["sim"]["time"], st["sim"]["year"].as_i64().unwrap() * 12);
+    assert_eq!(st["sim"]["month"], 1);
+    // Step until gunpowder is ready to be born and the run stops for a choice.
+    let st = call("sim_step", serde_json::json!({ "to": "end", "stop_at_choice": true }));
+    let pend = &st["sim"]["pending_institution"];
+    assert_eq!(pend["index"], 0, "stopped for gunpowder: {pend}");
+    assert!(st["live"]["position"].as_i64().unwrap() >= 1450);
+    assert_eq!(st["sim"]["step_months"], 12);
+    assert_eq!(st["sim"]["time"].as_i64().unwrap() % 12, 0, "yearly steps start in January");
+    let cands = pend["candidates"].as_array().unwrap();
+    assert!(!cands.is_empty());
+    // Stepping again without choosing stays put.
+    let again = call("sim_step", serde_json::json!({ "steps": 3, "stop_at_choice": true }));
+    assert_eq!(again["live"]["position"], st["live"]["position"]);
+    // Choose the best-ranked candidate: it is born there. (A low-ranked, poorly
+    // connected birthplace can keep an institution from spreading at all.)
+    let chosen = cands[0]["province"].as_u64().unwrap();
+    call("sim_directive", serde_json::json!({ "action": "institution_birth", "args": { "institution": 0, "province": chosen } }));
+    let st = call("sim_step", serde_json::json!({ "steps": 1, "stop_at_choice": true }));
+    let gun = &st["sim"]["institutions"][0];
+    assert_eq!(gun["province"], chosen, "{gun}");
+    assert!(st["sim"]["pending_institution"].is_null());
+    // The rest to the end, choices left to chance.
+    let st = call("sim_step", serde_json::json!({ "to": "end" }));
+    assert_eq!(st["sim"]["step_months"], 6);
+    assert_eq!(st["sim"]["time"], st["sim"]["year"].as_i64().unwrap() * 12);
+    let commit = call("sim_commit", serde_json::json!({}));
+    assert_eq!(commit["replayed"], false);
+    let mut s = session.lock().unwrap();
+    let m = s.world.meta(Step::Nations).unwrap().clone();
+    let np = worldcore::params::NationParams::default();
+    let earliest = [np.gunpowder_year, np.shipping_year, np.industrial_year, np.fertilizer_year, np.motor_year, np.air_year];
+    // Institutions are born in order, never before their year.
+    let inst = m["institutions"].as_array().unwrap();
+    let mut last = i64::MIN;
+    for (k, i) in inst.iter().enumerate() {
+        if let Some(y) = i["born"].as_i64() {
+            assert!(y >= earliest[k] as i64 && y >= last, "{i}");
+            last = y;
+        }
+    }
+    assert!(inst[0]["born"].is_i64() && inst[1]["born"].is_i64(), "gunpowder and navigation are born: {inst:?}");
+    // Ports: in good harbours, owned by nations of the shipping era.
+    let t = &m["table"];
+    let ports = t["ports"].as_array().unwrap();
+    assert!(!ports.is_empty(), "ports open");
+    for p in ports {
+        assert!(p["harbour"].as_f64().unwrap() + 1e-9 >= np.port_quality - 0.15, "{p}");
+        assert!(p["opened"].as_i64().unwrap() >= earliest[1] as i64);
+    }
+    // Province rows agree with the institution totals.
+    for (k, i) in inst.iter().enumerate() {
+        let name = i["name"].as_str().unwrap();
+        let n = t["provinces"].as_array().unwrap().iter().filter(|p| p["institutions"].as_array().unwrap().iter().any(|x| x == name)).count();
+        assert_eq!(n as u64, i["embraced_provinces"].as_u64().unwrap(), "institution {k}");
+    }
+    assert!(worldcore::validate::validate(&mut s.world).ok);
+}
+
+#[test]
+fn cities_rise_and_fall() {
+    use worldcore::directives::Directive;
+    let mut p = small_params(29);
+    p.cultures.ticks = 60;
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let t = w.meta(Step::Nations).unwrap()["table"].clone();
+    // Capitals become the largest cities.
+    let cities = t["cities"].as_array().unwrap();
+    let caps = cities.iter().take(10).filter(|c| c["capital"] == true).count();
+    assert!(caps >= 6, "capitals among the 10 largest cities: {caps}");
+    // Pins: a boom town and an abandoned city, placed in 1300 on two populous
+    // provinces that are not capitals, then the boom town moved and a capital moved.
+    let pop_of = |w: &World, id: u64| w.meta(Step::Nations).unwrap()["table"]["provinces"].as_array().unwrap().iter().find(|q| q["id"] == id).unwrap()["population"].as_f64().unwrap();
+    let mid: Vec<u64> = cities.iter().skip(20).filter(|c| c["capital"] == false).take(3).map(|c| c["province"].as_u64().unwrap()).collect();
+    let (boom, bust, later) = (mid[0], mid[1], mid[2]);
+    let d = |at: i64, month: u8, action: &str, args: serde_json::Value| Directive { stage: "nations".into(), at, month, action: action.into(), args, note: String::new(), by: "user".into() };
+    w.edits.overrides.directives = vec![
+        d(1300, 0, "pin_add", serde_json::json!({ "province": boom, "value": 1.0, "years": null, "label": "silver rush" })),
+        d(1300, 0, "pin_add", serde_json::json!({ "province": bust, "value": -1.0, "years": null, "label": "sacked and abandoned" })),
+        d(1500, 0, "pin_add", serde_json::json!({ "province": later, "value": 0.5, "years": 100, "label": null })),
+        d(1900, 0, "pin_move", serde_json::json!({ "pin": 99, "province": boom })),
+    ];
+    for x in &w.edits.overrides.directives {
+        worldcore::directives::validate(x).unwrap();
+    }
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m = w.meta(Step::Nations).unwrap().clone();
+    let applied = m["directives"].as_array().unwrap();
+    assert_eq!(applied.iter().map(|a| a["applied"] == true).collect::<Vec<_>>(), vec![true, true, true, false], "{applied:?}");
+    let before = |id: u64| t["provinces"].as_array().unwrap().iter().find(|q| q["id"] == id).unwrap()["population"].as_f64().unwrap();
+    assert!(pop_of(&w, boom) > 1.3 * before(boom), "boom town grew: {} vs {}", pop_of(&w, boom), before(boom));
+    assert!(pop_of(&w, bust) < 0.2 * before(bust), "abandoned city emptied: {} vs {}", pop_of(&w, bust), before(bust));
+    let pins = m["table"]["pins"].as_array().unwrap();
+    assert_eq!(pins.len(), 2, "the 100-year pin expired: {pins:?}");
+    assert_eq!(pins[0]["label"], "silver rush");
+    assert!(m["table"]["events"].as_array().unwrap().iter().any(|e| e["event"] == "ruined" || e["event"] == "metropolis"));
+    assert!(worldcore::validate::validate(&mut w).ok);
+
+    // Moving a capital late (dated between two steps: it applies in the step
+    // that covers its year) to a deep interior province, which cannot change
+    // hands in that last step.
+    let ptab = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().clone();
+    let nt = m["table"].clone();
+    let owner: std::collections::HashMap<u64, u64> = nt["provinces"].as_array().unwrap().iter().map(|q| (q["id"].as_u64().unwrap(), q["owner"].as_u64().unwrap())).collect();
+    let (nation, target) = ptab
+        .iter()
+        .filter_map(|q| {
+            let id = q["id"].as_u64()?;
+            let o = *owner.get(&id)?;
+            let nb: Vec<u64> = q["neighbors"].as_array()?.iter().filter_map(|x| x.as_u64()).collect();
+            let cap = nt["nations"].as_array()?.iter().find(|n| n["id"] == o)?["capital"].as_u64()?;
+            (o > 0 && id != cap && nb.len() >= 3 && nb.iter().all(|x| owner.get(x).map_or(true, |&y| y == o))).then_some((o, id))
+        })
+        .next()
+        .expect("an interior province");
+    // Dated April 1913, inside the six-month step that starts in January.
+    w.edits.overrides.directives.push(d(1913, 4, "move_capital", serde_json::json!({ "nation": nation, "province": target })));
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let m2 = w.meta(Step::Nations).unwrap();
+    assert_eq!(m2["directives"].as_array().unwrap().last().unwrap()["applied"], true);
+    assert!(m2["table"]["events"].as_array().unwrap().iter().any(|e| e["event"] == "capital" && e["year"] == 1913 && e["province"] == target));
+    let n2 = m2["table"]["nations"].as_array().unwrap().iter().find(|n| n["id"] == nation).unwrap();
+    assert_eq!(n2["capital"], target);
+}
+
+/// Old mountains come from noise, away from plate boundaries; their brushes
+/// add or remove only them, never the relief raised by plates.
+#[test]
+fn old_mountains_from_noise_and_their_brushes() {
+    let mut p = small_params(7);
+    p.planet.grid_level = 6;
+    let f32_of = |w: &mut World, name: &str| match w.field(name) {
+        Some((worldcore::fields::Field::F32(v), _, _)) => v.clone(),
+        _ => panic!("{name}"),
+    };
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Relief, &|_, _, _| {});
+    let old = f32_of(&mut w, "old_relief");
+    let elev = f32_of(&mut w, "elevation");
+    let land = elev.iter().filter(|&&e| e > 0.0).count();
+    let hilly = old.iter().filter(|&&o| o > 300.0).count();
+    assert!(hilly > land / 50 && hilly < land / 3, "old mountains on {hilly} of {land} land cells");
+    assert!(old.iter().cloned().fold(0.0, f32::max) < p.tectonics.old_mountain_height_m as f32 + 1.0, "never above their height");
+
+    // Without them, the plate relief is the same elsewhere.
+    let mut flat = World::new(WorldParams { tectonics: worldcore::params::TectonicParams { old_mountains: 0.0, ..p.tectonics.clone() }, ..p.clone() });
+    flat.run_to(Step::Relief, &|_, _, _| {});
+    let elev0 = f32_of(&mut flat, "elevation");
+    assert!(f32_of(&mut flat, "old_relief").iter().all(|&o| o == 0.0));
+    for i in 0..elev.len() {
+        assert!((elev[i] - old[i] - elev0[i]).abs() < 1.0, "cell {i}: only the old mountains differ");
+    }
+
+    // Erase the highest cluster, paint a new one on a plain.
+    let grid = w.grid();
+    let ll = |i: usize| [grid.lat[i].to_degrees(), grid.lon[i].to_degrees()];
+    let top = (0..old.len()).max_by(|&a, &b| old[a].total_cmp(&old[b])).unwrap();
+    let stress = f32_of(&mut w, "stress");
+    let plain = (0..old.len()).filter(|&i| elev[i] > 50.0 && old[i] == 0.0 && stress[i] < 0.05).max_by_key(|&i| (grid.lat[i].abs() < 1.0) as u8).expect("a plain");
+    w.edits.add_stroke(Stroke { tool: Tool::OldMountainErase, radius_km: 400.0, strength: 1.0, hardness: 0.9, points: vec![ll(top)], ..Default::default() });
+    w.edits.add_stroke(Stroke { tool: Tool::OldMountain, value: 1.0, radius_km: 500.0, strength: 1.0, hardness: 0.9, points: vec![ll(plain)], ..Default::default() });
+    assert!(!w.is_fresh(Step::Relief));
+    w.run_to(Step::Relief, &|_, _, _| {});
+    let old2 = f32_of(&mut w, "old_relief");
+    let elev2 = f32_of(&mut w, "elevation");
+    assert!(old2[top] < 1.0, "erased: {}", old2[top]);
+    assert!((elev2[top] - elev0[top]).abs() < 1.0, "only the old mountains go");
+    let painted = grid.neighbors(plain).iter().map(|&j| old2[j as usize]).fold(old2[plain], f32::max);
+    assert!(painted > 150.0, "painted old mountains: {painted} m");
+    assert_eq!(f32_of(&mut w, "stress"), stress, "plate stress untouched");
+}
+
+/// Nation seeds: polities you place exist at the start year with their name
+/// and size; `initial_nations` more are placed automatically; seeds on the
+/// sea are ignored and the erase tool removes the nearest seed.
+#[test]
+fn nation_seeds_and_initial_nations() {
+    let mut p = small_params(29);
+    p.cultures.ticks = 60;
+    p.nations.start_year = 1300;
+    p.nations.start_date = 1320;
+    p.nations.initial_nations = 3;
+    p.nations.initial_size = 4;
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Cultures, &|_, _, _| {});
+    let provs = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().clone();
+    let ll = |q: &serde_json::Value| [q["center"][0].as_f64().unwrap(), q["center"][1].as_f64().unwrap()];
+    let land: Vec<&serde_json::Value> = provs.iter().filter(|q| q["kind"] == "land").collect();
+    let a = land[0];
+    let far = |x: [f64; 2], y: [f64; 2]| Vec3::from_lat_lon_deg(x[0], x[1]).angle_to(Vec3::from_lat_lon_deg(y[0], y[1]));
+    let b = *land.iter().max_by(|x, y| far(ll(x), ll(a)).total_cmp(&far(ll(y), ll(a)))).unwrap();
+    let sea = provs.iter().find(|q| q["kind"] == "sea").unwrap();
+    let seed = |at: [f64; 2], size: f64, name: &str| Stroke { tool: Tool::NationSeed, value: size, radius_km: 100.0, name: name.into(), points: vec![at], ..Default::default() };
+    w.edits.add_stroke(seed(ll(a), 3.0, "Avalon"));
+    w.edits.add_stroke(seed(ll(b), 0.0, ""));
+    w.edits.add_stroke(seed(ll(sea), 2.0, "Atlantis"));
+    assert_eq!(w.edits.overrides.nation_seeds.len(), 3);
+    assert!(!w.is_fresh(Step::Nations) && w.is_fresh(Step::Cultures), "seeds feed Stage 4 only");
+    // Erase the sea seed.
+    w.edits.add_stroke(Stroke { tool: Tool::NationSeedErase, points: vec![ll(sea)], ..Default::default() });
+    assert_eq!(w.edits.overrides.nation_seeds.len(), 2);
+    w.edits.add_stroke(seed(ll(sea), 2.0, "Atlantis"));
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let events = w.meta(Step::Nations).unwrap()["table"]["events"].as_array().unwrap().clone();
+    let founded: Vec<&serde_json::Value> = events.iter().filter(|e| e["event"] == "founded" && e["year"] == 1300).collect();
+    assert!(founded.iter().any(|e| e["province"] == a["id"] && e["text"].as_str().unwrap().starts_with("Avalon")), "the named seed: {founded:?}");
+    assert!(founded.iter().any(|e| e["province"] == b["id"]), "the unnamed seed takes its capital's name");
+    assert!(!events.iter().any(|e| e["text"].as_str().unwrap_or("").contains("Atlantis")), "a seed on the sea founds nothing");
+    // Seeds are nations 1 and 2, the initial nations 3–5; later ones come from the first step.
+    let first: Vec<u64> = founded.iter().filter_map(|e| e["nation"].as_u64()).filter(|&n| n <= 5).collect();
+    assert_eq!(first, vec![1, 2, 3, 4, 5], "two seeds and three initial nations: {founded:?}");
+    assert!(founded.iter().any(|e| e["nation"] == 1 && e["province"] == a["id"]));
+    // The live run starts with the same polities.
+    let session = std::sync::Mutex::new(worldcore::api::Session::new(p));
+    session.lock().unwrap().world = w;
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(worldcore::api::ProgressState::default()));
+    let st = match worldcore::api::handle(&session, &progress, "sim_start", serde_json::json!({ "stage": "nations" })).unwrap() {
+        worldcore::api::Reply::Json(v) => v,
+        _ => panic!(),
+    };
+    let names: Vec<&str> = st["sim"]["nations"].as_array().unwrap().iter().filter_map(|n| n["name"].as_str()).collect();
+    assert_eq!(names.len(), 5, "the live run starts with the seeded polities only: {names:?}");
+    assert!(names.contains(&"Avalon"));
+    let avalon = st["sim"]["nations"].as_array().unwrap().iter().find(|n| n["name"] == "Avalon").unwrap();
+    assert!(avalon["provinces"].as_u64().unwrap() <= 3 && avalon["provinces"].as_u64().unwrap() >= 1, "{avalon}");
+}
+
+/// A stale later result never hides a fresh earlier one: after a change to
+/// Stage 1 inputs and a run to the relief step only, the elevation shown is
+/// the new relief, not the old (stale) eroded elevation of hydrology. Stale
+/// and later results can be cleared.
+#[test]
+fn stale_results_do_not_shadow_fresh_ones_and_can_be_cleared() {
+    use worldcore::api::{handle, ProgressState, Reply, Session};
+    let p = small_params(31);
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Hydrology, &|_, _, _| {});
+    let old = match w.field("elevation") {
+        Some((worldcore::fields::Field::F32(v), step, stale)) => {
+            assert_eq!(step, Step::Hydrology);
+            assert!(!stale);
+            v.clone()
+        }
+        _ => panic!(),
+    };
+    // A new seed changes everything from the sketch on; run to relief only.
+    w.params.planet.seed = 32;
+    w.run_to(Step::Relief, &|_, _, _| {});
+    assert!(w.is_fresh(Step::Relief) && !w.is_fresh(Step::Hydrology));
+    match w.field("elevation") {
+        Some((worldcore::fields::Field::F32(v), step, stale)) => {
+            assert_eq!(step, Step::Relief, "the fresh relief, not the stale hydrology");
+            assert!(!stale);
+            assert!(v.iter().zip(&old).any(|(a, b)| (a - b).abs() > 1.0));
+        }
+        _ => panic!(),
+    }
+    // A land stroke in deep sea shows as land at once, with the old
+    // hydrology still on disk (the user's case: sketch edits seemed ignored).
+    let grid = w.grid();
+    let elev_now = |w: &World| match w.field("elevation") {
+        Some((worldcore::fields::Field::F32(v), _, _)) => v.clone(),
+        _ => panic!(),
+    };
+    let e1 = elev_now(&w);
+    let deep = (0..e1.len()).find(|&i| e1[i] < -3000.0 && grid.lat[i].abs() < 0.6).expect("deep sea");
+    let at = [grid.lat[deep].to_degrees(), grid.lon[deep].to_degrees()];
+    w.edits.add_stroke(Stroke { tool: Tool::Land, radius_km: 900.0, strength: 1.0, hardness: 0.8, points: vec![at], ..Default::default() });
+    w.run_to(Step::Relief, &|_, _, _| {});
+    let e2 = elev_now(&w);
+    assert!(e2[deep] > 0.0, "painted land is land in the shown elevation: {} m", e2[deep]);
+    // Clearing through the API: stale results first, then from a step on.
+    let session = std::sync::Mutex::new(Session::new(p));
+    session.lock().unwrap().world = w;
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(ProgressState::default()));
+    let call = |cmd: &str, args: serde_json::Value| match handle(&session, &progress, cmd, args).unwrap() {
+        Reply::Json(v) => v,
+        _ => panic!(),
+    };
+    let st = call("clear_results", serde_json::json!({}));
+    let states: Vec<&str> = st["steps"].as_array().unwrap().iter().map(|x| x["state"].as_str().unwrap()).collect();
+    assert!(st["cleared"].as_u64().unwrap() >= 2, "climate and hydrology were stale: {states:?}");
+    assert!(!states.contains(&"stale"), "{states:?}");
+    assert_eq!(states[Step::Relief.index()], "done");
+    let st = call("clear_results", serde_json::json!({ "from": "plates" }));
+    let states: Vec<&str> = st["steps"].as_array().unwrap().iter().map(|x| x["state"].as_str().unwrap()).collect();
+    assert_eq!(st["cleared"], 2, "plates and relief");
+    assert_eq!(states[Step::Sketch.index()], "done");
+    assert!(states[Step::Plates.index()..].iter().all(|&s| s == "empty"), "{states:?}");
+}
+
+/// Foehn warms only land below the lee of ranges, by exactly the `foehn`
+/// field, without touching rain or the sea; mountains hold maritime air back,
+/// so lee slopes turn more continental than windward ones.
+#[test]
+fn foehn_and_mountains_blocking_sea_air() {
+    let mut p = small_params(5);
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    let run = |foehn: f64, blocking: f64| {
+        let mut q = p.clone();
+        q.climate.foehn = foehn;
+        q.climate.sea_air_blocking = blocking;
+        let mut w = World::new(q);
+        w.run_to(Step::Climate, &|_, _, _| {});
+        w
+    };
+    let f32_of = |w: &mut World, name: &str| match w.field(name) {
+        Some((worldcore::fields::Field::F32(v), _, _)) => v.clone(),
+        _ => panic!("{name}"),
+    };
+    let mut none = run(0.0, 0.0);
+    let mut foehn = run(1.0, 0.0);
+    let mut blocked = run(0.0, 1.0);
+    let grid = none.grid();
+    let n = grid.len();
+    let elev = f32_of(&mut none, "elevation");
+
+    // How far each land cell lies below the ground its annual-mean wind comes from.
+    let (u, v) = (f32_of(&mut none, "wind_u"), f32_of(&mut none, "wind_v"));
+    let below_upwind: Vec<f64> = (0..n)
+        .map(|i| {
+            let (mut aw, mut ah) = (0.0, 0.0);
+            for &nb in grid.neighbors(i) {
+                let j = nb as usize;
+                let (e, nn) = grid.pos[j].east_north();
+                let (uj, vj) = ((0..12).map(|m| u[m * n + j]).sum::<f32>(), (0..12).map(|m| v[m * n + j]).sum::<f32>());
+                let a = (e * uj as f64 + nn * vj as f64).dot((grid.pos[i] - grid.pos[j]).normalized()).max(0.0);
+                aw += a;
+                ah += a * elev[j].max(0.0) as f64;
+            }
+            if aw > 0.0 { ah / aw - elev[i].max(0.0) as f64 } else { 0.0 }
+        })
+        .collect();
+    let land: Vec<usize> = (0..n).filter(|&i| elev[i] > 0.0).collect();
+    let lee: Vec<usize> = land.iter().copied().filter(|&i| below_upwind[i] > 150.0).collect();
+    let windward: Vec<usize> = land.iter().copied().filter(|&i| below_upwind[i] < -150.0).collect();
+    assert!(lee.len() > 20 && windward.len() > 20, "{} lee, {} windward cells", lee.len(), windward.len());
+    let mean = |v: &[f32], cells: &[usize]| cells.iter().map(|&i| v[i] as f64).sum::<f64>() / cells.len() as f64;
+
+    // Foehn: none when switched off, only on land, within its cap, mostly on lee slopes.
+    assert!(f32_of(&mut none, "foehn").iter().all(|&x| x == 0.0));
+    let fw = f32_of(&mut foehn, "foehn");
+    assert!((0..n).all(|i| fw[i] >= 0.0 && (elev[i] > 0.0 || fw[i] == 0.0)), "only land is warmed");
+    let max = fw.iter().cloned().fold(0.0, f32::max);
+    assert!(max > 0.3 && max < 4.0, "strongest Foehn {max} °C");
+    let (f_lee, f_wind) = (mean(&fw, &lee), mean(&fw, &windward));
+    assert!(f_lee > 2.0 * f_wind && f_lee > 0.05, "Foehn on lee slopes {f_lee:.3} °C, windward {f_wind:.3} °C");
+    // It adds exactly its warming to each land month (ice sheets, which damp
+    // summer warmth, aside) and changes nothing else.
+    let (t0, t1) = (f32_of(&mut none, "t_mean"), f32_of(&mut foehn, "t_mean"));
+    for i in (0..n).filter(|&i| t0[i].min(t1[i]) > -8.0) {
+        assert!((t1[i] - t0[i] - fw[i]).abs() < 1e-3, "cell {i}: {} vs {}", t1[i] - t0[i], fw[i]);
+    }
+    assert_eq!(f32_of(&mut none, "p_ann"), f32_of(&mut foehn, "p_ann"), "rain unchanged");
+    assert_eq!(f32_of(&mut none, "continentality"), f32_of(&mut foehn, "continentality"));
+
+    // Blocking: lee slopes lose more maritime air than windward ones.
+    let (c0, c1) = (f32_of(&mut none, "continentality"), f32_of(&mut blocked, "continentality"));
+    let dc: Vec<f32> = (0..n).map(|i| c1[i] - c0[i]).collect();
+    let (d_lee, d_wind) = (mean(&dc, &lee), mean(&dc, &windward));
+    assert!(d_lee > 0.02 && d_lee > 2.0 * d_wind.max(0.0), "continentality rise on lee slopes {d_lee:.3}, windward {d_wind:.3}");
+    assert!(mean(&dc, &land) > 0.0, "land is more continental overall");
+}
+
+/// Orographic rain: wet air forced up a slope rains more on the windward side
+/// than on the lee, on the climate grid and on the finer world grid; no month
+/// exceeds the rain-rate limit, and the global total stays put.
+#[test]
+fn orographic_rain_on_windward_slopes() {
+    let mut p = small_params(5);
+    p.planet.grid_level = 7;
+    p.climate.climate_level = 6;
+    let run = |oro: f64| {
+        let mut q = p.clone();
+        q.climate.orographic = oro;
+        let mut w = World::new(q);
+        w.run_to(Step::Climate, &|_, _, _| {});
+        w
+    };
+    let f32_of = |w: &mut World, name: &str| match w.field(name) {
+        Some((worldcore::fields::Field::F32(v), _, _)) => v.clone(),
+        _ => panic!("{name}"),
+    };
+    let mut flat = run(0.0);
+    let mut oro = run(1.0);
+    let grid = flat.grid();
+    let n = grid.len();
+    let elev = f32_of(&mut flat, "elevation");
+    let (u, v) = (f32_of(&mut flat, "wind_u"), f32_of(&mut flat, "wind_v"));
+    let pm0 = f32_of(&mut flat, "precip");
+    // Climb of each land cell above the ground its wind comes from, weighting
+    // each month's wind by its rain (the wet-season wind is the one that counts).
+    let climb: Vec<f64> = (0..n)
+        .map(|i| {
+            let (mut aw, mut ah) = (0.0, 0.0);
+            for &nb in grid.neighbors(i) {
+                let j = nb as usize;
+                let (e, nn) = grid.pos[j].east_north();
+                let (uj, vj) = ((0..12).map(|m| u[m * n + j] * pm0[m * n + j]).sum::<f32>(), (0..12).map(|m| v[m * n + j] * pm0[m * n + j]).sum::<f32>());
+                let a = (e * uj as f64 + nn * vj as f64).dot((grid.pos[i] - grid.pos[j]).normalized()).max(0.0);
+                aw += a;
+                ah += a * elev[j].max(0.0) as f64;
+            }
+            if aw > 0.0 { elev[i].max(0.0) as f64 - ah / aw } else { 0.0 }
+        })
+        .collect();
+    let land: Vec<usize> = (0..n).filter(|&i| elev[i] > 0.0).collect();
+    let windward: Vec<usize> = land.iter().copied().filter(|&i| climb[i] > 150.0).collect();
+    let lee: Vec<usize> = land.iter().copied().filter(|&i| climb[i] < -150.0).collect();
+    assert!(windward.len() > 20 && lee.len() > 20, "{} windward, {} lee cells", windward.len(), lee.len());
+    let (p0, p1) = (f32_of(&mut flat, "p_ann"), f32_of(&mut oro, "p_ann"));
+    // Median gain per cell from switching orographic rain on.
+    let gain = |cells: &[usize]| {
+        let mut r: Vec<f64> = cells.iter().map(|&i| p1[i] as f64 / (p0[i] as f64).max(1.0)).collect();
+        r.sort_by(|a, b| a.total_cmp(b));
+        r[r.len() / 2]
+    };
+    let (g_wind, g_lee) = (gain(&windward), gain(&lee));
+    assert!(g_wind > 1.7, "windward slopes gain x{g_wind:.2}");
+    assert!(g_wind > g_lee + 0.35, "windward x{g_wind:.2} vs lee x{g_lee:.2}");
+    // The global total barely moves: orographic rain only moves rain around.
+    let total = |pa: &[f32]| (0..n).map(|i| pa[i] as f64 * grid.area[i]).sum::<f64>();
+    let ratio = total(&p1) / total(&p0);
+    assert!((ratio - 1.0).abs() < 0.03, "global precipitation changed x{ratio:.3}");
+
+    // A very wet world with strong orographic rain still keeps every month
+    // under the rain-rate limit.
+    let mut wet = p.clone();
+    wet.climate.global_precip_mm = 3000.0;
+    wet.climate.orographic = 2.0;
+    let mut w = World::new(wet);
+    w.run_to(Step::Climate, &|_, _, _| {});
+    let max = f32_of(&mut w, "precip").iter().cloned().fold(0.0, f32::max);
+    assert!(max > 1500.0 && max < 2500.0, "wettest month {max} mm");
+}
+
+/// Rivers run along cell edges (like Civilization V's): every segment joins
+/// two adjacent cell corners, both its banks are land and mark a river, the
+/// courses form a tree, and border rivers are where provinces meet.
+#[test]
+fn rivers_run_along_cell_edges_and_divide_land() {
+    let mut p = small_params(5);
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    let g = w.grid();
+    let get = |w: &World, name: &str| w.field(name).unwrap_or_else(|| panic!("{name}")).0.clone();
+    use worldcore::fields::Field;
+    let Field::I32(to) = get(&w, "river_to") else { panic!() };
+    let Field::F32(q) = get(&w, "river_seg_discharge") else { panic!() };
+    let Field::U8(seg_role) = get(&w, "river_seg_role") else { panic!() };
+    let Field::F32(bank_w) = get(&w, "river_width") else { panic!() };
+    let Field::U8(wat) = get(&w, "water") else { panic!() };
+    let Field::U32(prov) = get(&w, "province") else { panic!() };
+    assert_eq!(to.len(), g.tris.len(), "one segment slot per cell corner");
+    let segs: Vec<usize> = (0..to.len()).filter(|&t| to[t] >= 0).collect();
+    assert!(segs.len() > 100, "{} river segments", segs.len());
+    for &t in &segs {
+        let u = to[t] as usize;
+        let shared = g.tris[t].iter().filter(|c| g.tris[u].contains(c)).count();
+        assert_eq!(shared, 2, "segment {t}→{u} does not run along a cell edge");
+        let (a, b) = g.corner_edge_cells(t, u);
+        assert!(wat[a] == 0 && wat[b] == 0, "both banks are land");
+        assert!(bank_w[a] > 0.0 && bank_w[b] > 0.0, "both banks are river cells");
+        assert!(q[t] as f64 >= p.hydrology.river_threshold_m3s, "segment {t} carries {} m³/s", q[t]);
+    }
+    // Courses form a tree: following them always ends.
+    for &t in &segs {
+        let (mut c, mut k) = (t, 0);
+        while to[c] >= 0 {
+            c = to[c] as usize;
+            k += 1;
+            assert!(k <= to.len(), "river course from corner {t} loops");
+        }
+    }
+    // Border rivers are where provinces meet, and their borders are typed "river".
+    let border: Vec<usize> = segs.iter().copied().filter(|&t| seg_role[t] == 1).collect();
+    assert!(border.len() > 20, "{} border-river segments", border.len());
+    let split = border.iter().filter(|&&t| { let (a, b) = g.corner_edge_cells(t, to[t] as usize); prov[a] != prov[b] }).count();
+    let share = split as f64 / border.len() as f64;
+    assert!(share > 0.9, "only {:.0}% of border-river length divides provinces", share * 100.0);
+    let types = &w.meta(Step::Provinces).unwrap()["borders"];
+    assert!(types["river"].as_u64().unwrap_or(0) > 0, "no river borders: {types}");
+}
+
+/// The culture editor: merge, rename, split by a line and by traits,
+/// re-parent, new name, paint and lock. Edits pick cultures by place, apply
+/// at the end of Stage 3, and report what no longer applies. A locked culture
+/// keeps its provinces and name when Stage 3 re-runs with other settings,
+/// refuses further edits, and Stage 4 never changes its share of any province.
+#[test]
+fn culture_editor_and_locks() {
+    use serde_json::Value;
+    use worldcore::api::{prepare_culture_edit, CultureEdit};
+    use worldcore::edits::EditLayer;
+    use worldcore::fields::Field;
+    let mut p = small_params(9);
+    p.planet.grid_level = 6;
+    p.climate.climate_level = 6;
+    p.cultures.ticks = 240;
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Cultures, &|_, _, _| {});
+    let table = |w: &World, key: &str| -> Vec<Value> { w.meta(Step::Cultures).unwrap()["table"][key].as_array().unwrap().clone() };
+    let centres: std::collections::HashMap<u64, [f64; 2]> = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().iter().map(|r| (r["id"].as_u64().unwrap(), [r["center"][0].as_f64().unwrap(), r["center"][1].as_f64().unwrap()])).collect();
+    let culture_at = |w: &mut World, ll: [f64; 2]| -> u32 {
+        let g = w.grid();
+        let c = g.nearest(Vec3::from_lat_lon_deg(ll[0], ll[1]), None);
+        match w.field("culture") { Some((Field::U16(v), _, _)) => v[c] as u32, _ => panic!() }
+    };
+    let row = |w: &World, c: u32| table(w, "cultures").into_iter().find(|r| r["id"].as_u64() == Some(c as u64)).unwrap();
+    // Provinces (centres) where culture c is the majority, most populous first.
+    let provs_of = |w: &World, c: u32| -> Vec<[f64; 2]> {
+        let mut v: Vec<(f64, [f64; 2])> = table(w, "provinces").iter().filter(|r| r["culture"].as_u64() == Some(c as u64)).map(|r| (r["population"].as_f64().unwrap(), centres[&r["id"].as_u64().unwrap()])).collect();
+        v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        v.into_iter().map(|x| x.1).collect()
+    };
+    let edit = |w: &mut World, st: Stroke| -> Result<(), String> {
+        match prepare_culture_edit(w, st)? {
+            CultureEdit::Add(s) => w.edits.add_stroke(s),
+            CultureEdit::Unlock(idx) => { w.edits.remove_strokes(EditLayer::Cultures, &idx); }
+        }
+        Ok(())
+    };
+    let run = |w: &mut World| { w.run_to(Step::Cultures, &|_, _, _| {}); };
+    let living = |w: &World| -> Vec<(u32, u64)> {
+        let mut v: Vec<(u32, u64)> = table(w, "cultures").iter().filter(|r| r["alive"].as_bool().unwrap()).map(|r| (r["id"].as_u64().unwrap() as u32, r["provinces"].as_u64().unwrap())).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    };
+    let cultures = living(&w);
+    assert!(cultures.len() >= 4, "{} living cultures", cultures.len());
+    let (a, b, c, d) = (cultures[0].0, cultures[1].0, cultures[2].0, cultures[3].0);
+    let (pa, pb, pc, pd) = (provs_of(&w, a), provs_of(&w, b), provs_of(&w, c), provs_of(&w, d));
+    let n0 = cultures.len();
+
+    // Merge D into C; rename C.
+    edit(&mut w, Stroke { tool: Tool::CultureMerge, points: vec![pd[0], pc[0]], ..Default::default() }).unwrap();
+    edit(&mut w, Stroke { tool: Tool::RenameCulture, points: vec![pc[0]], name: "Testlandic".into(), ..Default::default() }).unwrap();
+    run(&mut w);
+    assert_eq!(culture_at(&mut w, pd[0]), c, "D's land is C's now");
+    let rd = row(&w, d);
+    assert!(!rd["alive"].as_bool().unwrap() && rd["fate"] == "merged" && rd["fate_other"].as_u64() == Some(c as u64), "{rd}");
+    assert_eq!(row(&w, c)["name"], "Testlandic");
+    assert_eq!(living(&w).len(), n0 - 1);
+
+    // Split A by a line between its two farthest provinces.
+    let v = |ll: [f64; 2]| Vec3::from_lat_lon_deg(ll[0], ll[1]);
+    let (mut f1, mut f2, mut far) = (pa[0], pa[0], 0.0);
+    for &x in &pa { for &y in &pa { let dd = v(x).angle_to(v(y)); if dd > far { far = dd; f1 = x; f2 = y; } } }
+    let m = (v(f1) + v(f2)).normalized();
+    let perp = m.cross((v(f2) - v(f1)).normalized()).normalized();
+    let deg = |q: Vec3| { let (la, lo) = q.lat_lon(); [la.to_degrees(), lo.to_degrees()] };
+    let line: Vec<[f64; 2]> = (-10..=10).map(|k| deg((m + perp * (k as f64 * 0.06)).normalized())).collect();
+    edit(&mut w, Stroke { tool: Tool::CultureSplit, points: line, ..Default::default() }).unwrap();
+    run(&mut w);
+    let (s1, s2) = (culture_at(&mut w, f1), culture_at(&mut w, f2));
+    assert_ne!(s1, s2, "the line splits A");
+    let daughter = if s1 == a { s2 } else { s1 };
+    assert!(s1 == a || s2 == a, "one side keeps A");
+    assert_eq!(row(&w, daughter)["parent"].as_u64(), Some(a as u64), "the other side is A's daughter");
+
+    // Split B by its people's contacts into two.
+    edit(&mut w, Stroke { tool: Tool::CultureSplitTraits, points: vec![pb[0]], value: 2.0, ..Default::default() }).unwrap();
+    run(&mut w);
+    let b_daughters = table(&w, "cultures").iter().filter(|r| r["parent"].as_u64() == Some(b as u64) && r["alive"].as_bool().unwrap() && r["founded_year"] == row(&w, daughter)["founded_year"]).count();
+    let unapplied = w.meta(Step::Cultures).unwrap()["unapplied_edits"].clone();
+    assert!(b_daughters >= 1 || unapplied.to_string().contains("closely knit"), "split by traits: {unapplied}");
+
+    // Re-parent the daughter of A under C (C is older); B under A's daughter fails (too young).
+    edit(&mut w, Stroke { tool: Tool::CultureReparent, points: vec![if s1 == daughter { f1 } else { f2 }, pc[0]], ..Default::default() }).unwrap();
+    edit(&mut w, Stroke { tool: Tool::CultureReparent, points: vec![pb[0], if s1 == daughter { f1 } else { f2 }], ..Default::default() }).unwrap();
+    // A new name for B, and paint C over one of B's provinces.
+    let cb = culture_at(&mut w, pb[0]);
+    let old_b = row(&w, cb)["name"].clone();
+    edit(&mut w, Stroke { tool: Tool::CultureNewName, points: vec![pb[0]], ..Default::default() }).unwrap();
+    let target = *pb.last().unwrap();
+    edit(&mut w, Stroke { tool: Tool::CulturePaint, points: vec![pc[0], target], radius_km: 60.0, ..Default::default() }).unwrap();
+    run(&mut w);
+    assert_eq!(row(&w, daughter)["parent"].as_u64(), Some(c as u64), "re-parented under C");
+    let bnow = culture_at(&mut w, pb[0]);
+    assert_ne!(row(&w, bnow)["name"], old_b, "B has a new name");
+    assert_eq!(culture_at(&mut w, target), c, "the painted province is C's");
+    let reasons = w.meta(Step::Cultures).unwrap()["unapplied_edits"].to_string();
+    assert!(reasons.contains("younger"), "re-parenting under a younger culture is refused: {reasons}");
+    let report = worldcore::api::overrides_report(&w);
+    assert!(report["unapplied"].as_array().unwrap().iter().any(|u| u["layer"] == "cultures"), "the overrides report lists it");
+
+    // Lock C ("Testlandic"), then change a Stage 3 setting and re-run.
+    edit(&mut w, Stroke { tool: Tool::CultureLock, points: vec![pc[0]], ..Default::default() }).unwrap();
+    run(&mut w);
+    let lc = culture_at(&mut w, pc[0]);
+    assert!(row(&w, lc)["locked"].as_bool().unwrap() && row(&w, lc)["name"] == "Testlandic");
+    let ids = |w: &World, c: u32| -> std::collections::BTreeSet<u64> { table(w, "provinces").iter().filter(|r| r["culture"].as_u64() == Some(c as u64)).map(|r| r["id"].as_u64().unwrap()).collect() };
+    let held = ids(&w, lc);
+    assert!(edit(&mut w, Stroke { tool: Tool::CultureMerge, points: vec![pb[0], pc[0]], ..Default::default() }).unwrap_err().contains("locked"));
+    w.params.cultures.drift *= 1.7;
+    w.params.cultures.contact_scale_km *= 0.8;
+    run(&mut w);
+    let lc2 = culture_at(&mut w, pc[0]);
+    assert!(row(&w, lc2)["locked"].as_bool().unwrap(), "still locked after re-running Stage 3");
+    assert_eq!(row(&w, lc2)["name"], "Testlandic", "keeps its name");
+    assert_eq!(ids(&w, lc2), held, "keeps exactly its provinces");
+
+    // Stage 4 never changes a locked culture's share of a province.
+    let start: Vec<(u64, f64)> = table(&w, "provinces").iter().filter_map(|r| {
+        let sh: Vec<(u64, f64)> = r["shares"].as_array().unwrap().iter().map(|s| (s[0].as_u64().unwrap(), s[1].as_f64().unwrap())).collect();
+        let total: f64 = sh.iter().map(|x| x.1).sum();
+        sh.iter().find(|x| x.0 == lc2 as u64).map(|x| (r["id"].as_u64().unwrap(), x.1 / total))
+    }).collect();
+    assert!(!start.is_empty());
+    w.run_to(LAST, &|_, _, _| {});
+    let end: std::collections::HashMap<u64, f64> = w.meta(Step::Nations).unwrap()["table"]["provinces"].as_array().unwrap().iter().map(|r| {
+        let s = r["shares"].as_array().unwrap().iter().find(|s| s[0].as_u64() == Some(lc2 as u64)).map_or(0.0, |s| s[1].as_f64().unwrap());
+        (r["id"].as_u64().unwrap(), s)
+    }).collect();
+    for (id, s0) in &start {
+        let s1 = end.get(id).copied().unwrap_or(0.0);
+        assert!((s1 - s0).abs() < 0.003, "province {id}: locked share {s0:.3} became {s1:.3}");
+    }
+
+    // Unlock.
+    edit(&mut w, Stroke { tool: Tool::CultureLock, points: vec![pc[0]], ..Default::default() }).unwrap();
+    run(&mut w);
+    let cu = culture_at(&mut w, pc[0]);
+    assert!(!row(&w, cu)["locked"].as_bool().unwrap(), "unlocked");
+    let rep = worldcore::validate::validate(&mut w);
+    assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+}
+
+#[test]
+fn continents_grow_from_the_drawing() {
+    use worldcore::api::{handle, ProgressState, Reply, Session};
+    use worldcore::edits::SketchBase;
+    use worldcore::fields::Field;
+    use worldcore::graph;
+    let mut p = small_params(3);
+    p.planet.grid_level = 6;
+    let draw = |w: &mut World| {
+        let st = |tool, r: f64, pts: &[[f64; 2]]| Stroke { tool, radius_km: r, hardness: 0.5, points: pts.to_vec(), ..Default::default() };
+        w.edits.add_stroke(st(Tool::Land, 1200.0, &[[40.0, -100.0], [48.0, -80.0], [30.0, -85.0]]));
+        w.edits.add_stroke(st(Tool::Sea, 450.0, &[[47.0, -92.0]]));
+        w.edits.add_stroke(st(Tool::Land, 900.0, &[[-15.0, 30.0], [-30.0, 35.0]]));
+        w.edits.add_stroke(st(Tool::Land, 500.0, &[[10.0, 150.0]]));
+    };
+    let sketch = |p: &WorldParams, base: SketchBase| {
+        let mut w = World::new(p.clone());
+        w.edits.sketch.set_base(base);
+        draw(&mut w);
+        w.run_to(Step::Sketch, &|_, _, _| {});
+        let land = match w.field("land") { Some((Field::U8(v), _, _)) => v.clone(), _ => panic!() };
+        let drawing = match w.field("drawing") { Some((Field::F32(v), _, _)) => Some(v.clone()), _ => None };
+        (w.meta(Step::Sketch).cloned().unwrap(), land, drawing)
+    };
+    let grid = Grid::new(p.planet.grid_level);
+    let area = |f: &dyn Fn(usize) -> bool| (0..grid.len()).filter(|&i| f(i)).map(|i| grid.area[i]).sum::<f64>();
+
+    let (m, land, drawing) = sketch(&p, SketchBase::Drawing);
+    let d = drawing.expect("the drawing is kept for the map");
+    assert_eq!(m["base"], "drawing");
+    let drawn_area = area(&|i| d[i] > 0.0);
+    let land_area = area(&|i| land[i] == 1);
+    assert!((land_area / drawn_area - 1.0).abs() < 0.1, "the land area is the drawn one: {land_area} vs {drawn_area}");
+    let kept = m["drawing_kept"].as_f64().unwrap();
+    let precision = m["drawing_precision"].as_f64().unwrap();
+    assert!(kept > 0.7 && precision > 0.7, "the land follows the drawing: kept {kept}, precision {precision}");
+    assert!(kept < 0.97, "the generator reshapes the coasts: kept {kept}");
+
+    // Each drawn landmass keeps about its drawn size (measured over the
+    // cells nearest to it).
+    let (comp, masses) = graph::components(&grid, |i| d[i] > 0.0);
+    assert_eq!(masses.len(), 3);
+    let src: Vec<(u32, f64, u32)> = (0..grid.len()).filter(|&i| d[i] > 0.0).map(|i| (i as u32, 0.0, comp[i])).collect();
+    let near = graph::multi_source(&grid, &src, f64::INFINITY, |_, _, _, len| Some(len));
+    for (k, mass) in masses.iter().enumerate() {
+        let want: f64 = mass.iter().map(|&c| grid.area[c as usize]).sum();
+        let got = area(&|i| near.label[i] == k as u32 && land[i] == 1);
+        assert!((got / want - 1.0).abs() < 0.3, "landmass {k} keeps its size: {got} vs {want}");
+    }
+
+    // Another seed: other coasts, the same layout.
+    let mut p2 = p.clone();
+    p2.planet.seed = 4;
+    let (m2, land2, _) = sketch(&p2, SketchBase::Drawing);
+    let differ = area(&|i| land[i] != land2[i]);
+    assert!(differ > 0.05 * drawn_area, "another seed gives other details: {differ} vs {drawn_area}");
+    assert!(m2["drawing_kept"].as_f64().unwrap() > 0.7);
+
+    // No freedom: exactly what the same strokes paint on an empty ocean.
+    let mut p0 = p.clone();
+    p0.sketch.drawing_freedom_km = 0.0;
+    let (_, exact, _) = sketch(&p0, SketchBase::Drawing);
+    let (mo, ocean, od) = sketch(&p, SketchBase::Ocean);
+    assert_eq!(exact, ocean);
+    assert!(od.is_none() && mo["drawing_kept"].is_null());
+
+    // The freedom is part of the cache key only for drawings, so other
+    // worlds keep theirs.
+    let mut e = worldcore::edits::Edits::default();
+    let mut pf = p.clone();
+    pf.sketch.drawing_freedom_km = 900.0;
+    use worldcore::stages::input_hashes;
+    assert_eq!(input_hashes(&p, &e), input_hashes(&pf, &e));
+    e.sketch.set_base(SketchBase::Drawing);
+    assert_ne!(input_hashes(&p, &e)[1], input_hashes(&pf, &e)[1]);
+    assert_eq!(input_hashes(&p, &e)[0], input_hashes(&pf, &e)[0]);
+
+    // The API switches the base, and undo switches it back.
+    let session = std::sync::Mutex::new(Session::new(p.clone()));
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(ProgressState::default()));
+    let call = |cmd: &str, args: serde_json::Value| match handle(&session, &progress, cmd, args).unwrap() {
+        Reply::Json(v) => v,
+        _ => panic!(),
+    };
+    assert_eq!(call("status", serde_json::json!({}))["edits"]["sketch_base"], "generated");
+    assert_eq!(call("set_sketch_base", serde_json::json!({ "value": "drawing" }))["edits"]["sketch_base"], "drawing");
+    assert_eq!(call("set_auto_base", serde_json::json!({ "value": false }))["edits"]["sketch_base"], "ocean");
+    assert_eq!(call("undo", serde_json::json!({}))["edits"]["sketch_base"], "drawing");
+    assert_eq!(call("undo", serde_json::json!({}))["edits"]["sketch_base"], "generated");
 }

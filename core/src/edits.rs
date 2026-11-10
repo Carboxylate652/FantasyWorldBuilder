@@ -21,6 +21,10 @@ pub enum Tool {
     Lower,
     Smooth,
     Flatten,
+    // Old (noise) mountains, step 4: paint adds worn mountain clusters (value
+    // = strength 0–1), erase removes them. Plate-boundary relief is untouched.
+    OldMountain,
+    OldMountainErase,
     // Biome override (step 7)
     BiomePaint,
     BiomeErase,
@@ -60,6 +64,36 @@ pub enum Tool {
     // an oil port). The stroke's first point places it; `value` is the
     // population it should reach.
     SitePin,
+    // Nation seed (Stage 4): a polity that already exists at the start year,
+    // its capital at the stroke's first point; `value` = its provinces (0:
+    // the default size), `name` = its name (empty: the capital's). A drag
+    // that starts on a seed moves it; erase removes the nearest seed.
+    NationSeed,
+    NationSeedErase,
+    // Culture editor (Stage 3). Cultures are picked by location, since their
+    // ids change whenever Stage 3 re-runs.
+    /// Drag from a culture onto the culture that should absorb it.
+    CultureMerge,
+    /// The stroke's first point picks the culture; provinces mostly under the
+    /// brush join it.
+    CulturePaint,
+    /// A line across a culture splits it in two (the smaller side becomes a
+    /// daughter culture); a loop makes the provinces inside a daughter culture.
+    CultureSplit,
+    /// Split the culture under the point by its people's traits into `value`
+    /// (2–5) daughter cultures.
+    CultureSplitTraits,
+    /// Drag from a culture onto its new parent in the family tree.
+    CultureReparent,
+    /// Rename the culture under the point to `name`.
+    RenameCulture,
+    /// Give the culture under the point a new name from its own language
+    /// (`seed` picks it).
+    CultureNewName,
+    /// Lock a culture: the first point picks it and the other points are its
+    /// provinces when it was locked; `name` is its name. Re-running keeps its
+    /// provinces and name, and Stage 4 never changes it.
+    CultureLock,
 }
 
 impl Tool {
@@ -67,7 +101,7 @@ impl Tool {
         match self {
             Tool::Land | Tool::Sea | Tool::Mountain | Tool::EraseHint => EditLayer::Sketch,
             Tool::PlatePaint => EditLayer::Plates,
-            Tool::Raise | Tool::Lower | Tool::Smooth | Tool::Flatten => EditLayer::Elevation,
+            Tool::Raise | Tool::Lower | Tool::Smooth | Tool::Flatten | Tool::OldMountain | Tool::OldMountainErase => EditLayer::Elevation,
             Tool::BiomePaint | Tool::BiomeErase => EditLayer::Biomes,
             Tool::BarrierPaint | Tool::BarrierErase => EditLayer::Barriers,
             Tool::StatePaint | Tool::StateMerge | Tool::RenameState => EditLayer::States,
@@ -76,6 +110,15 @@ impl Tool {
             Tool::FertilityPaint | Tool::FertilityErase => EditLayer::Fertility,
             Tool::BandPin | Tool::BandErase => EditLayer::Bands,
             Tool::Attraction | Tool::AttractionErase => EditLayer::Attraction,
+            Tool::NationSeed | Tool::NationSeedErase => EditLayer::NationSeeds,
+            Tool::CultureMerge
+            | Tool::CulturePaint
+            | Tool::CultureSplit
+            | Tool::CultureSplitTraits
+            | Tool::CultureReparent
+            | Tool::RenameCulture
+            | Tool::CultureNewName
+            | Tool::CultureLock => EditLayer::Cultures,
         }
     }
 }
@@ -94,10 +137,15 @@ pub enum EditLayer {
     Fertility,
     Bands,
     Attraction,
+    NationSeeds,
+    /// Culture editor: merges, splits, paint, family tree, names and locks.
+    Cultures,
+    /// Time-stamped steering of the Stage 3 and 4 simulations (not strokes).
+    Directives,
 }
 
 impl EditLayer {
-    pub const ALL: [EditLayer; 11] = [
+    pub const ALL: [EditLayer; 14] = [
         EditLayer::Sketch,
         EditLayer::Plates,
         EditLayer::Elevation,
@@ -109,6 +157,9 @@ impl EditLayer {
         EditLayer::Provinces,
         EditLayer::Bands,
         EditLayer::Attraction,
+        EditLayer::Cultures,
+        EditLayer::NationSeeds,
+        EditLayer::Directives,
     ];
 
     /// Name used in files, the API and the CLI (same as the serde name).
@@ -125,6 +176,9 @@ impl EditLayer {
             EditLayer::Fertility => "fertility",
             EditLayer::Bands => "bands",
             EditLayer::Attraction => "attraction",
+            EditLayer::NationSeeds => "nation_seeds",
+            EditLayer::Cultures => "cultures",
+            EditLayer::Directives => "directives",
         }
     }
 
@@ -144,7 +198,8 @@ impl EditLayer {
             EditLayer::Barriers | EditLayer::Sites | EditLayer::Fertility => Step::Habitability,
             EditLayer::States => Step::States,
             EditLayer::Provinces => Step::Provinces,
-            EditLayer::Bands | EditLayer::Attraction => Step::Cultures,
+            EditLayer::Bands | EditLayer::Attraction | EditLayer::Cultures | EditLayer::Directives => Step::Cultures,
+            EditLayer::NationSeeds => Step::Nations,
         }
     }
 
@@ -161,9 +216,14 @@ impl EditLayer {
             EditLayer::Fertility => "Fertility",
             EditLayer::Bands => "Founding bands",
             EditLayer::Attraction => "Attraction",
+            EditLayer::NationSeeds => "Nation seeds",
+            EditLayer::Cultures => "Cultures (merge, split, paint, family tree, names, locks)",
+            EditLayer::Directives => "Simulation directives (Stages 3 and 4)",
         }
     }
 }
+
+static NO_STROKES: Vec<Stroke> = Vec::new();
 
 /// Format tag of an override bundle file (`*.fwm-overrides.json`).
 pub const BUNDLE_FORMAT: &str = "fwm-overrides";
@@ -231,6 +291,11 @@ pub struct MotionArrow {
 pub struct Sketch {
     /// Start from generated continents (from the seed) instead of an empty ocean.
     pub auto_base: bool,
+    /// Grow continents from the drawing: land and sea strokes are a rough
+    /// layout that the continent generator follows, instead of exact paint.
+    /// Takes precedence over `auto_base`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_drawing: bool,
     pub strokes: Vec<Stroke>,
     pub pins: Vec<PlatePin>,
     pub arrows: Vec<MotionArrow>,
@@ -238,7 +303,35 @@ pub struct Sketch {
 
 impl Default for Sketch {
     fn default() -> Self {
-        Sketch { auto_base: true, strokes: vec![], pins: vec![], arrows: vec![] }
+        Sketch { auto_base: true, from_drawing: false, strokes: vec![], pins: vec![], arrows: vec![] }
+    }
+}
+
+/// What the continent sketch starts from.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SketchBase {
+    /// Continents generated from the seed; strokes paint over them.
+    Generated,
+    /// An empty ocean; strokes paint land exactly.
+    Ocean,
+    /// Continents grown from the drawing by the generator.
+    Drawing,
+}
+
+impl Sketch {
+    pub fn base(&self) -> SketchBase {
+        if self.from_drawing {
+            SketchBase::Drawing
+        } else if self.auto_base {
+            SketchBase::Generated
+        } else {
+            SketchBase::Ocean
+        }
+    }
+    pub fn set_base(&mut self, b: SketchBase) {
+        self.from_drawing = b == SketchBase::Drawing;
+        self.auto_base = b == SketchBase::Generated;
     }
 }
 
@@ -255,6 +348,12 @@ pub struct Overrides {
     pub fertility: Vec<Stroke>,
     pub bands: Vec<Stroke>,
     pub attraction: Vec<Stroke>,
+    /// Polities that already exist when Stage 4 starts.
+    pub nation_seeds: Vec<Stroke>,
+    /// Culture editor, applied in order at the end of Stage 3.
+    pub cultures: Vec<Stroke>,
+    /// Steering of the Stage 3 and 4 simulations, by hand or by the AI guide.
+    pub directives: Vec<crate::directives::Directive>,
 }
 
 /// How heightmap pixel values map to metres.
@@ -321,33 +420,15 @@ impl Edits {
             EditLayer::Provinces => self.overrides.provinces.push(s),
             EditLayer::Sites => self.overrides.sites.push(s),
             EditLayer::Fertility => self.overrides.fertility.push(s),
-            EditLayer::Bands => self.add_band_pin(s),
+            EditLayer::Bands => add_pin(&mut self.overrides.bands, s, Tool::BandErase),
             EditLayer::Attraction => self.overrides.attraction.push(s),
+            EditLayer::NationSeeds => add_pin(&mut self.overrides.nation_seeds, s, Tool::NationSeedErase),
+            EditLayer::Cultures => self.overrides.cultures.push(s),
+            EditLayer::Directives => {}
         }
     }
 
-    /// Founding-band pins: a drag that starts within 400 km of a pin moves
-    /// it; otherwise the pin goes where the stroke ends. Erase removes the
-    /// nearest pin within 600 km.
-    fn add_band_pin(&mut self, s: Stroke) {
-        let (Some(first), Some(last)) = (s.points.first().copied(), s.points.last().copied()) else { return };
-        let km = |a: [f64; 2], b: [f64; 2]| Vec3::from_lat_lon_deg(a[0], a[1]).angle_to(Vec3::from_lat_lon_deg(b[0], b[1])) * 6371.0;
-        let pins = &mut self.overrides.bands;
-        let nearest = |pins: &Vec<Stroke>, max: f64| {
-            pins.iter().enumerate().filter_map(|(k, p)| p.points.first().map(|q| (k, km(*q, first)))).filter(|x| x.1 <= max).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| x.0)
-        };
-        match s.tool {
-            Tool::BandErase => {
-                if let Some(k) = nearest(pins, 600.0) {
-                    pins.remove(k);
-                }
-            }
-            _ => match nearest(pins, 400.0).filter(|_| s.points.len() >= 2 && km(first, last) > 50.0) {
-                Some(k) => pins[k].points = vec![last],
-                None => pins.push(Stroke { points: vec![last], ..s }),
-            },
-        }
-    }
+
     /// Strokes of an override layer (the sketch layer: its strokes only).
     pub fn strokes(&self, layer: EditLayer) -> &Vec<Stroke> {
         let o = &self.overrides;
@@ -363,6 +444,9 @@ impl Edits {
             EditLayer::Fertility => &o.fertility,
             EditLayer::Bands => &o.bands,
             EditLayer::Attraction => &o.attraction,
+            EditLayer::NationSeeds => &o.nation_seeds,
+            EditLayer::Cultures => &o.cultures,
+            EditLayer::Directives => &NO_STROKES,
         }
     }
 
@@ -380,13 +464,20 @@ impl Edits {
             EditLayer::Fertility => &mut o.fertility,
             EditLayer::Bands => &mut o.bands,
             EditLayer::Attraction => &mut o.attraction,
+            EditLayer::NationSeeds => &mut o.nation_seeds,
+            EditLayer::Cultures => &mut o.cultures,
+            EditLayer::Directives => unreachable!("directives are not strokes"),
         }
     }
 
     /// Number of edits in a layer (the sketch layer counts its plate pins and
     /// motion arrows too).
     pub fn count(&self, layer: EditLayer) -> usize {
-        self.strokes(layer).len() + if layer == EditLayer::Sketch { self.sketch.pins.len() + self.sketch.arrows.len() } else { 0 }
+        match layer {
+            EditLayer::Sketch => self.sketch.strokes.len() + self.sketch.pins.len() + self.sketch.arrows.len(),
+            EditLayer::Directives => self.overrides.directives.len(),
+            _ => self.strokes(layer).len(),
+        }
     }
 
     /// Remove strokes by index (indices out of range are ignored).
@@ -394,15 +485,20 @@ impl Edits {
         let mut idx: Vec<usize> = indices.to_vec();
         idx.sort_unstable();
         idx.dedup();
-        let v = self.strokes_mut(layer);
-        let mut removed = 0;
-        for &i in idx.iter().rev() {
-            if i < v.len() {
-                v.remove(i);
-                removed += 1;
+        fn drop<T>(v: &mut Vec<T>, idx: &[usize]) -> usize {
+            let mut removed = 0;
+            for &i in idx.iter().rev() {
+                if i < v.len() {
+                    v.remove(i);
+                    removed += 1;
+                }
             }
+            removed
         }
-        removed
+        if layer == EditLayer::Directives {
+            return drop(&mut self.overrides.directives, &idx);
+        }
+        drop(self.strokes_mut(layer), &idx)
     }
 
     /// An override bundle with the given layers: a JSON file that carries
@@ -411,7 +507,11 @@ impl Edits {
     pub fn bundle(&self, layers: &[EditLayer], seed: u64) -> serde_json::Value {
         let mut m = serde_json::Map::new();
         for &l in layers {
-            let v = if l == EditLayer::Sketch { serde_json::to_value(&self.sketch) } else { serde_json::to_value(self.strokes(l)) };
+            let v = match l {
+                EditLayer::Sketch => serde_json::to_value(&self.sketch),
+                EditLayer::Directives => serde_json::to_value(&self.overrides.directives),
+                _ => serde_json::to_value(self.strokes(l)),
+            };
             m.insert(l.key().into(), v.unwrap());
         }
         serde_json::json!({ "format": BUNDLE_FORMAT, "version": BUNDLE_VERSION, "source_seed": seed, "layers": m })
@@ -431,12 +531,19 @@ impl Edits {
         let layers = bundle["layers"].as_object().ok_or("override bundle has no layers")?;
         // Parse everything first, so a bad layer changes nothing.
         let mut parsed: Vec<(EditLayer, Option<Sketch>, Vec<Stroke>)> = Vec::new();
+        let mut directives: Option<Vec<crate::directives::Directive>> = None;
         for (k, v) in layers {
             let l = EditLayer::from_key(k).ok_or_else(|| format!("unknown override layer `{k}`"))?;
             if only.is_some_and(|o| !o.contains(&l)) {
                 continue;
             }
-            if l == EditLayer::Sketch {
+            if l == EditLayer::Directives {
+                let d: Vec<crate::directives::Directive> = serde_json::from_value(v.clone()).map_err(|e| format!("layer directives: {e}"))?;
+                if let Some(bad) = d.iter().find_map(|x| crate::directives::validate(x).err()) {
+                    return Err(format!("layer directives: {bad}"));
+                }
+                directives = Some(d);
+            } else if l == EditLayer::Sketch {
                 let sk: Sketch = serde_json::from_value(v.clone()).map_err(|e| format!("layer sketch: {e}"))?;
                 parsed.push((l, Some(sk), vec![]));
             } else {
@@ -448,6 +555,13 @@ impl Edits {
             }
         }
         let mut out = Vec::new();
+        if let Some(d) = directives {
+            if replace {
+                self.overrides.directives.clear();
+            }
+            out.push((EditLayer::Directives, d.len()));
+            self.overrides.directives.extend(d);
+        }
         for (l, sk, st) in parsed {
             if replace {
                 self.clear_layer(l);
@@ -490,7 +604,32 @@ impl Edits {
             EditLayer::Fertility => self.overrides.fertility.clear(),
             EditLayer::Bands => self.overrides.bands.clear(),
             EditLayer::Attraction => self.overrides.attraction.clear(),
+            EditLayer::NationSeeds => self.overrides.nation_seeds.clear(),
+            EditLayer::Cultures => self.overrides.cultures.clear(),
+            EditLayer::Directives => self.overrides.directives.clear(),
         }
+    }
+}
+
+/// Pins (founding bands, nation seeds): a drag that starts within 400 km of
+/// a pin moves it; otherwise the pin goes where the stroke ends. The erase
+/// tool removes the nearest pin within 600 km.
+fn add_pin(pins: &mut Vec<Stroke>, s: Stroke, erase: Tool) {
+    let (Some(first), Some(last)) = (s.points.first().copied(), s.points.last().copied()) else { return };
+    let km = |a: [f64; 2], b: [f64; 2]| Vec3::from_lat_lon_deg(a[0], a[1]).angle_to(Vec3::from_lat_lon_deg(b[0], b[1])) * 6371.0;
+    let nearest = |pins: &Vec<Stroke>, max: f64| {
+        pins.iter().enumerate().filter_map(|(k, p)| p.points.first().map(|q| (k, km(*q, first)))).filter(|x| x.1 <= max).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| x.0)
+    };
+    match s.tool {
+        t if t == erase => {
+            if let Some(k) = nearest(pins, 600.0) {
+                pins.remove(k);
+            }
+        }
+        _ => match nearest(pins, 400.0).filter(|_| s.points.len() >= 2 && km(first, last) > 50.0) {
+            Some(k) => pins[k].points = vec![last],
+            None => pins.push(Stroke { points: vec![last], ..s }),
+        },
     }
 }
 

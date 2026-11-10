@@ -27,6 +27,14 @@ async fn api(app: tauri::AppHandle, state: tauri::State<'_, AppState>, cmd: Stri
     if cmd == "update_install" {
         return tauri::async_runtime::spawn_blocking(move || install_update(&app, &progress, &args)).await.map_err(|e| e.to_string())?;
     }
+    if cmd.starts_with("guide_") {
+        return tauri::async_runtime::spawn_blocking(move || match fwm_guide::handle(&session, &progress, &cmd, &args) {
+            Some(r) => Ok(Response::new(serde_json::to_vec(&r?).map_err(|e| e.to_string())?)),
+            None => Err(format!("unknown command `{cmd}`")),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     if cmd.starts_with("update_") || cmd == "app_version" {
         return tauri::async_runtime::spawn_blocking(move || match fwm_update::handle(&cmd, &args) {
             Some(r) => Ok(Response::new(serde_json::to_vec(&r?).map_err(|e| e.to_string())?)),

@@ -1,10 +1,10 @@
 import './style.css';
 import * as api from './api';
-import { Grid, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
-import { BOUNDARY, DEPOSITS, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, plateColor, stateColor, type LayerId, type Legend } from './layers';
+import { Grid, angle, eastNorth, fromLatLon, toLatLon, type Vec3 } from './grid';
+import { BOUNDARY, DEPOSITS, ERA_NAMES, INSTITUTION_NAMES, KOPPEN, LAYERS, MONTHS, TERRAIN, TRADE_GOODS, colorize, cultureColor, groupColor, hillshade, nationColor, plateColor, sketchColor, stateColor, type LayerId, type Legend } from './layers';
 import { Renderer, type LineSet, type RibbonSet } from './render';
 import { Noise, SCATTER_STREAM, scatterOctaves, scatterWeight } from './noise';
-import { EDITOR_TOOLS, STAGE2_START, STAGE3_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
+import { EDITOR_TOOLS, LIVE_STEPS, STAGE2_START, STAGE3_START, STAGE4_START, STAGE_ENDS, STEPS, TOOLS, type Param, type StepUI, type ToolId } from './schema';
 
 // ------------------------------------------------------------------ state
 
@@ -13,8 +13,9 @@ import { EDITOR_TOOLS, STAGE2_START, STAGE3_START, STAGE_ENDS, STEPS, TOOLS, typ
 type Political = {
   states: any[]; regions: any[]; continents: any[]; provinces: any[]; adjacencies: any[];
   cultures: any[]; groups: any[]; events: any[];
+  nations: any[]; nationEvents: any[]; railways: any[]; cityPins: any[];
   byState: Map<number, any>; byRegion: Map<number, any>; byProv: Map<number, any>; byCont: Map<number, any>;
-  byCulture: Map<number, any>; byGroup: Map<number, any>;
+  byCulture: Map<number, any>; byGroup: Map<number, any>; byNation: Map<number, any>;
 };
 
 type StepStatus = { key: string; title: string; state: 'done' | 'stale' | 'empty'; millis: number; meta: any };
@@ -22,10 +23,12 @@ type Status = {
   steps: StepStatus[];
   params: any;
   edits: {
-    elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_strokes: number; pins: any[]; arrows: any[];
+    elevation_import: any | null; province_import: any | null; auto_base: boolean; sketch_base: 'generated' | 'ocean' | 'drawing'; sketch_strokes: number; pins: any[]; arrows: any[];
     plate_strokes: number; elevation_strokes: number; biome_strokes: number; barrier_strokes: number; state_strokes: number; province_strokes: number;
     site_pins: number; sites: { lat: number; lon: number; population: number }[];
     fertility_strokes: number; attraction_strokes: number; band_pins: { lat: number; lon: number; bands: number }[];
+    culture_edits?: number;
+    nation_seeds?: { lat: number; lon: number; size: number; name: string }[];
   };
   grid: { level: number; cells: number; spacing_km: number };
   path: string | null;
@@ -33,6 +36,8 @@ type Status = {
   can_redo: boolean;
   dirty: boolean;
   override_edits: number;
+  /** A Stage 3 or 4 simulation running step by step. */
+  live: { stage: string; position: number; month?: number | null; end: number; unit: string; done: boolean } | null;
 };
 
 type Asset = { name: string; url: string; size: number; sha256: string | null };
@@ -54,7 +59,11 @@ const S = {
   /** Version of this build and the last update check. */
   version: '',
   update: null as UpdateCheck | null,
-  overlays: { rivers: true, wind: false, motion: false, edits: true, borders: false },
+  overlays: {
+    rivers: true, wind: false, motion: false, edits: true, borders: false,
+    /** Reference latitudes (remembered between sessions). */
+    latitudes: (() => { try { return localStorage.getItem('fwm.latitudes') !== '0'; } catch { return true; } })(),
+  },
   political: null as Political | null,
   exag: 0,
   autoRun: true,
@@ -93,10 +102,11 @@ async function boot() {
         h('div', { id: 'toolbar' }),
         h('div', { id: 'brushbar' }),
         h('div', { id: 'legend' }),
+        h('div', { id: 'simpanel' }),
         h('div', { id: 'toast' }),
       ),
     ),
-    h('footer', { id: 'statusbar' }, h('span', { id: 'hover' }, 'Hover the planet for cell details.'), h('span', { id: 'progress' })),
+    h('footer', { id: 'statusbar' }, h('span', { id: 'infotags' }), h('span', { id: 'hover' }, 'Hover the planet for cell details.'), h('span', { id: 'progress' })),
   );
   try {
     R = new Renderer($('#canvas') as HTMLCanvasElement);
@@ -106,6 +116,7 @@ async function boot() {
   }
   bindCanvas();
   bindKeys();
+  renderInfoTags();
   // Handle for debugging from the devtools console.
   (window as any).fwm = { R, S };
   try {
@@ -116,6 +127,7 @@ async function boot() {
       api.isTauri ? String(e) : h('span', {}, 'Start it with ', h('code', {}, 'worldgen serve --static app/dist'), '.')));
     return;
   }
+  loadGuidePrefs();
   void startupUpdateCheck();
   // A fresh session: generate the sketch so there is something to look at.
   if (S.status!.steps[1].state === 'empty') await run('sketch');
@@ -133,6 +145,7 @@ async function refreshStatus(st?: Status) {
   renderTopbar();
   renderSteps();
   renderToolbar();
+  renderSim();
   await refreshLayer();
 }
 
@@ -153,8 +166,9 @@ async function political(): Promise<Political | null> {
     S.political = {
       states: t.states ?? [], regions: t.regions ?? [], continents: t.continents ?? [], provinces: t.provinces ?? [], adjacencies: t.adjacencies ?? [],
       cultures: t.cultures ?? [], groups: t.culture_groups ?? [], events: t.culture_events ?? [],
+      nations: t.nations ?? [], nationEvents: t.nation_events ?? [], railways: t.railways ?? [], cityPins: t.city_pins ?? [],
       byState: idx(t.states), byRegion: idx(t.regions), byProv: idx(t.provinces), byCont: idx(t.continents),
-      byCulture: idx(t.cultures), byGroup: idx(t.culture_groups),
+      byCulture: idx(t.cultures), byGroup: idx(t.culture_groups), byNation: idx(t.nations),
     };
   } catch {
     return null;
@@ -175,6 +189,8 @@ async function refreshLayer() {
   let stale = false;
   let missing = false;
   for (const name of def.fields) {
+    // The drawing outline belongs to worlds grown from a drawing only.
+    if (name === 'drawing' && S.status!.edits.sketch_base !== 'drawing') continue;
     const d = await getField(name, def.monthly && ['temp', 'precip', 'wind_u', 'wind_v'].includes(name) ? S.month : null);
     if (d) {
       f[name] = d.values;
@@ -208,11 +224,13 @@ async function refreshLayer() {
 function stepOfLayer(id: LayerId): string {
   const m: Record<string, string> = {
     sketch: 'Continent sketch', plates: 'Plates', crust: 'Plates', boundaries: 'Tectonic relief', elevation: 'Tectonic relief',
-    stress: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', continentality: 'Climate',
-    currents: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
+    stress: 'Tectonic relief', old_relief: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', continentality: 'Climate',
+    currents: 'Climate', foehn: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
     habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
     resources: 'Provinces',
     cultures: 'Cultures', culture_groups: 'Cultures', population: 'Cultures', attraction: 'Cultures',
+    nations: 'Nations & history', railways: 'Nations & history', transport: 'Nations & history', eras: 'Nations & history',
+    institutions: 'Nations & history', realms: 'Nations & history', city_growth: 'Nations & history',
   };
   return m[id];
 }
@@ -264,39 +282,77 @@ function arrow(L: Lines, p: Vec3, de: number, dn: number, col: [number, number, 
   }
 }
 
+/** Reference latitudes: the equator (solid) and 30° and 60° north and south (dashed). */
+const LATITUDES_DEG = [0, 30, -30, 60, -60];
+
+function drawLatitudes(elev: ArrayLike<number> | undefined) {
+  if (!S.overlays.latitudes || !S.grid) {
+    R.setGraticule(null, null);
+    return;
+  }
+  const g = S.grid;
+  const R0 = S.status!.params.planet.radius_km * 1000;
+  let hint: number | undefined;
+  // With relief exaggeration on the globe, keep the line above the raised land around it.
+  const lift = (p: Vec3) => {
+    if (!elev || S.exag <= 0) return 0;
+    const c = g.nearest(p, hint);
+    hint = c;
+    let m = Math.max(0, elev[c]);
+    for (const j of g.neighbors(c)) m = Math.max(m, elev[j]);
+    return (S.exag * m) / R0;
+  };
+  const L = new Lines();
+  const step = 0.5; // degrees of longitude per segment
+  for (const lat of LATITUDES_DEG) {
+    const equator = lat === 0;
+    const col: [number, number, number, number] = equator ? [1, 1, 1, 0.6] : [1, 1, 1, 0.42];
+    for (let lon = -180; lon < 180; lon += step) {
+      // Dashes of 3° with 2° gaps, except on the equator.
+      if (!equator && (lon + 180) % 5 >= 3) continue;
+      const a = fromLatLon((lat * Math.PI) / 180, (lon * Math.PI) / 180);
+      const b = fromLatLon((lat * Math.PI) / 180, ((lon + step) * Math.PI) / 180);
+      L.seg(a, b, col, 0.0018, lift(a), lift(b));
+    }
+  }
+  const [gl3, fl] = L.sets();
+  R.setGraticule(gl3, fl);
+}
+
 async function refreshOverlays() {
   const g = S.grid!;
   const exagLift = (i: number, elev: ArrayLike<number> | undefined) =>
     elev && S.exag > 0 ? (S.exag * Math.max(0, elev[i])) / (S.status!.params.planet.radius_km * 1000) : 0;
 
-  // Rivers as ribbons whose on-screen width follows the real bankfull width
-  // (log scale: ~0.8 px for a 60 m stream, ~5 px for a 2 km great river).
-  const width = S.overlays.rivers ? await getField('river_width') : null;
-  const recv = width ? await getField('receiver') : null;
-  if (width && recv && !width.stale) {
-    const elev = (await getField('elevation'))?.values;
-    const wv = width.values, rc = recv.values;
+  drawLatitudes(S.overlays.latitudes && S.exag > 0 ? (await getField('elevation'))?.values : undefined);
+
+  // Rivers run along cell edges, from cell corner to cell corner (where the
+  // borders are drawn), as ribbons whose on-screen width follows the real
+  // bankfull width (log scale: ~0.8 px for a 60 m stream, ~5 px for a 2 km great river).
+  const width = S.overlays.rivers ? await getField('river_seg_width') : null;
+  const to = width ? await getField('river_to') : null;
+  const elevF = width || S.layer === 'barrier' ? (await getField('elevation'))?.values : undefined;
+  if (width && to && !width.stale) {
+    const wv = width.values, tv = to.values;
     const segs: number[] = [];
-    for (let i = 0; i < g.n; i++) if (wv[i] > 0 && rc[i] >= 0) segs.push(i);
-    const mk = (): RibbonSet => ({ a: new Float32Array(segs.length * 3), b: new Float32Array(segs.length * 3), width: new Float32Array(segs.length), color: new Float32Array(segs.length * 4), count: segs.length });
-    const gl3 = mk(), fl = mk();
-    segs.forEach((i, k) => {
-      const r = rc[i];
-      const t = Math.min(1, Math.max(0, Math.log(wv[i] / 60) / Math.log(2000 / 60)));
-      const px = 0.8 + 4.2 * t;
-      const col = [0.32 - 0.22 * t, 0.58 - 0.3 * t, 0.95 - 0.15 * t, 0.85 + 0.15 * t];
-      const pa = surface(g.p(i), 0.0025 + exagLift(i, elev)), pb = surface(g.p(r), 0.0025 + exagLift(r, elev));
-      gl3.a.set(pa, k * 3); gl3.b.set(pb, k * 3);
-      const [la, loa] = toLatLon(g.p(i));
-      let [lb, lob] = toLatLon(g.p(r));
-      if (lob - loa > Math.PI) lob -= 2 * Math.PI;
-      if (lob - loa < -Math.PI) lob += 2 * Math.PI;
-      fl.a.set([loa, la, 0], k * 3); fl.b.set([lob, lb, 0], k * 3);
-      gl3.width[k] = fl.width[k] = px;
-      gl3.color.set(col, k * 4); fl.color.set(col, k * 4);
+    for (let t = 0; t < g.t; t++) if (wv[t] > 0 && tv[t] >= 0) segs.push(t);
+    const [gl3, fl] = cornerRibbons(g, segs, tv, elevF, (t) => {
+      const k = Math.min(1, Math.max(0, Math.log(wv[t] / 60) / Math.log(2000 / 60)));
+      return [0.8 + 4.2 * k, [0.32 - 0.22 * k, 0.58 - 0.3 * k, 0.95 - 0.15 * k, 0.85 + 0.15 * k]];
     });
     R.setRibbons('rivers', gl3, fl);
   } else R.setRibbons('rivers', null, null);
+
+  // On the barrier layer: border rivers (red) and backbone rivers (green) on their edges.
+  const roles = S.layer === 'barrier' ? await getField('river_seg_role') : null;
+  const rto = roles ? await getField('river_to') : null;
+  if (roles && rto && !roles.stale) {
+    const rv = roles.values, tv = rto.values;
+    const segs: number[] = [];
+    for (let t = 0; t < g.t; t++) if (rv[t] > 0 && tv[t] >= 0) segs.push(t);
+    const [gl3, fl] = cornerRibbons(g, segs, tv, elevF, (t) => [7, rv[t] === 1 ? [0.92, 0.24, 0.2, 1] : [0.24, 0.82, 0.47, 1]]);
+    R.setRibbons('river_roles', gl3, fl);
+  } else R.setRibbons('river_roles', null, null);
 
   // Winds (sampled on the first 2,562 cells = the level-4 sub-grid)
   if (S.overlays.wind) {
@@ -326,7 +382,8 @@ async function refreshOverlays() {
   const lay = S.layer;
   const political = lay === 'states' || lay === 'provinces' || lay === 'regions';
   const cultural = lay === 'cultures' || lay === 'culture_groups';
-  const stf = cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
+  const national = lay === 'nations' || lay === 'railways' || lay === 'transport' || lay === 'eras' || lay === 'institutions';
+  const stf = lay === 'realms' ? await getField('realm') : national ? await getField('owner') : cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
   if (stf && !stf.stale) {
     const L = new Lines();
     // Culture layers: culture borders as hairlines, group borders as ribbons.
@@ -368,6 +425,117 @@ async function refreshOverlays() {
   }
 
   drawEditMarkers();
+  await drawTransportIcons();
+}
+
+/** Icons over the map in the Transport and Railways layers (stations,
+ *  junctions, ports, airports at their province's centre), and the candidate
+ *  birthplaces of an institution waiting for the user's choice (gold stars). */
+async function drawTransportIcons() {
+  const lay = S.layer;
+  const P = S.political;
+  const L = new Lines();
+  let any = false;
+  type C4 = [number, number, number, number];
+  const icon = (c: Vec3, kind: number, slot: number, count: number) => {
+    const [e, n] = eastNorth(c);
+    const r = 0.0065;
+    const dx = (slot - (count - 1) / 2) * 2.6 * r;
+    const at = (x: number, y: number) => offset(c, e, n, dx + x, y);
+    const line = (x1: number, y1: number, x2: number, y2: number, col: C4, w = 0.0035) => L.seg(at(x1, y1), at(x2, y2), col, w);
+    if (kind === 0) {
+      // Station: a filled red square.
+      for (let k = -2; k <= 2; k++) line(-r * 0.7, (k * r) / 3, r * 0.7, (k * r) / 3, [0.8, 0.12, 0.12, 1]);
+    } else if (kind === 1) {
+      // Junction: a blue diamond, filled.
+      for (let k = -3; k <= 3; k++) { const y = (k * r) / 3; const w = r * (1 - Math.abs(k) / 3); line(-w, y, w, y, [0.12, 0.35, 0.86, 1]); }
+    } else if (kind === 2) {
+      // Port: an anchor (ring, shank, stock, flukes).
+      const col: C4 = [0.08, 0.35, 0.67, 1];
+      for (let k = 0; k < 8; k++) { const a1 = (k / 8) * 2 * Math.PI, a2 = ((k + 1) / 8) * 2 * Math.PI; line(Math.cos(a1) * r * 0.25, r * 0.75 + Math.sin(a1) * r * 0.25, Math.cos(a2) * r * 0.25, r * 0.75 + Math.sin(a2) * r * 0.25, col, 0.0025); }
+      line(0, r * 0.5, 0, -r, col); line(-r * 0.45, r * 0.25, r * 0.45, r * 0.25, col);
+      line(0, -r, -r * 0.7, -r * 0.4, col); line(0, -r, r * 0.7, -r * 0.4, col);
+    } else {
+      // Airport: a plane (fuselage, wings, tail).
+      const col: C4 = [0.55, 0.16, 0.67, 1];
+      line(0, -r, 0, r, col); line(-r, r * 0.1, r, r * 0.1, col); line(-r * 0.45, -r * 0.8, r * 0.45, -r * 0.8, col);
+    }
+  };
+  if ((lay === 'transport' || lay === 'railways') && P) {
+    const [pf, rw, pt, ap] = await Promise.all(['province', 'railway', 'port', 'airport'].map((x) => getField(x)));
+    if (pf && !pf.stale) {
+      const flags = new Map<number, number>();
+      for (let i = 0; i < pf.values.length; i++) {
+        const id = pf.values[i];
+        if (!id) continue;
+        let b = 0;
+        const r = rw ? rw.values[i] : 0;
+        if (r === 2) b |= 1;
+        if (r === 3) b |= 2;
+        if (lay === 'transport' && pt && pt.values[i] === 2) b |= 4;
+        if (lay === 'transport' && ap && ap.values[i] === 1) b |= 8;
+        if (b) flags.set(id, (flags.get(id) ?? 0) | b);
+      }
+      for (const [id, b] of flags) {
+        const p = P.byProv.get(id);
+        if (!p?.center) continue;
+        const c = fromLatLon((p.center[0] * Math.PI) / 180, (p.center[1] * Math.PI) / 180);
+        const kinds = [b & 2 ? 1 : b & 1 ? 0 : -1, b & 4 ? 2 : -1, b & 8 ? 3 : -1].filter((k) => k >= 0);
+        kinds.forEach((k, slot) => icon(c, k, slot, kinds.length));
+        any = true;
+      }
+    }
+  }
+  for (const cand of SIM.state?.pending_institution?.candidates ?? []) {
+    if (!cand.at) continue;
+    const c = fromLatLon((cand.at[0] * Math.PI) / 180, (cand.at[1] * Math.PI) / 180);
+    const [e, n] = eastNorth(c);
+    const col: C4 = [1, 0.82, 0.1, 1];
+    for (let k = 0; k < 5; k++) {
+      const a1 = (k / 5) * 2 * Math.PI + Math.PI / 2, a2 = (((k + 2) % 5) / 5) * 2 * Math.PI + Math.PI / 2;
+      L.seg(offset(c, e, n, Math.cos(a1) * 0.018, Math.sin(a1) * 0.018), offset(c, e, n, Math.cos(a2) * 0.018, Math.sin(a2) * 0.018), col, 0.004);
+    }
+    any = true;
+  }
+  if (any) {
+    const [a, b] = L.sets();
+    R.setOverlay('transport', a, b);
+  } else R.setOverlay('transport', null, null);
+}
+
+/** Position of cell corner t (the centroid of its triangle, as the renderer draws it). */
+function cornerPos(g: Grid, t: number): Vec3 {
+  const [p, q, r] = [g.p(g.tris[t * 3]), g.p(g.tris[t * 3 + 1]), g.p(g.tris[t * 3 + 2])];
+  const s: Vec3 = [p[0] + q[0] + r[0], p[1] + q[1] + r[1], p[2] + q[2] + r[2]];
+  const l = Math.hypot(...s);
+  return [s[0] / l, s[1] / l, s[2] / l];
+}
+
+/** Globe and flat ribbons for river segments from corner t to corner to[t];
+ *  `style` gives each segment's width (px) and colour. */
+function cornerRibbons(g: Grid, segs: number[], to: ArrayLike<number>, elev: ArrayLike<number> | undefined, style: (t: number) => [number, number[]]): [RibbonSet, RibbonSet] {
+  const mk = (): RibbonSet => ({ a: new Float32Array(segs.length * 3), b: new Float32Array(segs.length * 3), width: new Float32Array(segs.length), color: new Float32Array(segs.length * 4), count: segs.length });
+  const gl3 = mk(), fl = mk();
+  const R0 = S.status!.params.planet.radius_km * 1000;
+  const lift = (t: number) => {
+    if (!elev || S.exag <= 0) return 0.0025;
+    const e = (Math.max(0, elev[g.tris[t * 3]]) + Math.max(0, elev[g.tris[t * 3 + 1]]) + Math.max(0, elev[g.tris[t * 3 + 2]])) / 3;
+    return 0.0025 + (S.exag * e) / R0;
+  };
+  segs.forEach((t, k) => {
+    const u = to[t];
+    const [px, col] = style(t);
+    const ca = cornerPos(g, t), cb = cornerPos(g, u);
+    gl3.a.set(surface(ca, lift(t)), k * 3); gl3.b.set(surface(cb, lift(u)), k * 3);
+    const [la, loa] = toLatLon(ca);
+    let [lb, lob] = toLatLon(cb);
+    if (lob - loa > Math.PI) lob -= 2 * Math.PI;
+    if (lob - loa < -Math.PI) lob += 2 * Math.PI;
+    fl.a.set([loa, la, 0], k * 3); fl.b.set([lob, lb, 0], k * 3);
+    gl3.width[k] = fl.width[k] = px;
+    gl3.color.set(col, k * 4); fl.color.set(col, k * 4);
+  });
+  return [gl3, fl];
 }
 
 /** Cell-edge segments between neighbouring cells whose values differ (and pass `keep`):
@@ -433,10 +601,33 @@ function drawEditMarkers() {
       if (fill) L.seg(p, offset(p, e, n, Math.cos(a1) * r, Math.sin(a1) * r), col, 0.004);
     }
   };
+  // Nation seeds: red discs with a white rim, larger for larger realms.
+  for (const sd of st.edits.nation_seeds ?? []) {
+    const p = fromLatLon((sd.lat * Math.PI) / 180, (sd.lon * Math.PI) / 180);
+    const r = 0.012 + 0.003 * Math.sqrt(sd.size || 6);
+    ring(p, r * 1.25, [1, 1, 1, 1], false);
+    ring(p, r, [0.85, 0.15, 0.2, 1], true);
+  }
   for (const b of st.edits.band_pins ?? []) ring(fromLatLon((b.lat * Math.PI) / 180, (b.lon * Math.PI) / 180), 0.01 + 0.004 * Math.sqrt(b.bands), [1, 0.85, 0.2, 1], true);
   if (!(st.edits.band_pins ?? []).length) {
     const founders = st.steps.find((s) => s.key === 'cultures')?.meta?.founders ?? [];
     for (const f of founders) ring(fromLatLon((f.lat * Math.PI) / 180, (f.lon * Math.PI) / 180), 0.012, [1, 0.85, 0.2, 0.7], false);
+  }
+  // City pins of the live Stage 4 run (or of the kept run): orange draws people, red-brown loses them.
+  for (const pin of (SIM.state?.stage === 'nations' ? SIM.state.pins : S.political?.cityPins) ?? []) {
+    if (!pin.at) continue;
+    const p = fromLatLon((pin.at[0] * Math.PI) / 180, (pin.at[1] * Math.PI) / 180);
+    const [e, n] = eastNorth(p);
+    const r = 0.012 + 0.01 * Math.abs(pin.value);
+    const col: [number, number, number, number] = pin.value >= 0 ? [1, 0.6, 0.1, 1] : [0.75, 0.2, 0.2, 1];
+    ring(p, r, col, false);
+    if (pin.value >= 0) {
+      L.seg(offset(p, e, n, -r * 0.6, 0), offset(p, e, n, r * 0.6, 0), col, 0.004);
+      L.seg(offset(p, e, n, 0, -r * 0.6), offset(p, e, n, 0, r * 0.6), col, 0.004);
+    } else {
+      L.seg(offset(p, e, n, -r * 0.5, -r * 0.5), offset(p, e, n, r * 0.5, r * 0.5), col, 0.004);
+      L.seg(offset(p, e, n, -r * 0.5, r * 0.5), offset(p, e, n, r * 0.5, -r * 0.5), col, 0.004);
+    }
   }
   for (const a of st.edits.arrows) {
     const p = fromLatLon((a.lat * Math.PI) / 180, (a.lon * Math.PI) / 180);
@@ -571,9 +762,10 @@ function renderTopbar() {
     S.month = v === '' ? null : Number(v);
     refreshLayer();
   } }, h('option', { value: '', selected: S.month === null }, 'Annual'), ...MONTHS.map((m, i) => h('option', { value: i, selected: S.month === i }, m)));
-  const ov = (key: keyof typeof S.overlays, label: string) =>
-    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: S.overlays[key], onchange: (e: Event) => {
+  const ov = (key: keyof typeof S.overlays, label: string, title?: string) =>
+    h('label', { class: 'check', title: title ?? '' }, h('input', { type: 'checkbox', checked: S.overlays[key], onchange: (e: Event) => {
       S.overlays[key] = (e.target as HTMLInputElement).checked;
+      if (key === 'latitudes') try { localStorage.setItem('fwm.latitudes', S.overlays.latitudes ? '1' : '0'); } catch { /* ignore */ }
       renderTopbar();
       refreshOverlays();
     } }), label);
@@ -589,6 +781,7 @@ function renderTopbar() {
       btn('Flat map', () => setView(1), { class: R.mode === 1 ? 'on' : '' })),
     h('div', { class: 'group' }, layerSel, monthSel),
     h('div', { class: 'group' }, ov('rivers', 'Rivers'), ov('borders', 'Borders'), ov('wind', 'Wind'), ov('motion', 'Plate motion'), ov('edits', 'Pins'),
+      ov('latitudes', 'Latitudes', 'Reference lines: the equator (solid) and 30° and 60° north and south (dashed)'),
       h('label', { class: 'check', title: 'Relief exaggeration on the globe' }, 'Relief',
         h('input', { type: 'range', min: 0, max: 40, step: 1, value: S.exag, oninput: (e: Event) => { S.exag = Number((e.target as HTMLInputElement).value); refreshLayer(); } }))),
     h('div', { class: 'spacer' }),
@@ -609,10 +802,27 @@ function renderTopbar() {
 function stageButtons(st: Status): HTMLElement {
   const done = (step: string) => st.steps.find((s) => s.key === step)?.state === 'done';
   const next = STAGE_ENDS.find((s) => !done(s.step));
+  const stale = st.steps.filter((s) => s.state === 'stale').length;
   return h('div', { class: 'group' },
     next ? h('button', { class: 'primary', disabled: S.busy, title: `Generate everything up to the end of Stage ${next.stage}`, onclick: () => run(next.step) }, `Next: Stage ${next.stage}`) : null,
     ...STAGE_ENDS.map((s) => h('button', { disabled: S.busy, class: done(s.step) ? 'done' : '', title: `Generate up to the end of Stage ${s.stage}`, onclick: () => run(s.step) }, done(s.step) ? `Stage ${s.stage} ✓` : `Stage ${s.stage}`)),
-    h('button', { class: next ? '' : 'primary', disabled: S.busy, onclick: () => run(STAGE_ENDS[STAGE_ENDS.length - 1].step) }, 'Generate all'));
+    h('button', { class: next ? '' : 'primary', disabled: S.busy, onclick: () => run(STAGE_ENDS[STAGE_ENDS.length - 1].step) }, 'Generate all'),
+    stale ? h('button', { class: 'warn', disabled: S.busy, title: 'Remove the results whose inputs changed since they ran (they no longer match your sketch, edits or parameters); your edits stay', onclick: () => clearResults(null, stale) }, `Clear stale (${stale})`) : null);
+}
+
+/** Remove results from a step on (or every stale result); edits stay, the next run rebuilds them. */
+async function clearResults(from: string | null, count: number) {
+  const what = from ? `the results of "${STEPS.find((s) => s.key === from)?.title}" and every later step (${count})` : `${count} stale result${count > 1 ? 's' : ''} (steps whose inputs changed since they ran)`;
+  if (!confirm(`Remove ${what}? Your sketch, edits and parameters stay; run again to rebuild.`)) return;
+  try {
+    const st = await api.json<Status & { cleared: number }>('clear_results', from ? { from } : {});
+    invalidate();
+    if (!st.live) SIM.state = null;
+    toast(`Removed ${st.cleared} result${st.cleared === 1 ? '' : 's'}`);
+    await refreshStatus(st);
+  } catch (e) {
+    toast(String(e), true);
+  }
 }
 
 function undoTarget(): string | undefined {
@@ -740,7 +950,7 @@ async function onOverrides() {
       await mutate(cmd, args);
       await render();
     };
-    const stale = ['states', 'provinces'].some((k) => S.status!.steps.find((s) => s.key === k)?.state !== 'done');
+    const stale = ['states', 'provinces', 'cultures'].some((k) => S.status!.steps.find((s) => s.key === k)?.state !== 'done');
     const byLayer = new Map<string, any[]>();
     for (const u of r.unapplied) byLayer.set(u.layer, [...(byLayer.get(u.layer) ?? []), u]);
     box.innerHTML = '';
@@ -763,7 +973,7 @@ async function onOverrides() {
             for (const [layer, list] of byLayer) await mutate('remove_edits', { layer, indices: list.map((u) => u.index) });
             await render();
           } }, 'Remove them'))
-        : h('p', { class: 'muted' }, stale ? 'Generate Stage 2 to check that every state and province edit still applies.' : 'Every state and province edit applies to the current map.'),
+        : h('p', { class: 'muted' }, stale ? 'Generate Stages 2 and 3 to check that every state, province and culture edit still applies.' : 'Every state, province and culture edit applies to the current map.'),
       h('div', { class: 'actions' },
         h('button', { disabled: !r.total, onclick: () => exportOverrides([...sel]) }, 'Export…'),
         h('button', { onclick: async () => { if (await importOverrides(replace)) await render(); } }, 'Import…'),
@@ -942,6 +1152,480 @@ function onAbout() {
   if (S.update) show(S.update);
 }
 
+// ------------------------------------------------------------------ live simulation (Stages 3 and 4)
+
+type GuideLog = { position: number; narration: string; actions: { action: string; args: any; ok: boolean; error?: string | null }[] };
+
+const SIM = {
+  /** Summary of the live run (sim_* replies). */
+  state: null as any | null,
+  tab: 'world' as 'world' | 'steer' | 'guide',
+  playing: false,
+  busy: false,
+  actions: new Map<string, any[]>(),
+  action: '',
+  form: {} as Record<string, string>,
+  note: '',
+  advance: { cultures: 250, nations: 25 } as Record<string, number>,
+  /** Stage 4: stop before an institution is born to choose its birthplace. */
+  askBirth: true,
+  /** Names of living nations and cultures of the live run, for hover text. */
+  nations: new Map<number, any>(),
+  cultures: new Map<number, any>(),
+  guide: {
+    running: false, goal: '', years: { cultures: 500, nations: 50 } as Record<string, number>, maxActions: 4,
+    log: [] as GuideLog[], tokens: [0, 0], settings: null as any | null, presets: [] as any[], showSettings: false, keyDraft: '',
+  },
+};
+
+function loadGuidePrefs() {
+  try {
+    const g = JSON.parse(localStorage.getItem('fwm.guide') ?? '{}');
+    if (typeof g.goal === 'string') SIM.guide.goal = g.goal;
+    if (g.years) Object.assign(SIM.guide.years, g.years);
+    if (g.maxActions) SIM.guide.maxActions = g.maxActions;
+  } catch { /* ignore */ }
+}
+
+function saveGuidePrefs() {
+  try {
+    localStorage.setItem('fwm.guide', JSON.stringify({ goal: SIM.guide.goal, years: SIM.guide.years, maxActions: SIM.guide.maxActions }));
+  } catch { /* ignore */ }
+}
+
+/** Show progress messages while a long command runs. */
+function pollProgress(): () => void {
+  const prog = $('#progress');
+  const t = setInterval(async () => {
+    try {
+      const p = await api.json('progress');
+      if (p.running) {
+        prog.innerHTML = '';
+        prog.append(h('span', {}, p.msg || p.step || '…'), h('progress', { max: 1, value: p.frac || 0 }));
+      }
+    } catch { /* ignore */ }
+  }, 200);
+  return () => {
+    clearInterval(t);
+    prog.textContent = '';
+  };
+}
+
+/** Take a reply that carries the session status and the live summary. */
+async function applySim(r: any) {
+  const { sim, ...status } = r;
+  S.status = status as Status;
+  SIM.state = sim ?? null;
+  SIM.nations = new Map((sim?.nations ?? []).map((n: any) => [n.id, n]));
+  SIM.cultures = new Map((sim?.cultures ?? []).map((c: any) => [c.id, c]));
+  invalidate();
+  renderTopbar();
+  renderSim();
+  await refreshLayer();
+}
+
+async function simCall(cmd: string, args: any = {}): Promise<any | null> {
+  if (SIM.busy) {
+    toast('The simulation is busy; try again in a moment.', true);
+    return null;
+  }
+  SIM.busy = true;
+  renderSim();
+  const stop = pollProgress();
+  try {
+    const r = await api.json(cmd, args);
+    await applySim(r);
+    return r;
+  } catch (e) {
+    toast(String(e), true);
+    SIM.playing = false;
+    return null;
+  } finally {
+    stop();
+    SIM.busy = false;
+    renderSim();
+  }
+}
+
+/** Step the live run; Stage 4 stops before an institution's birth when the user chooses birthplaces. */
+function simStep(args: Record<string, unknown>) {
+  const nations = S.status?.live?.stage === 'nations';
+  return simCall('sim_step', { ...args, stop_at_choice: nations && SIM.askBirth });
+}
+
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** A year, with its month (1–12) when it is not January. */
+function fmtYear(y: number, month?: number): string {
+  return month && month > 1 ? `${MONTH_NAMES[month - 1]} ${y}` : String(y);
+}
+
+/** A step length in months, as years when it is a whole number of them. */
+function fmtStep(m: number): string {
+  return m % 12 === 0 ? `${m / 12} yr steps` : `${m} month steps`;
+}
+
+async function simStart(stage: string) {
+  S.layer = stage === 'cultures' ? 'cultures' : 'nations';
+  SIM.guide.log = [];
+  SIM.guide.tokens = [0, 0];
+  await simCall('sim_start', { stage });
+  renderSteps();
+}
+
+async function simPlay() {
+  SIM.playing = !SIM.playing;
+  renderSim();
+  while (SIM.playing && S.status?.live && !S.status.live.done) {
+    const r = await simStep({ steps: 1 });
+    if (!r || SIM.state?.pending_institution) break;
+  }
+  SIM.playing = false;
+  renderSim();
+}
+
+async function simCommit() {
+  SIM.playing = false;
+  SIM.guide.running = false;
+  if (SIM.busy) return;
+  SIM.busy = true;
+  renderSim();
+  const stop = pollProgress();
+  try {
+    const st = await api.json<Status & { committed: string; replayed: boolean }>('sim_commit', {});
+    SIM.state = null;
+    SIM.nations.clear();
+    SIM.cultures.clear();
+    invalidate();
+    await refreshStatus(st);
+    toast(`Kept the ${st.committed === 'nations' ? 'Stage 4' : 'Stage 3'} run${st.replayed ? ' (re-run, since its inputs changed)' : ''}. Its directives are saved with the world.`);
+  } catch (e) {
+    toast(String(e), true);
+  } finally {
+    stop();
+    SIM.busy = false;
+    renderSim();
+  }
+}
+
+async function simCancel() {
+  if (!confirm('Stop the live run? Its directives stay in the world (Overrides panel); the step keeps its previous result.')) return;
+  SIM.playing = false;
+  SIM.guide.running = false;
+  SIM.state = null;
+  SIM.nations.clear();
+  SIM.cultures.clear();
+  const st = await api.json<Status>('sim_cancel', {});
+  invalidate();
+  await refreshStatus(st);
+}
+
+async function simActions(stage: string): Promise<any[]> {
+  if (!SIM.actions.has(stage)) SIM.actions.set(stage, await api.json('sim_actions', { stage }));
+  return SIM.actions.get(stage)!;
+}
+
+/** Arguments from the directive form, by the action's schema. */
+function formArgs(schema: any): any {
+  const out: any = {};
+  for (const [k, sp] of Object.entries<any>(schema.properties ?? {})) {
+    const raw = (SIM.form[k] ?? '').trim();
+    const types: string[] = Array.isArray(sp.type) ? sp.type : [sp.type];
+    if (!raw) { out[k] = types.includes('null') ? null : types.includes('array') ? [] : undefined; continue; }
+    if (types.includes('array')) out[k] = raw.split(/[\s,;]+/).filter(Boolean).map(Number);
+    else if (types.includes('boolean')) out[k] = raw === 'true';
+    else if (types.includes('integer')) out[k] = Math.round(Number(raw));
+    else if (types.includes('number')) out[k] = Number(raw);
+    else out[k] = raw;
+  }
+  return out;
+}
+
+async function guideSettingsLoad() {
+  try {
+    SIM.guide.settings = await api.json('guide_config_get', {});
+    if (!SIM.guide.presets.length) SIM.guide.presets = await api.json('guide_presets', {});
+  } catch (e) {
+    SIM.guide.settings = { error: String(e) };
+  }
+  renderSim();
+}
+
+async function guideRun() {
+  const g = SIM.guide;
+  const live = S.status?.live;
+  if (!live) return;
+  if (!g.goal.trim()) return toast('Describe the history you want to see first', true);
+  saveGuidePrefs();
+  g.running = true;
+  SIM.playing = false;
+  renderSim();
+  const atStart = SIM.state && (SIM.state.stage === 'cultures' ? SIM.state.tick === 0 : SIM.state.year === SIM.state.start_year);
+  let years = atStart && !g.log.length ? 0 : g.years[live.stage];
+  while (g.running) {
+    const stop = pollProgress();
+    let r: any;
+    try {
+      r = await api.json('guide_turn', { goal: g.goal, years, max_actions: g.maxActions });
+    } catch (e) {
+      toast(`Guide: ${e}`, true);
+      stop();
+      break;
+    }
+    stop();
+    g.tokens[0] += r.input_tokens ?? 0;
+    g.tokens[1] += r.output_tokens ?? 0;
+    if (r.status) await applySim(r.status);
+    if (r.done) break;
+    g.log.push({ position: r.position, narration: r.narration, actions: r.actions ?? [] });
+    years = r.next_years ?? g.years[live.stage];
+    renderSim();
+  }
+  g.running = false;
+  renderSim();
+}
+
+/** City pins on the map in a live Stage 4 run: click to add, drag a pin to move it, or remove. */
+async function cityPinGesture(tool: ToolId, start: Vec3, end: Vec3, moved: boolean) {
+  const live = S.status?.live;
+  if (!live || live.stage !== 'nations') return toast('Start Stage 4 step by step first: city pins steer a live run.', true);
+  if (live.done) return toast('The run has reached its end; restart it to place pins.', true);
+  const prov = await getField('province');
+  if (!prov) return;
+  const kind = await getField('province_kind');
+  const provAt = (p: Vec3) => prov.values[S.grid!.nearest(p)];
+  const onLand = (p: Vec3) => !kind || kind.values[S.grid!.nearest(p)] < 2;
+  const pins: any[] = SIM.state?.pins ?? [];
+  const near = (p: Vec3) => {
+    let best: any = null, bd = 0.04;
+    for (const pin of pins) {
+      const d = angle(p, fromLatLon((pin.at[0] * Math.PI) / 180, (pin.at[1] * Math.PI) / 180));
+      if (d < bd) { bd = d; best = pin; }
+    }
+    return best;
+  };
+  if (tool === 'city_unpin') {
+    const pin = near(start);
+    if (!pin) return toast('Click near a city pin to remove it.', true);
+    await simCall('sim_directive', { action: 'pin_remove', args: { pin: pin.id }, note: `pin at ${pin.province_name} removed` });
+    return;
+  }
+  const from = moved ? near(start) : null;
+  if (from) {
+    if (!onLand(end)) return toast('City pins go on land.', true);
+    await simCall('sim_directive', { action: 'pin_move', args: { pin: from.id, province: provAt(end) } });
+    return;
+  }
+  if (!onLand(moved ? end : start)) return toast('City pins go on land.', true);
+  const value = S.toolValue['city_pin'] ?? 0.8;
+  const label = window.prompt('What makes this city rise or fall? (optional)', value >= 0 ? 'boom town' : 'abandoned city');
+  if (label === null) return;
+  await simCall('sim_directive', { action: 'pin_add', args: { province: provAt(moved ? end : start), value, years: null, label: label.trim() || null } });
+}
+
+function renderSim() {
+  const box = document.querySelector('#simpanel') as HTMLElement | null;
+  if (!box || !S.status) return;
+  const live = S.status.live;
+  const stage = live?.stage ?? (LIVE_STEPS.includes(S.openStep) ? S.openStep : null);
+  box.innerHTML = '';
+  box.className = stage ? 'show' : '';
+  if (!stage) return;
+  const stageName = stage === 'cultures' ? 'Stage 3 · Cultures' : 'Stage 4 · Nations';
+  if (!live) {
+    box.append(h('div', { class: 'sim-head' }, h('b', {}, `Step by step · ${stageName}`)),
+      h('p', { class: 'muted' }, 'Run the simulation a step at a time, watch it on the map, steer it with directives, or let an AI guide steer it toward the history you describe. Directives are saved with the world, so re-running the stage replays the same history.'),
+      h('div', { class: 'row' }, h('button', { class: 'primary', disabled: SIM.busy || S.busy, onclick: () => simStart(stage) }, 'Start step by step')));
+    return;
+  }
+  const st = SIM.state;
+  const pos = live.unit === 'year'
+    ? `${fmtYear(live.position, live.month ?? undefined)} of ${st?.start_year ?? ''}–${live.end}${st?.era ? ' · ' + st.era + ' era' : ''}${st?.step_months ? ' · ' + fmtStep(st.step_months) : ''}`
+    : `Generation ${live.position} of ${live.end}${st ? ' · year ' + Math.round(st.year).toLocaleString() + ' · era ' + st.era : ''}`;
+  const frac = live.unit === 'year' && st ? (live.position + ((live.month ?? 1) - 1) / 12 - st.start_year) / Math.max(1, live.end - st.start_year) : live.position / Math.max(1, live.end);
+  const busy = SIM.busy || SIM.guide.running;
+  const adv = SIM.advance[stage];
+  box.append(
+    h('div', { class: 'sim-head' }, h('b', {}, stageName), h('span', { class: 'muted' }, live.done ? 'finished' : 'live')),
+    h('div', {}, pos), h('progress', { class: 'sim-prog', max: 1, value: Math.min(1, Math.max(0, frac)) }),
+    h('div', { class: 'row wrap' },
+      h('button', { disabled: busy || live.done, title: live.unit === 'year' ? 'One step' : 'One generation', onclick: () => simStep({ steps: 1 }) }, 'Step'),
+      h('input', { type: 'number', class: 'years', min: 1, step: 1, value: adv, title: 'Years to advance', onchange: (e: Event) => (SIM.advance[stage] = Math.max(1, Number((e.target as HTMLInputElement).value))) }),
+      h('button', { disabled: busy || live.done, onclick: () => simStep({ years: SIM.advance[stage] }) }, `+${adv} years`),
+      h('button', { disabled: busy || live.done, onclick: () => simStep({ to: 'era' }) }, 'Next era'),
+      h('button', { disabled: (SIM.busy && !SIM.playing) || SIM.guide.running || live.done, class: SIM.playing ? 'on' : '', onclick: simPlay }, SIM.playing ? 'Pause' : 'Play'),
+      h('button', { disabled: busy || live.done, onclick: () => simStep({ to: 'end' }) }, 'To the end')),
+    h('div', { class: 'row wrap' },
+      h('button', { class: 'primary', disabled: busy, title: 'Run to the end and keep this history as the stage result', onclick: simCommit }, live.done ? 'Keep this history' : 'Finish and keep'),
+      h('button', { disabled: busy, title: 'Start again from the beginning (directives so far are replayed)', onclick: () => simStart(stage) }, 'Restart'),
+      h('button', { disabled: SIM.busy, onclick: simCancel }, 'Stop')),
+    h('div', { class: 'seg tabs' },
+      ...(['world', 'steer', 'guide'] as const).map((t) => h('button', { class: SIM.tab === t ? 'on' : '', onclick: () => { SIM.tab = t; if (t === 'guide' && !SIM.guide.settings) guideSettingsLoad(); renderSim(); } }, t === 'world' ? 'World' : t === 'steer' ? 'Steer' : 'AI guide'))),
+  );
+  const body = h('div', { class: 'sim-body' });
+  box.append(body);
+  if (!st) return;
+  if (stage === 'nations') {
+    const pend = st.pending_institution;
+    if (pend) {
+      const choose = async (province: number | null) => {
+        const r = await simCall('sim_directive', { action: 'institution_birth', args: { institution: pend.index, province }, note: province === null ? 'left to chance' : '' });
+        if (r) toast(`${pend.name} will be born ${province === null ? 'where chance takes it' : 'in ' + (pend.candidates.find((c: any) => c.province === province)?.name ?? '#' + province)}. Step on.`);
+      };
+      body.append(h('div', { class: 'callout' },
+        h('b', {}, `The institution of ${pend.name} is ready to be born (${pend.era} era).`),
+        h('div', { class: 'muted small' }, 'Choose its birthplace among the candidates (gold stars on the map), or let chance pick one weighted by their scores.'),
+        ...pend.candidates.map((c: any) => h('div', { class: 'item' },
+          h('span', { class: 'link', onclick: () => R.lookAt(fromLatLon((c.at[0] * Math.PI) / 180, (c.at[1] * Math.PI) / 180)) }, `${c.name} `, h('span', { class: 'muted' }, `#${c.province} · ${c.owner_name} · score ${c.score}`)),
+          h('button', { class: 'small', disabled: busy, onclick: () => choose(c.province) }, 'Here'))),
+        h('div', { class: 'row' }, h('button', { disabled: busy, onclick: () => choose(null) }, 'Let chance decide'))));
+    }
+    body.append(h('label', { class: 'check small' }, h('input', { type: 'checkbox', checked: SIM.askBirth, onchange: (e: Event) => { SIM.askBirth = (e.target as HTMLInputElement).checked; } }), ' Ask me where institutions are born'));
+  }
+  const fmtM = (x: number) => (x >= 1e6 ? `${(x / 1e6).toFixed(1)} M` : `${Math.round(x / 1000)}k`);
+  if (SIM.tab === 'world') {
+    if (stage === 'cultures') {
+      body.append(h('div', { class: 'muted' }, `${st.cultures.length} cultures in ${st.groups} groups · ${fmtM(st.population)} people · ${st.settled_provinces} of ${st.land_provinces} provinces settled`));
+      for (const c of st.cultures.slice(0, 10)) {
+        const cc = cultureColor(c.id, c.group).map(Math.round);
+        body.append(h('div', { class: 'item' }, h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), `${c.name} `, h('span', { class: 'muted' }, `#${c.id}`)),
+          h('span', { class: 'muted' }, `${fmtM(c.population)} · ${c.provinces} prov.${c.regions?.[0]?.name ? ' · ' + c.regions[0].name : ''}`)));
+      }
+      const ev = (st.events ?? []).slice(-8).reverse();
+      if (ev.length) body.append(h('h4', {}, 'Recent events'), ...ev.map((e: any) => h('div', { class: 'muted small' }, `${Math.round(e.year)}: ${e.event} ${SIM.cultures.get(e.culture)?.name ?? '#' + e.culture}${e.other ? ' / ' + (SIM.cultures.get(e.other)?.name ?? '#' + e.other) : ''}`)));
+    } else {
+      body.append(h('div', { class: 'muted' }, `${st.nations.length} nations · ${st.ruled_provinces} of ${st.land_provinces} provinces ruled · ${fmtM(st.population)} people · ${st.railways} railway lines`));
+      if (st.leader) body.append(h('div', { class: 'muted small' }, `Most advanced: ${st.leader.name} (${st.leader.era}, technology ${Math.round(st.leader.tech)}) · ${Object.entries(st.eras ?? {}).map(([k, v]) => `${v} ${k}`).join(', ')}`));
+      const tr = st.transport;
+      if (tr) body.append(h('div', { class: 'muted small' }, `Roads ${Math.round(tr.road_km.track).toLocaleString()} km track, ${Math.round(tr.road_km.paved).toLocaleString()} km paved, ${Math.round(tr.road_km.highway).toLocaleString()} km highway · rail ${Math.round(tr.rail_km).toLocaleString()} km, ${tr.junctions} junctions · ${tr.ports ?? 0} ports · ${tr.airports} airports`));
+      const born = (st.institutions ?? []).filter((x: any) => x.born !== null);
+      if (born.length || st.next_institution) body.append(h('div', { class: 'muted small' },
+        `Institutions: ${born.map((x: any) => `${x.name} (${x.born}, ${x.province_name}; ${x.nations_in_era} nations)`).join(' · ') || 'none yet'}${st.next_institution ? ` · next: ${st.next_institution.name}, from ${st.next_institution.earliest}${st.next_institution.chosen ? ' (birthplace chosen)' : ''}` : ''}`));
+      for (const e of (st.empires ?? []).filter((x: any) => x.dissolved === null)) body.append(h('div', { class: 'muted small' }, `${e.name}: emperor #${e.emperor}, ${e.kings} kings, ${e.dukes} dukes, ${e.territory_provinces} provinces of imperial territory`));
+      if (st.tags?.length) body.append(h('div', { class: 'muted small' }, `Tags: ${st.tags.map((t: any) => `${t.tag}${t.scope === 'world' ? '' : ' (' + t.scope + ' #' + t.id + ')'}`).join(', ')}`));
+      for (const n of st.nations.slice(0, 12)) {
+        const nc = nationColor(n.id).map(Math.round);
+        body.append(h('div', { class: 'item link', onclick: () => {
+          const p = S.political?.byProv.get(n.capital);
+          if (p?.center) R.lookAt(fromLatLon((p.center[0] * Math.PI) / 180, (p.center[1] * Math.PI) / 180));
+        } }, h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${nc.join(',')})` }), `${n.name} `, h('span', { class: 'muted' }, `#${n.id}`)),
+          h('span', { class: 'muted' }, `${n.rank ? n.rank + ' · ' : ''}${n.era} · ${n.provinces} prov. · ${fmtM(n.population)} · treasury ${fmtM(n.treasury)}${n.bankrupt ? ' (bankrupt)' : ''}${n.reforming ? ' (reforming)' : ''}${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
+      }
+      if (st.cities?.length) {
+        body.append(h('h4', {}, 'Largest cities'), ...st.cities.slice(0, 8).map((c: any) => h('div', { class: 'item' },
+          h('span', {}, `${c.name}${c.capital ? ' ★' : ''}${c.station ? ' 🚉' : ''}${c.airport ? ' ✈' : ''}`),
+          h('span', { class: 'muted' }, `${fmtM(c.population)}${c.attraction ? ' · pull ' + (c.attraction > 0 ? '+' : '') + c.attraction : ''}${SIM.nations.get(c.owner) ? ' · ' + SIM.nations.get(c.owner).name : ''}`))));
+      }
+      if (st.pins?.length) {
+        body.append(h('h4', {}, `City pins (${st.ruins ?? 0} cities in ruins)`), ...st.pins.map((p: any) => h('div', { class: 'item' },
+          h('span', {}, `#${p.id} ${p.province_name} ${p.value > 0 ? '+' : ''}${p.value}${p.label ? ' · ' + p.label : ''}${p.by === 'guide' ? ' (guide)' : ''}`),
+          h('button', { class: 'x', title: 'Remove', disabled: busy || live.done, onclick: () => simCall('sim_directive', { action: 'pin_remove', args: { pin: p.id } }) }, '×'))));
+      } else if (st.ruins) body.append(h('div', { class: 'muted small' }, `${st.ruins} cities in ruins. City pins: tool on the left, or the Steer tab.`));
+      if (st.effects?.length) body.append(h('h4', {}, 'In effect'), ...st.effects.map((e: any) => h('div', { class: 'muted small' }, `${e.effect} · nation #${e.nation}${e.target ? ' → #' + e.target : ''}${e.factor !== undefined ? ' ×' + e.factor : ''} until ${e.until}`)));
+      const ev = (st.events ?? []).slice(-10).reverse();
+      if (ev.length) body.append(h('h4', {}, 'Recent events'), ...ev.map((e: any) => h('div', { class: 'muted small' }, `${e.year}: ${e.text}`)));
+    }
+  }
+  if (SIM.tab === 'steer') {
+    const sel = h('select', { onchange: (e: Event) => { SIM.action = (e.target as HTMLSelectElement).value; SIM.form = {}; renderSim(); } }) as HTMLSelectElement;
+    body.append(h('p', { class: 'muted small' }, 'A directive applies from the next step and is saved with the world. Ids are shown when you hover the map (province, state, region, culture, nation).'), sel);
+    simActions(stage).then((acts) => {
+      if (!SIM.action || !acts.some((a) => a.name === SIM.action)) SIM.action = acts[0]?.name ?? '';
+      sel.append(...acts.map((a) => h('option', { value: a.name, selected: a.name === SIM.action }, a.name.replace(/_/g, ' '))));
+      const a = acts.find((x) => x.name === SIM.action);
+      if (!a) return;
+      const form = h('div', { class: 'form sim-form' });
+      for (const [k, sp] of Object.entries<any>(a.schema.properties ?? {})) {
+        const types: string[] = Array.isArray(sp.type) ? sp.type : [sp.type];
+        const ph = types.includes('array') ? 'ids, e.g. 12, 40' : types.includes('null') ? 'optional' : sp.minimum !== undefined ? `${sp.minimum} to ${sp.maximum}` : '';
+        const choices: string[] | null = sp.enum ?? (types.includes('boolean') ? ['true', 'false'] : null);
+        if (choices && SIM.form[k] === undefined) SIM.form[k] = choices[0];
+        form.append(h('label', { title: sp.description ?? '' }, h('span', {}, k.replace(/_/g, ' ')),
+          choices
+            ? h('select', { onchange: (e: Event) => (SIM.form[k] = (e.target as HTMLSelectElement).value) }, ...choices.map((c) => h('option', { value: c, selected: SIM.form[k] === c }, c.replace(/_/g, ' '))))
+            : h('input', { type: types.includes('number') || types.includes('integer') ? 'number' : 'text', placeholder: ph, value: SIM.form[k] ?? '', step: 'any', oninput: (e: Event) => (SIM.form[k] = (e.target as HTMLInputElement).value) })));
+      }
+      form.append(h('label', { class: 'wide' }, h('span', {}, 'note'), h('input', { type: 'text', placeholder: 'why (for the chronicle)', value: SIM.note, oninput: (e: Event) => (SIM.note = (e.target as HTMLInputElement).value) })));
+      sel.after(h('div', { class: 'muted small' }, a.description), form,
+        h('div', { class: 'row' }, h('button', { class: 'primary', disabled: busy || live.done, onclick: async () => {
+          const r = await simCall('sim_directive', { action: a.name, args: formArgs(a.schema), note: SIM.note });
+          if (r) { SIM.note = ''; toast(`${a.name.replace(/_/g, ' ')} applies from the next step`); }
+        } }, 'Apply')));
+    });
+    const applied = [...(st.queued ?? []).map((d: any) => ({ ...d, queued: true })), ...(st.directives ?? []).slice(-14).reverse()];
+    if (applied.length) {
+      body.append(h('h4', {}, 'Directives so far'), ...applied.map((d: any) => {
+        const when = d.year !== undefined ? fmtYear(d.year, d.month) : d.tick;
+        const what = d.action === 'note' ? `“${d.args?.text ?? ''}”` : `${d.action.replace(/_/g, ' ')} ${JSON.stringify(Object.fromEntries(Object.entries(d.args ?? {}).filter(([, v]) => v !== null && !(Array.isArray(v) && !v.length))))}`;
+        return h('div', { class: 'muted small' }, `${when}: ${what}${d.note ? ' — ' + d.note : ''}${d.by === 'guide' ? ' (guide)' : ''}${d.queued ? ' (from the next step)' : d.applied === false ? ' (no effect)' : ''}`);
+      }));
+    }
+  }
+  if (SIM.tab === 'guide') {
+    const g = SIM.guide;
+    const cfg = g.settings;
+    const ready = cfg && !cfg.error && cfg.model && (cfg.has_key || (cfg.base_url ?? '').includes('localhost') || (cfg.base_url ?? '').includes('127.0.0.1'));
+    body.append(
+      h('div', { class: 'row' },
+        h('span', { class: 'muted small', style: 'flex:1' }, cfg?.error ? cfg.error : cfg ? `${cfg.provider === 'anthropic' ? 'Anthropic' : 'OpenAI-compatible'} · ${cfg.model || 'no model'} · ${cfg.has_key ? 'key ' + (cfg.key_source === 'settings' ? cfg.key_hint : 'from ' + cfg.key_source) : 'no key'}` : 'Loading settings…'),
+        h('button', { class: 'small', onclick: () => { g.showSettings = !g.showSettings; renderSim(); } }, g.showSettings ? 'Hide settings' : 'Settings')),
+    );
+    if (g.showSettings && cfg && !cfg.error) {
+      const f = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model, effort: cfg.effort };
+      const preset = h('select', { onchange: (e: Event) => {
+        const pr = g.presets.find((x) => x.id === (e.target as HTMLSelectElement).value);
+        if (pr) { Object.assign(cfg, { provider: pr.provider, base_url: pr.base_url, model: pr.model }); renderSim(); }
+      } }, h('option', { value: '' }, 'Choose a provider…'), ...g.presets.map((pr) => h('option', { value: pr.id, selected: !!pr.base_url && pr.base_url === cfg.base_url && pr.provider === cfg.provider }, pr.label)));
+      const hint = g.presets.find((pr) => pr.base_url && pr.base_url === cfg.base_url)?.hint ?? '';
+      const inp = (k: keyof typeof f, label: string, ph = '') => h('label', {}, h('span', {}, label), h('input', { type: 'text', value: (cfg as any)[k] ?? '', placeholder: ph, oninput: (e: Event) => ((cfg as any)[k] = (e.target as HTMLInputElement).value) }));
+      body.append(h('div', { class: 'form sim-form' },
+        h('label', { class: 'wide' }, h('span', {}, 'Preset'), preset),
+        h('label', {}, h('span', {}, 'Format'), h('select', { onchange: (e: Event) => { cfg.provider = (e.target as HTMLSelectElement).value; renderSim(); } },
+          h('option', { value: 'anthropic', selected: cfg.provider === 'anthropic' }, 'Anthropic Messages API'), h('option', { value: 'openai', selected: cfg.provider === 'openai' }, 'OpenAI-compatible'))),
+        cfg.provider === 'anthropic' ? h('label', {}, h('span', {}, 'Effort'), h('select', { onchange: (e: Event) => (cfg.effort = (e.target as HTMLSelectElement).value) },
+          ...['low', 'medium', 'high'].map((x) => h('option', { value: x, selected: cfg.effort === x }, x)))) : h('span', {}),
+        inp('base_url', 'Base URL', 'https://…'), inp('model', 'Model', 'model id'),
+        h('label', { class: 'wide' }, h('span', {}, 'API key'), h('input', { type: 'password', autocomplete: 'off', value: g.keyDraft, placeholder: cfg.has_key ? (cfg.key_source === 'settings' ? `saved (${cfg.key_hint}); type to replace` : `using ${cfg.key_source}`) : 'paste your key', oninput: (e: Event) => (g.keyDraft = (e.target as HTMLInputElement).value) })),
+      ), hint ? h('div', { class: 'muted small' }, hint) : '',
+      h('div', { class: 'muted small' }, `Saved on this computer only (${cfg.path}), never in a world.`),
+      h('div', { class: 'row' },
+        h('button', { onclick: async () => {
+          try {
+            const args: any = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model, effort: cfg.effort };
+            if (g.keyDraft) args.api_key = g.keyDraft;
+            g.settings = await api.json('guide_config_set', args);
+            g.keyDraft = '';
+            toast('Guide settings saved');
+          } catch (e) { toast(String(e), true); }
+          renderSim();
+        } }, 'Save'),
+        h('button', { onclick: async () => {
+          const stop = pollProgress();
+          try { const r = await api.json('guide_test', {}); toast(`${r.model}: ${r.text}`); } catch (e) { toast(String(e), true); }
+          stop();
+        } }, 'Test'),
+        cfg.key_source === 'settings' ? h('button', { onclick: async () => { g.settings = await api.json('guide_config_set', { api_key: '' }); renderSim(); } }, 'Forget key') : null));
+    }
+    body.append(
+      h('label', { class: 'sim-goal' }, h('span', { class: 'muted small' }, 'The history you want to see'),
+        h('textarea', { rows: 4, placeholder: stage === 'cultures' ? 'e.g. Two great peoples: one on the western continent, one spread over the islands; the steppe people should split into many tribes.' : 'e.g. A sea empire grows in the south and colonises the east; by 1800 it breaks into three kingdoms. The northern city-states stay independent.', oninput: (e: Event) => { g.goal = (e.target as HTMLTextAreaElement).value; } }, g.goal)),
+      h('div', { class: 'row wrap' },
+        h('label', { class: 'check' }, 'Years per turn ', h('input', { type: 'number', class: 'years', min: 5, value: g.years[stage], onchange: (e: Event) => (g.years[stage] = Math.max(5, Number((e.target as HTMLInputElement).value))) })),
+        h('label', { class: 'check' }, 'Max directives ', h('input', { type: 'number', class: 'years', min: 1, max: 12, value: g.maxActions, onchange: (e: Event) => (g.maxActions = Math.max(1, Number((e.target as HTMLInputElement).value))) }))),
+      h('div', { class: 'row' },
+        g.running
+          ? h('button', { class: 'on', onclick: () => { g.running = false; renderSim(); } }, 'Pause after this turn')
+          : h('button', { class: 'primary', disabled: SIM.busy || live.done || !ready, title: ready ? '' : 'Set up a provider, model and key first', onclick: guideRun }, g.log.length ? 'Continue guiding' : 'Start guiding'),
+        h('span', { class: 'muted small' }, g.tokens[0] ? `${g.tokens[0].toLocaleString()} tokens in · ${g.tokens[1].toLocaleString()} out` : '')),
+      h('p', { class: 'muted small' }, 'Each turn the simulation advances, the model reads a summary of the world and your goal, then issues directives and writes a line for the chronicle. It needs the model only while guiding: the directives are saved, so re-runs replay without it.'),
+    );
+    for (const t of [...g.log].reverse().slice(0, 30)) {
+      body.append(h('div', { class: 'guide-turn' }, h('b', {}, String(Math.round(t.position))), ' ', t.narration || h('span', { class: 'muted' }, '(no note)'),
+        ...t.actions.map((a) => h('div', { class: `small ${a.ok ? 'muted' : 'err'}` }, `${a.ok ? '✓' : '✗'} ${a.action.replace(/_/g, ' ')} ${a.ok ? JSON.stringify(Object.fromEntries(Object.entries(a.args ?? {}).filter(([, v]) => v !== null && !(Array.isArray(v) && !v.length)))) : a.error ?? ''}`))));
+    }
+  }
+}
+
 // ------------------------------------------------------------------ step cards
 
 function renderSteps() {
@@ -956,6 +1640,7 @@ function renderSteps() {
   STEPS.forEach((ui, idx) => {
     if (idx === STAGE2_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 2 · States and provinces')));
     if (idx === STAGE3_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 3 · Cultures')));
+    if (idx === STAGE4_START) box.append(h('div', { class: 'steps-head stage' }, h('b', {}, 'Stage 4 · Nations and history')));
     box.append(stepCard(ui, idx, st.steps[idx]));
   });
   box.scrollTop = scroll;
@@ -975,6 +1660,7 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
     if (!open && ui.tools.length && !ui.tools.includes(S.tool)) S.tool = 'navigate';
     renderSteps();
     renderToolbar();
+    renderSim();
   } },
     h('span', { class: 'num' }, String(idx + 1)), h('span', { class: 'title' }, ui.title),
     ss.millis ? h('span', { class: 'ms' }, ss.millis < 1000 ? `${ss.millis} ms` : `${(ss.millis / 1000).toFixed(1)} s`) : null, pill);
@@ -983,15 +1669,26 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
 
   const body = h('div', { class: 'card-body' }, h('p', { class: 'muted' }, ui.blurb));
   const form = h('div', { class: 'form' });
-  for (const p of ui.params) form.append(paramInput(p));
+  // Sketch parameters that only one base uses are shown with that base.
+  const base = S.status!.edits.sketch_base;
+  const unused = (p: Param) => (p.key === 'auto_continents' && base !== 'generated') || (p.key === 'drawing_freedom_km' && base !== 'drawing');
+  for (const p of ui.params) if (!unused(p)) form.append(paramInput(p));
   body.append(form);
 
   // Step-specific extras.
   const e = S.status!.edits;
   if (ui.key === 'sketch') {
+    const sm = ss.state === 'done' ? ss.meta : null;
+    form.prepend(h('label', {}, h('span', { title: 'What the strokes work on' }, 'Start from'),
+      h('select', { onchange: (ev: Event) => mutate('set_sketch_base', { value: (ev.target as HTMLSelectElement).value }, 'sketch') },
+        ...([['generated', 'Generated continents (seed)'], ['drawing', 'My drawing (procedural)'], ['ocean', 'Empty ocean (exact paint)']] as const)
+          .map(([v, label]) => h('option', { value: v, selected: e.sketch_base === v }, label)))));
     body.append(
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: e.auto_base, onchange: (ev: Event) => mutate('set_auto_base', { value: (ev.target as HTMLInputElement).checked }, 'sketch') }), 'Start from generated continents'),
-      h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.sketch_strokes} strokes`),
+      h('p', { class: 'muted' }, e.sketch_base === 'drawing'
+        ? 'Draw a rough layout with the land and sea brushes. The generator gives it natural coasts, peninsulas, gulfs and islands, and keeps each landmass’s size; another seed gives other details. “Freedom from the drawing” sets how far coasts may stray.'
+        : e.sketch_base === 'generated' ? 'Strokes paint over the continents generated from the seed.' : 'Strokes paint land exactly; coast noise only decides soft brush edges.'),
+      h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.sketch_strokes} strokes`
+        + (sm?.drawing_kept !== undefined && e.sketch_base === 'drawing' ? ` · ${Math.round(sm.drawing_kept * 100)}% of the drawn land is land` : '')),
         h('button', { class: 'small', disabled: !e.sketch_strokes && !e.pins.length && !e.arrows.length, onclick: () => confirm('Clear all sketch strokes, pins and arrows?') && mutate('clear_layer', { layer: 'sketch' }, 'sketch') }, 'Clear sketch')),
     );
   }
@@ -1031,6 +1728,10 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
     body.append(h('div', { class: 'row' }, h('span', { class: 'muted' }, `${e.fertility_strokes} fertility strokes`),
       h('button', { class: 'small', disabled: !e.fertility_strokes, onclick: () => mutate('clear_layer', { layer: 'fertility' }, 'habitability') }, 'Clear fertility')));
   }
+  if (LIVE_STEPS.includes(ui.key)) {
+    body.append(h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, 'Step by step, directives and the AI guide: panel on the map.'),
+      h('button', { class: 'small', disabled: !!S.status!.live || S.busy, onclick: () => simStart(ui.key) }, 'Step by step')));
+  }
   if (ui.key === 'cultures') {
     const pins = e.band_pins ?? [];
     const founders = S.status!.steps.find((x) => x.key === 'cultures')?.meta?.founders ?? [];
@@ -1042,6 +1743,21 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
         h('button', { class: 'small', disabled: !pins.length, onclick: () => mutate('clear_layer', { layer: 'bands' }, 'cultures') }, 'Clear pins')),
       h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, `${e.attraction_strokes} attraction strokes`),
         h('button', { class: 'small', disabled: !e.attraction_strokes, onclick: () => mutate('clear_layer', { layer: 'attraction' }, 'cultures') }, 'Clear attraction')));
+    const ce = e.culture_edits ?? 0;
+    const locked = S.status!.steps.find((x) => x.key === 'cultures')?.meta?.locked_cultures ?? 0;
+    body.append(h('h4', {}, 'Culture editor'),
+      h('p', { class: 'muted' }, 'Merge, split, paint, re-parent, rename and lock cultures. Edits pick a culture by where you click, apply at the end of the run, and come back whenever Stage 3 re-runs.'),
+      h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, `${ce} culture edits${locked ? `, ${locked} locked culture${locked === 1 ? '' : 's'}` : ''}`),
+        h('button', { class: 'small', disabled: !ce, onclick: () => { if (confirm('Remove every culture edit, locks included?')) mutate('clear_layer', { layer: 'cultures' }, 'cultures'); } }, 'Clear culture edits')));
+  }
+  if (ui.key === 'nations') {
+    const seeds = e.nation_seeds ?? [];
+    const n0 = S.status!.params.nations.initial_nations ?? 0;
+    body.append(h('h4', {}, 'Nations at the start'),
+      h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, seeds.length
+        ? `${seeds.length} nation seed${seeds.length > 1 ? 's' : ''} (${seeds.map((x) => x.name || 'unnamed').join(', ')}), then ${n0} more by chance.`
+        : `${n0} nations by chance. Place nation seeds (X) to choose where they are.`),
+        h('button', { class: 'small', disabled: !seeds.length, onclick: () => mutate('clear_layer', { layer: 'nation_seeds' }, 'nations') }, 'Clear seeds')));
   }
   if (ui.key === 'provinces') {
     const imp = e.province_import;
@@ -1056,7 +1772,10 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
       h('button', { class: 'small', disabled: !e.province_strokes, onclick: () => mutate('clear_layer', { layer: 'provinces' }) }, 'Clear paint')));
   }
 
+  const later = S.status!.steps.slice(idx).filter((x) => x.state !== 'empty').length;
   body.append(h('div', { class: 'actions' },
+    idx > 0 && later ? h('button', { class: 'small', disabled: S.busy, title: `Remove the results of this step and the ${later > 1 ? 'later ones' : 'next'} (your edits stay); run again to rebuild them`,
+      onclick: () => clearResults(ui.key, later) }, 'Clear from here') : null,
     h('button', { class: 'primary', disabled: S.busy || ss.state === 'done', onclick: () => run(ui.key) },
       S.busy ? 'Working…' : ss.state === 'done' ? 'Up to date' : idx === 0 ? 'Build grid' : `Run to step ${idx + 1}`)));
   if (ss.meta && ss.state !== 'empty') body.append(summary(ui.key, ss.meta));
@@ -1184,7 +1903,7 @@ function summary(key: string, m: any): HTMLElement {
       break;
     case 'hydrology': {
       if (m.channel_loss_m3s !== undefined) box.append(stat('Lost in dry channels', `${fmt(m.channel_loss_m3s)} m³/s`));
-      box.append(stat('River cells', fmt(m.river_cells)), stat('Lakes', `${m.lakes} (${m.endorheic_lakes} endorheic)`), stat('Eroded', `${fmt(m.eroded_km3 / 1000)}k km³`));
+      box.append(stat('Rivers', `${fmt(m.river_km ?? 0)} km`), stat('Lakes', `${m.lakes} (${m.endorheic_lakes} endorheic)`), stat('Eroded', `${fmt(m.eroded_km3 / 1000)}k km³`));
       const list = h('div', { class: 'list' });
       (m.major_rivers ?? []).forEach((r: any, i: number) => list.append(h('div', { class: 'item link', onclick: () => R.lookAt(fromLatLon((r.lat * Math.PI) / 180, (r.lon * Math.PI) / 180)) },
         `${i + 1}. ${fmt(r.discharge_m3s)} m³/s · ${fmt(r.width_m ?? 0)} m wide · ${fmt(r.length_km)} km · basin ${fmt(r.basin_mkm2, 2)} M km²`)));
@@ -1239,6 +1958,33 @@ function summary(key: string, m: any): HTMLElement {
       });
       break;
     }
+    case 'nations': {
+      box.append(stat('Nations', `${fmt(m.nations)} in ${m.start_date} (${fmt(m.nations_ever)} ever since ${m.start_year})`),
+        stat('Land ruled', `${fmt((m.ruled_share ?? 0) * 100)}%`), stat('Population', `${fmt((m.population ?? 0) / 1e6, 1)} M`),
+        stat('History', `${fmt(m.conquests)} capitals taken, ${fmt(m.independences)} independences, ${fmt(m.colonies)} colonies`),
+        stat('Eras', `${m.leader ? m.leader.name + ' leads (' + m.leader.era + ')' : '—'}${m.eras ? ' · ' + Object.entries(m.eras).map(([k, v]) => `${v} ${k}`).join(', ') : ''}`),
+        stat('Railways', `${fmt(m.railways)} lines over ${fmt(m.railway_provinces)} provinces${m.transport ? ', ' + fmt(m.transport.rail_km) + ' km, ' + m.transport.junctions + ' junctions' : ''}`),
+        ...(m.transport ? [stat('Roads & air', `${fmt(m.transport.road_km.track)} km track, ${fmt(m.transport.road_km.paved)} km paved, ${fmt(m.transport.road_km.highway)} km highway · ${m.transport.airports} airports`)] : []),
+        ...(m.bankruptcies ? [stat('Bankruptcies', fmt(m.bankruptcies))] : []),
+        stat('Cities', `${fmt(m.metropolises ?? 0)} passed a million · ${fmt(m.ruins ?? 0)} lie in ruins`));
+      if (m.directives?.length) box.append(stat('Directives', `${m.directives.filter((d: any) => d.action !== 'note').length} applied, ${m.directives.filter((d: any) => d.by === 'guide').length} by the guide`));
+      const list = h('div', { class: 'list' });
+      box.append(list);
+      political().then((P) => {
+        if (!P || !P.nations.length) return;
+        const living = P.nations.filter((n) => n.ended === null).sort((a, b) => b.population - a.population);
+        for (const n of living.slice(0, 14)) {
+          const nc = nationColor(n.id).map(Math.round);
+          const cap = P.byProv.get(n.capital);
+          list.append(h('div', { class: 'item link', onclick: () => cap?.center && R.lookAt(fromLatLon((cap.center[0] * Math.PI) / 180, (cap.center[1] * Math.PI) / 180)) },
+            h('span', {}, h('i', { class: 'swatch', style: `background: rgb(${nc.join(',')})` }), n.name),
+            h('span', { class: 'muted' }, `${n.government} · ${n.culture_name} · ${n.era ?? ''} · ${n.provinces} prov. · ${fmt(n.population / 1e6, 1)} M${n.overseas_provinces ? ' · ' + n.overseas_provinces + ' overseas' : ''}`)));
+        }
+        const ev = P.nationEvents.filter((e) => e.event !== 'railway').slice(-12).reverse();
+        if (ev.length) list.append(h('h4', {}, 'Chronicle (latest)'), ...ev.map((e) => h('div', { class: 'muted small' }, `${e.year}: ${e.text}`)));
+      });
+      break;
+    }
     case 'cultures': {
       box.append(stat('Cultures', `${fmt(m.cultures)} in ${fmt(m.groups)} groups`), stat('Population', `${fmt(m.population / 1e6, 1)} M of ${fmt(m.capacity / 1e6, 1)} M possible`),
         stat('History', `${fmt(m.years)} years: ${fmt(m.splits)} splits, ${fmt(m.merged)} merges, ${fmt(m.extinct)} died out`), stat('Bands', fmt(m.bands)));
@@ -1260,16 +2006,34 @@ function summary(key: string, m: any): HTMLElement {
             const cc = cultureColor(c.id, c.group).map(Math.round);
             const parent = c.parent ? P.byCulture.get(c.parent) : null;
             const origin = parent ? `Split from ${parent.name} in ${yr(c.founded_year)}` : `Emerged in ${yr(c.founded_year)}`;
-            list.append(h('div', { class: 'item', title: origin },
-              h('span', {}, '\u00a0\u00a0', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name),
+            list.append(h('div', { class: 'item', title: origin + (c.locked ? '. Locked: re-running keeps it as it is.' : '') },
+              h('span', {}, '\u00a0\u00a0', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name, c.locked ? ' 🔒' : ''),
               h('span', { class: 'muted' }, `${fmt(c.population / 1e6, 2)} M · ${c.provinces} prov.${parent ? ' · from ' + parent.name : ''}`)));
           }
         }
+        // Family tree: every living culture under its ancestors (ended ones greyed).
+        const kids = new Map<number, any[]>();
+        const keep = new Set<number>();
+        for (const c of P.cultures) if (c.alive) for (let x: any = c; x && !keep.has(x.id); x = x.parent ? P.byCulture.get(x.parent) : null) keep.add(x.id);
+        for (const c of P.cultures) if (keep.has(c.id)) { const k = c.parent && keep.has(c.parent) ? c.parent : 0; if (!kids.has(k)) kids.set(k, []); kids.get(k)!.push(c); }
+        const tree = h('div', { class: 'list' });
+        const walk = (pid: number, depth: number) => {
+          for (const c of (kids.get(pid) ?? []).sort((a, b) => a.founded_year - b.founded_year || a.id - b.id)) {
+            const cc = cultureColor(c.id, c.group).map(Math.round);
+            const fate = c.alive ? `${fmt(c.population / 1e6, 2)} M` : `${c.fate === 'merged' ? 'merged into ' + (P.byCulture.get(c.fate_other)?.name ?? '?') : 'died out'} in ${yr(c.ended_year)}`;
+            tree.append(h('div', { class: 'item', style: c.alive ? '' : 'opacity:0.55' },
+              h('span', { class: 'tree-name', style: `padding-left:${4 + Math.min(depth, 8) * 10}px` }, depth ? '└ ' : '', h('i', { class: 'swatch', style: `background: rgb(${cc.join(',')})` }), c.name, c.locked ? ' 🔒' : ''),
+              h('span', { class: 'muted' }, `${yr(c.founded_year)} · ${fate}`)));
+            walk(c.id, depth + 1);
+          }
+        };
+        walk(0, 0);
+        box.append(h('details', {}, h('summary', {}, `Family tree (${keep.size} cultures)`), tree));
         const recent = P.events.filter((e) => e.kind !== 'emerged').slice(-8).reverse();
         if (recent.length) list.append(h('div', { class: 'item' }, h('b', {}, 'Latest events')));
         for (const e of recent) {
           const a = P.byCulture.get(e.culture)?.name ?? `#${e.culture}`, b = P.byCulture.get(e.other)?.name ?? '';
-          const text = e.kind === 'split' ? `${a} split from ${b}` : e.kind === 'merged' ? `${a} merged into ${b}` : `${a} died out`;
+          const text = (e.kind === 'split' ? `${a} split from ${b}` : e.kind === 'merged' ? `${a} merged into ${b}` : `${a} died out`) + (e.edit ? ' (edit)' : '');
           list.append(h('div', { class: 'item' }, h('span', {}, text), h('span', { class: 'muted' }, yr(e.year))));
         }
       });
@@ -1361,6 +2125,8 @@ function renderToolbar() {
       out.textContent = (v > 0 ? '+' : '') + v.toFixed(2);
     } }), out));
   }
+  if (t.value === 'provinces') bb.append(h('label', {}, h('span', {}, 'Provinces (0: default)'), h('input', { type: 'number', step: 1, min: 0, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
+  if (t.value === 'parts') bb.append(h('label', {}, h('span', {}, 'Daughter cultures'), h('input', { type: 'number', step: 1, min: 2, max: 5, value: val, onchange: (e: Event) => setVal(Math.max(2, Math.min(5, Math.round(Number((e.target as HTMLInputElement).value))))) })));
   if (t.value === 'bands') bb.append(h('label', {}, h('span', {}, 'Bands'), h('input', { type: 'number', step: 1, min: 1, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'goods') {
     const goods = TRADE_GOODS.map(([g], i) => [g, i + 1] as const).filter(([g]) => g !== 'none');
@@ -1393,12 +2159,24 @@ function renderToolbar() {
   bb.append(h('span', { class: 'muted hint' }, t.hint));
 }
 
+let legendCollapsed = (() => { try { return localStorage.getItem('fwm.legend.collapsed') === '1'; } catch { return false; } })();
+
 function renderLegend(stale: boolean) {
   const lg = $('#legend');
   lg.innerHTML = '';
   const L = S.legend;
   if (!L) return;
-  lg.append(h('div', { class: 'lg-title' }, L.title, stale ? h('span', { class: 'pill stale' }, 'stale') : null));
+  const n = L.items?.length ?? 0;
+  lg.classList.toggle('collapsed', legendCollapsed);
+  lg.classList.toggle('wide', n > 10);
+  lg.append(h('div', { class: 'lg-title', title: legendCollapsed ? 'Show the legend' : 'Hide the legend', onclick: () => {
+    legendCollapsed = !legendCollapsed;
+    try { localStorage.setItem('fwm.legend.collapsed', legendCollapsed ? '1' : '0'); } catch { /* ignore */ }
+    renderLegend(stale);
+  } }, h('span', { class: 'lg-caret' }, legendCollapsed ? '▸' : '▾'), h('span', { class: 'lg-name' }, L.title),
+    legendCollapsed && n ? h('span', { class: 'muted' }, ` (${n})`) : null, stale ? h('span', { class: 'pill stale' }, 'stale') : null));
+  renderHover();
+  if (legendCollapsed) return;
   if (L.gradient) {
     const st = L.gradient.stops;
     const lo = st[0][0], hi = st[st.length - 1][0];
@@ -1408,7 +2186,7 @@ function renderLegend(stale: boolean) {
   }
   if (L.items) {
     const box = h('div', { class: 'items' });
-    for (const it of L.items.slice(0, 24)) box.append(h('div', {}, h('i', { style: `background: rgb(${it.color.map(Math.round).join(',')})` }), it.label));
+    for (const it of L.items) box.append(h('div', { title: it.label }, h('i', { style: `background: rgb(${it.color.map(Math.round).join(',')})` }), it.label));
     lg.append(box);
   }
 }
@@ -1548,14 +2326,23 @@ function bindCanvas() {
       const t = TOOLS.find((x) => x.id === S.tool)!;
       const deg = (p: Vec3) => toLatLon(p).map((v) => +((v * 180) / Math.PI).toFixed(4));
       const moved = Math.acos(Math.max(-1, Math.min(1, d.start[0] * d.end[0] + d.start[1] * d.end[1] + d.start[2] * d.end[2]))) > 0.004;
-      if (t.gesture === 'link' && !moved && t.id !== 'band_pin') {
+      if (t.id === 'city_pin' || t.id === 'city_unpin') {
+        await cityPinGesture(t.id, d.start, d.end, moved);
+        return;
+      }
+      if (t.gesture === 'link' && !moved && t.id !== 'band_pin' && t.id !== 'nation_seed') {
         toast('Drag from the first place to the second.');
         return;
       }
       let name = '';
       if (t.rename) {
-        name = window.prompt(t.id === 'rename_state' ? 'New state name' : 'New province name')?.trim() ?? '';
+        name = window.prompt(t.id === 'rename_state' ? 'New state name' : t.id === 'rename_culture' ? 'New culture name' : 'New province name')?.trim() ?? '';
         if (!name) return;
+      }
+      if (t.id === 'nation_seed' && !moved) {
+        const v = window.prompt('Name of the nation (leave empty for its capital\'s name)', '');
+        if (v === null) return;
+        name = v.trim();
       }
       const stroke = {
         tool: t.rust ?? S.tool,
@@ -1605,13 +2392,19 @@ function paintPreview(d: Extract<Drag, { kind: 'stroke' }>, p: Vec3) {
   const r = S.brush.radius_km / R0;
   const sk = S.cache.get('sketch|null')?.values as Float32Array | undefined;
   const hint = S.cache.get('mountain_hint|null')?.values as Float32Array | undefined;
-  const target = tool === 'land' || tool === 'sea' ? sk : hint;
+  const land = S.cache.get('land|null')?.values as Uint8Array | undefined;
+  // Grown from the drawing: land and sea strokes change the drawing (its
+  // outline moves); the continents follow when the step runs.
+  const drawing = S.status!.edits.sketch_base === 'drawing' ? S.cache.get('drawing|null')?.values as Float32Array | undefined : undefined;
+  const target = tool === 'land' || tool === 'sea' ? drawing ?? sk : hint;
   if (!target) return;
+  const fields = { sketch: sk, land: drawing ? land : undefined, mountain_hint: hint, drawing };
   const goal = tool === 'land' ? 1 : tool === 'sea' ? -1 : tool === 'mountain' ? 1 : 0;
   const inner = Math.min(0.98, S.brush.hardness);
   const reach = d.gen ? r * (1 + S.brush.scatter) : r;
   const freq = R0 / Math.max(10, S.brush.grain_km);
   const octaves = scatterOctaves(S.brush.grain_km, g.spacing * R0);
+  const touched = new Set<number>();
   g.within(p, reach, (c, dist) => {
     const prev = d.dmin.get(c) ?? Infinity;
     if (dist >= prev) return;
@@ -1633,18 +2426,17 @@ function paintPreview(d: Extract<Drag, { kind: 'stroke' }>, p: Vec3) {
     if (!d.base.has(c)) d.base.set(c, target[c]);
     const b = d.base.get(c)!;
     target[c] = b + (goal - b) * w;
-    // Recolour the cell the way the sketch layer does.
-    const v = sk ? sk[c] : -1;
-    const land = v > 0;
-    let col = land ? [118, 160, 90] : [38, 78, 128];
-    const soft = 1 - Math.abs(v);
-    col = col.map((x) => x + soft * 25);
-    const hv = hint ? hint[c] : 0;
-    if (hv > 0.02) col = col.map((x, k) => x + ([150, 95, 60][k] - x) * Math.min(1, hv));
-    S.colors![c * 4] = col[0];
-    S.colors![c * 4 + 1] = col[1];
-    S.colors![c * 4 + 2] = col[2];
+    touched.add(c);
+    // The outline also changes on the neighbours' side.
+    if (drawing) for (const j of g.neighbors(c)) touched.add(j);
   });
+  // Recolour the cells the way the sketch layer does.
+  for (const c of touched) {
+    const col = sketchColor(g, fields, c);
+    S.colors![c * 4] = Math.min(255, col[0]);
+    S.colors![c * 4 + 1] = Math.min(255, col[1]);
+    S.colors![c * 4 + 2] = Math.min(255, col[2]);
+  }
   R.setColors(S.colors);
 }
 
@@ -1662,7 +2454,8 @@ function hover(p: Vec3 | null) {
       const d = await api.json('probe', { cell: c, month: S.month });
       if (d.state !== undefined) await political();
       if (c !== hoverCell) return;
-      $('#hover').textContent = describe(d);
+      lastProbe = d;
+      renderHover();
     } catch { /* ignore */ }
   }, 60);
 }
@@ -1671,25 +2464,116 @@ function riverClass(w: number): string {
   return w >= 1000 ? 'great river' : w >= 400 ? 'major river' : w >= 150 ? 'river' : 'stream';
 }
 
-function describe(d: any): string {
-  const parts: string[] = [];
+// ------------------------------------------------------------------ info tags (status bar)
+
+/** Kinds of cell information in the status bar; the tags choose which are shown. */
+const INFO_TAGS = [
+  ['relief', 'Relief', 'Elevation, plate and boundary'],
+  ['climate', 'Climate', 'Temperature, rain and Köppen class'],
+  ['water', 'Water', 'Rivers and lakes'],
+  ['land', 'Land', 'Terrain, habitability and springs'],
+  ['province', 'Province', 'Province, goods, state, region and continent'],
+  ['culture', 'Culture', 'Culture and population density'],
+  ['nation', 'Nation', 'Owner, era, realm and institutions'],
+  ['transport', 'Transport', 'Railways, roads, ports and airports'],
+] as const;
+type InfoTag = (typeof INFO_TAGS)[number][0];
+
+/** The tags Auto shows for each layer group. */
+const AUTO_TAGS: Record<string, InfoTag[]> = {
+  Planet: ['relief'],
+  Climate: ['climate', 'relief'],
+  Water: ['water', 'relief'],
+  Biomes: ['climate', 'land'],
+  Political: ['land', 'province'],
+  Cultures: ['culture', 'province'],
+  Nations: ['nation', 'transport'],
+};
+
+const infoTags: { auto: boolean; on: InfoTag[] } = (() => {
+  try {
+    const v = JSON.parse(localStorage.getItem('fwm.infotags') ?? '');
+    if (typeof v?.auto === 'boolean' && Array.isArray(v.on)) return { auto: v.auto, on: v.on.filter((t: string) => INFO_TAGS.some((x) => x[0] === t)) };
+  } catch { /* ignore */ }
+  return { auto: true, on: ['relief', 'climate', 'province', 'nation'] };
+})();
+let lastProbe: any = null;
+
+function activeTags(): Set<InfoTag> {
+  if (!infoTags.auto) return new Set(infoTags.on);
+  const group = LAYERS.find((l) => l.id === S.layer)?.group ?? 'Planet';
+  const tags = new Set<InfoTag>(AUTO_TAGS[group] ?? ['relief']);
+  if (S.layer === 'transport' || S.layer === 'railways') tags.add('transport');
+  return tags;
+}
+
+function renderInfoTags() {
+  const box = $('#infotags');
+  box.innerHTML = '';
+  const active = activeTags();
+  const save = () => {
+    try { localStorage.setItem('fwm.infotags', JSON.stringify(infoTags)); } catch { /* ignore */ }
+    renderInfoTags();
+    renderHover();
+  };
+  box.append(h('button', { class: infoTags.auto ? 'tag on' : 'tag', title: 'Show what fits the current map layer', onclick: () => {
+    infoTags.auto = !infoTags.auto;
+    if (!infoTags.auto) infoTags.on = [...active];
+    save();
+  } }, 'Auto'));
+  for (const [id, label, tip] of INFO_TAGS) {
+    box.append(h('button', { class: active.has(id) ? (infoTags.auto ? 'tag auto' : 'tag on') : 'tag', title: tip, onclick: () => {
+      const on = new Set(active);
+      if (on.has(id)) on.delete(id); else on.add(id);
+      infoTags.auto = false;
+      infoTags.on = INFO_TAGS.map((t) => t[0]).filter((t) => on.has(t));
+      save();
+    } }, label));
+  }
+}
+
+/** The status-bar text for the last probed cell, limited to the active tags; the tooltip holds everything. */
+function renderHover() {
+  const el = $('#hover');
+  if (infoTags.auto) renderInfoTags();
+  if (!lastProbe) return;
+  const parts = describe(lastProbe);
+  const active = activeTags();
+  const shown = parts.filter(([tag]) => tag === 'place' || active.has(tag as InfoTag));
+  el.textContent = shown.map((x) => x[1]).join('  ·  ');
+  el.title = INFO_TAGS.map(([id, label]) => [label, parts.filter(([t]) => t === id).map((x) => x[1]).join(' · ')])
+    .filter(([, v]) => v).map(([l, v]) => `${l}: ${v}`).join('\n');
+}
+
+function describe(d: any): [string, string][] {
+  const out: [string, string][] = [];
+  let tag = 'place';
+  const parts = { push: (s: string) => out.push([tag, s]) };
   const ns = d.lat >= 0 ? 'N' : 'S', ew = d.lon >= 0 ? 'E' : 'W';
   parts.push(`${Math.abs(d.lat).toFixed(1)}°${ns} ${Math.abs(d.lon).toFixed(1)}°${ew}`);
+  tag = 'relief';
   if (d.elevation !== undefined) parts.push(`${Math.round(d.elevation).toLocaleString()} m`);
   if (d.plate !== undefined) parts.push(`plate #${d.plate}${d.crust === 1 ? ' (continental)' : d.crust === 0 ? ' (oceanic)' : ''}`);
   if (d.boundary) parts.push(BOUNDARY[d.boundary][0]);
+  tag = 'climate';
   const adj = d.temp_adjust ?? 0;
   if (Array.isArray(d.temp)) {
     const mean = d.temp.reduce((a: number, b: number) => a + b, 0) / 12 + adj;
     parts.push(`${mean.toFixed(1)} °C (${(Math.min(...d.temp) + adj).toFixed(0)} to ${(Math.max(...d.temp) + adj).toFixed(0)})`);
   } else if (typeof d.temp === 'number') parts.push(`${(d.temp + adj).toFixed(1)} °C in ${MONTHS[S.month ?? 0]}`);
+  if (d.foehn >= 0.1) parts.push(`Foehn +${d.foehn.toFixed(1)} °C`);
   if (d.p_ann !== undefined) parts.push(`${Math.round(d.p_ann).toLocaleString()} mm/yr`);
   if (d.koppen) parts.push(`${KOPPEN[d.koppen][0]} ${KOPPEN[d.koppen][2]}`);
+  tag = 'land';
   if (d.terrain !== undefined) parts.push(TERRAIN[d.terrain][0]);
-  if (d.river) parts.push(`${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, ${Math.round(d.discharge).toLocaleString()} m³/s, order ${d.river}`);
+  tag = 'water';
+  if (d.river) parts.push(`beside a ${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, order ${d.river}`);
   if (d.lake) parts.push(['', 'fresh lake', 'salt lake', 'dry lake'][d.lake]);
+  tag = 'land';
+  if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
   if (d.habitability !== undefined && d.water === 0) parts.push(`habitability ${d.habitability.toFixed(2)}${d.river_role === 1 ? ', border river' : d.river_role === 2 ? ', backbone river' : ''}`);
   const P = S.political;
+  tag = 'province';
   if (P && d.province) {
     const p = P.byProv.get(d.province);
     if (p) {
@@ -1702,15 +2586,33 @@ function describe(d: any): string {
     const s = P.byState.get(d.state);
     const r = s ? P.byRegion.get(s.region) : null;
     const ct = s ? P.byCont.get(s.continent) : null;
-    if (s) parts.push(`state ${s.name}${r ? ', ' + r.name : ''}${ct ? ', ' + ct.name : ''}`);
+    if (s) parts.push(`state ${s.name} (#${s.id})${r ? ', ' + r.name + ' (region #' + r.id + ')' : ''}${ct ? ', ' + ct.name : ''}`);
   }
-  if (P && d.culture) {
-    const c = P.byCulture.get(d.culture), g = c ? P.byGroup.get(c.group) : null;
-    if (c) parts.push(`${c.name} culture${g ? ' (' + g.name + ')' : ''}`);
+  tag = 'nation';
+  if (d.owner) {
+    const n = SIM.nations.get(d.owner) ?? P?.byNation.get(d.owner);
+    parts.push(n ? `${n.name} (nation #${n.id}, ${n.government})` : `nation #${d.owner}`);
+  } else if (d.owner === 0 && d.water === 0) parts.push('no ruler');
+  tag = 'transport';
+  if (d.railway) parts.push(d.railway === 3 ? 'railway junction' : d.railway === 2 ? 'railway station' : 'railway');
+  if (d.road) parts.push(['', 'track', 'paved road', 'highway'][d.road] ?? 'road');
+  if (d.airport) parts.push('airport');
+  if (d.port === 2) parts.push('port');
+  else if (d.port === 1) parts.push('good harbour');
+  tag = 'nation';
+  if (d.institutions) parts.push(`institutions: ${INSTITUTION_NAMES.filter((_, k) => (d.institutions >> k) & 1).join(', ')}`);
+  if (d.realm && d.owner && d.realm !== d.owner) {
+    const r = SIM.nations.get(d.realm) ?? S.political?.byNation.get(d.realm);
+    parts.push(`realm of ${r ? r.name : '#' + d.realm}${d.imperial ? ' (imperial territory)' : ''}`);
+  }
+  if (d.nation_era) parts.push(`${ERA_NAMES[d.nation_era - 1]} era`);
+  tag = 'culture';
+  if (d.culture) {
+    const c = SIM.cultures.get(d.culture) ?? P?.byCulture.get(d.culture), g = c && P ? P.byGroup.get(c.group) : null;
+    if (c) parts.push(`${c.name} culture (#${c.id})${g ? ' (' + g.name + ')' : ''}${c.locked ? ', locked' : ''}`);
   }
   if (d.population) parts.push(`${d.population.toFixed(1)} people/km²`);
-  if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
-  return parts.join('  ·  ');
+  return out;
 }
 
 function bindKeys() {

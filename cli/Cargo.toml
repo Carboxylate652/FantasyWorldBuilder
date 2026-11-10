@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 worldcore = { path = "../core" }
 fwm-update = { path = "../update" }
+fwm-guide = { path = "../guide" }
 serde_json = "1"
 serde = "1"
 tiny_http = "0.12"

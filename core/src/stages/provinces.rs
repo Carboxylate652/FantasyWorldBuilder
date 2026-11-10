@@ -34,6 +34,7 @@ use crate::edits::{stroke_coverage, Tool};
 use crate::fields::{Field, Fields};
 use crate::graph;
 use crate::names::{self, Lang};
+use crate::rivers::RiverEdges;
 use crate::rng::{hash_unit, stream, Rng};
 use crate::vec3::Vec3;
 use std::collections::{BTreeMap, HashSet};
@@ -76,7 +77,12 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let hab = ctx.input.f32("habitability");
     let bar = ctx.input.f32("barrier");
     let state = ctx.input.u16("state");
-    let river_role = ctx.input.u8("river_role");
+    // Rivers run along cell edges: a border river's crossing cost, and which
+    // edges are border rivers.
+    let river_to = ctx.input.i32("river_to");
+    let river_bar = RiverEdges::new(g, river_to, ctx.input.f32("river_seg_barrier"));
+    let border_seg: Vec<f32> = ctx.input.u8("river_seg_role").iter().map(|&r| (r == role::BORDER) as u8 as f32).collect();
+    let border_river = RiverEdges::new(g, river_to, &border_seg);
     let region = ctx.input.u16("region");
     let cont = ctx.input.u8("continent");
     let area: Vec<f64> = g.area.iter().map(|a| a * r2).collect();
@@ -169,7 +175,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         let mut seeds = partition::poisson(g, &order, &group, |i| (target(i) / 1.2).sqrt() / r_km);
         partition::seed_every_component(g, &group, &order, &mut seeds);
         let bw = pp.barrier_weight.max(0.0);
-        let cost = |a: usize, b: usize| if group[a] >= G_LAKE { 1.0 } else { 1.0 + bw * 0.5 * (bar[a] + bar[b]) as f64 };
+        let cost = |a: usize, b: usize| if group[a] >= G_LAKE { 1.0 } else { 1.0 + bw * (0.5 * (bar[a] + bar[b]) + river_bar.get(g, a, b) * crate::rivers::CROSSING_WEIGHT) as f64 };
         ctx.progress(0.25, "Growing provinces");
         let mut label = partition::grow(g, r_km, &group, &seeds, None, cost);
         for k in 0..pp.lloyd_passes.min(8) {
@@ -304,7 +310,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let near_cont = if cont_src.is_empty() {
         vec![0u32; n]
     } else {
-        graph::multi_source(g, &cont_src, f64::INFINITY, |a, b, _| Some(g.pos[a].angle_to(g.pos[b]))).label
+        graph::multi_source(g, &cont_src, f64::INFINITY, |_a, _b, _, edge_len| Some(edge_len)).label
     };
 
     #[derive(Clone)]
@@ -673,8 +679,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             if b != NONE && a != b {
                 let e = nb_set.entry((a.min(b), a.max(b))).or_default();
                 e.edges += 1;
-                e.barrier += 0.5 * (bar[i] + bar[j]) as f64;
-                if river_role[i] == role::BORDER || river_role[j] == role::BORDER {
+                e.barrier += (0.5 * (bar[i] + bar[j]) + river_bar.get(g, i, j)) as f64;
+                if border_river.get(g, i, j) > 0.0 {
                     e.river += 1;
                 }
             }
@@ -698,7 +704,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let passable_land = |i: usize| land(i) && label[i] != NONE && provs[label[i] as usize].kind == kind::LAND;
     let coast: Vec<(u32, f64, u32)> =
         (0..n).filter(|&i| passable_land(i) && g.neighbors(i).iter().any(|&j| ocean(j as usize))).map(|i| (i as u32, 0.0, i as u32)).collect();
-    let reach = graph::multi_source(g, &coast, max_km, |a, b, _| if ocean(b) { Some(g.pos[a].angle_to(g.pos[b]) * r_km) } else { None });
+    let reach = graph::multi_source(g, &coast, max_km, |_a, b, _, edge_len| if ocean(b) { Some(edge_len * r_km) } else { None });
     let mut straits: BTreeMap<(u32, u32), (f64, usize, usize, usize)> = BTreeMap::new();
     let consider = |from: usize, to: usize, via: usize, km: f64, straits: &mut BTreeMap<(u32, u32), (f64, usize, usize, usize)>| {
         if km > max_km || lm[from] == lm[to] {

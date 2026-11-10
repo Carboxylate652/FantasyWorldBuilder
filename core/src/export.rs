@@ -145,6 +145,9 @@ struct Layers<'a> {
     prov_class: Option<Vec<u8>>,
     prov_rgb: std::collections::HashMap<u32, [u8; 3]>,
     border_noise: Noise,
+    /// Cells on a river's banks: province borders there are not warped, so a
+    /// border along a river stays on the river line.
+    river_bank: Vec<bool>,
 }
 
 fn f32_of<'a>(w: &'a World, name: &str) -> Option<&'a [f32]> {
@@ -193,6 +196,7 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         },
         prov_rgb: province_colors(w),
         border_noise: Noise::new(w.params.planet.seed, stream::BORDER_NOISE),
+        river_bank: if fresh(Step::Hydrology) { f32_of(w, "river_width").map(|v| v.iter().map(|&x| x > 0.0).collect()).unwrap_or_default() } else { Vec::new() },
     };
     let (wpx, hpx) = (opts.width.clamp(64, 32768) as usize, opts.height.clamp(32, 16384) as usize);
     let noise = Noise::new(w.params.planet.seed, stream::EXPORT_NOISE);
@@ -307,6 +311,12 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
                 write_cultures_png(dir, &r, &cm["table"], &prov_info, wpx, hpx)?;
                 files.push("cultures.png".into());
             }
+            if let Some(nm) = w.meta(Step::Nations).filter(|_| fresh(Step::Nations) && fresh(Step::Cultures)) {
+                progress(0.34, "Writing nations.png, railways.png and transport.png");
+                let centers: std::collections::HashMap<u32, (f64, f64)> = w.meta(Step::Provinces).map(|m| m["table"]["provinces"].as_array().into_iter().flatten().filter_map(|p| Some((p["id"].as_u64()? as u32, (p["center"][0].as_f64()?, p["center"][1].as_f64()?)))).collect()).unwrap_or_default();
+                write_nations_png(dir, &r, &nm["table"], &centers, &prov_info, wpx, hpx, opts)?;
+                files.extend(["nations.png".to_string(), "railways.png".to_string(), "transport.png".to_string()]);
+            }
             Some(r)
         }
         _ => None,
@@ -378,13 +388,23 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
     // Rivers.
     if w.is_fresh(Step::Hydrology) {
         progress(0.9, "Drawing rivers");
-        let river = u8_of(w, "river_rank").ok_or("no rivers")?;
-        let recv = match w.field("receiver") {
+        // Rivers run along cell edges, from corner to corner.
+        let to = match w.field("river_to") {
             Some((Field::I32(v), _, _)) => v.as_slice(),
-            _ => return Err("no receivers".into()),
+            _ => return Err("no rivers".into()),
         };
-        let discharge = f32_of(w, "discharge").ok_or("no discharge")?;
-        let img = draw_rivers(&grid, river, recv, discharge, &water, wpx, hpx, opts);
+        let width = f32_of(w, "river_seg_width").ok_or("no river widths")?;
+        let discharge = f32_of(w, "river_seg_discharge").ok_or("no discharge")?;
+        let hp = &w.params.hydrology;
+        let w_thr = hp.width_coeff * hp.river_threshold_m3s.max(1.0).powf(hp.width_exponent);
+        let rank: Vec<u8> = width.iter().map(|&x| if x > 0.0 { (1.0 + 2.0 * (x as f64 / w_thr).log2().max(0.0)).min(9.0) as u8 } else { 0 }).collect();
+        let corner_ll: Vec<(f64, f64)> = (0..to.len())
+            .map(|t| {
+                let (la, lo) = grid.corner_pos(t).lat_lon();
+                (la.to_degrees(), lo.to_degrees())
+            })
+            .collect();
+        let img = draw_rivers(&corner_ll, &rank, to, discharge, &water, wpx, hpx, opts);
         let mut e = encoder(mk("rivers.png")?, png::ColorType::Indexed, png::BitDepth::Eight, Some(river_palette()))
             .write_header()
             .map_err(|e| e.to_string())?;
@@ -394,21 +414,20 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
 
         // Vector rivers with per-vertex width and discharge, for spline-based
         // river renderers (e.g. Victoria 3 style) and GIS tools.
-        let width = f32_of(w, "river_width").ok_or("no river widths")?;
         let mut feats = Vec::new();
-        for (q, chain) in river_chains(grid.len(), river, recv, discharge) {
+        for (q, chain) in river_chains(to, discharge) {
             let mut coords: Vec<[f64; 2]> = Vec::with_capacity(chain.len());
             let mut widths = Vec::with_capacity(chain.len());
             let mut flows = Vec::with_capacity(chain.len());
             for &c in &chain {
-                let lon = grid.lon[c].to_degrees();
+                let (lat, lon) = corner_ll[c];
                 // Keep the line continuous across the antimeridian (lon may leave ±180).
                 let lon = match coords.last() {
                     Some(&[pl, _]) if lon - pl > 180.0 => lon - 360.0,
                     Some(&[pl, _]) if lon - pl < -180.0 => lon + 360.0,
                     _ => lon,
                 };
-                coords.push([(lon * 1e4).round() / 1e4, (grid.lat[c].to_degrees() * 1e4).round() / 1e4]);
+                coords.push([(lon * 1e4).round() / 1e4, (lat * 1e4).round() / 1e4]);
                 // The last vertex is the confluence (or the sea): keep this river's own values there.
                 let idx = flows.len();
                 let k = if idx + 1 == chain.len() && idx > 0 { chain[idx - 1] } else { c };
@@ -437,6 +456,9 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         files.extend(write_tables(dir, &table, wpx, hpx, opts)?);
         if let Some(cm) = cultures {
             files.extend(write_culture_tables(dir, &cm["table"])?);
+            if let Some(nm) = w.meta(Step::Nations).filter(|_| fresh(Step::Nations)) {
+                files.extend(write_nation_tables(dir, &nm["table"])?);
+            }
         }
     }
 
@@ -455,7 +477,7 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         "terrain_palette": TERRAIN.iter().enumerate().map(|(i, (n, c))| serde_json::json!({"index": i, "name": n, "rgb": c})).collect::<Vec<_>>(),
         "koppen_colors": KOPPEN.iter().map(|(n, c)| serde_json::json!({"class": n, "rgb": c})).collect::<Vec<_>>(),
         "rivers": {"0": "source", "1": "merge (tributary end)", "2": "split", "3-11": "width class: each step is ×√2 in width, from the threshold river (3) up", "254": "land", "255": "water"},
-        "rivers_geojson": "rivers.geojson: one LineString per river from source to confluence or mouth, with width_m and discharge_m3s per vertex (width = a·Q^b)",
+        "rivers_geojson": "rivers.geojson: one LineString per river from source to confluence or mouth, running along cell edges (vertices are cell corners), with width_m and discharge_m3s per vertex (width = a·Q^b)",
         "river_width": { "coeff": w.params.hydrology.width_coeff, "exponent": w.params.hydrology.width_exponent },
         "provinces": {
             "provinces.png": "one unique RGB colour per province, nearest-cell sampling (no anti-aliasing); borders are noise-warped by up to a third of a grid cell; islets and ponds made only by detail noise are removed, stray pieces merged and X-crossings broken up (see province_cleanup)",
@@ -470,6 +492,21 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
             "culture_groups.csv": "id;name;color;population;cultures",
             "culture_events.csv": "year;event (emerged, split, merged, extinct);culture;other (parent of a split, culture a merge went into)",
             "province_cultures.csv": "province;population;culture (majority);shares (culture:share, shares ≥ 5%)",
+            "nations.png": "reference map at the start date: provinces coloured by owner, borders between nations dark, unruled land grey; railways dark with white stations",
+            "railways.png": "reference map: land grey, railways black, stations red, junctions (where lines meet and travellers change) blue",
+            "transport.png": "reference map: land grey with nation borders, roads (track light brown, paved road dark brown, highway orange), railways black with stations red and junctions blue, ports dark blue, airports purple",
+            "nations.csv": "id;name;government (city-state, kingdom, empire);color;capital_province;capital_name;primary_culture;culture_name;provinces;population;overseas_provinces;founded;ended;fate;fate_other;parent;era (early, gunpowder, ocean shipping, industry, fertilizer, motor age, air age);tech (technology year);treasury;income (per year);integration (0–1, people-weighted);track_km;paved_km;highway_km;rail_km;stations;airports;ports;liege (feudal liege, 0 = independent);rank (emperor, king, duke);realm (top of its feudal chain);empire;institutions (share of provinces that embraced each of the six institutions) — every nation that ever existed (infrastructure at the start date, or when it ended)",
+            "nation_events.csv": "year;event (founded, independence, conquest of a capital, war summary, colony, union, renamed, era, railway, highway, airport, bankruptcy, metropolis, ruined, capital, ended);nation;other;province;text",
+            "railways.csv": "id;name;owner (nation that built it);opened;closed (empty while open);km;stations (province ids);provinces (province ids along the line, in order)",
+            "ports.csv": "province;name;owner;opened;harbour (0–1: calm winds, deep water, shelter, river mouth, no winter ice)",
+            "titles.csv": "empire;level (empire, king, duke, count, baron);title;holder (nation id);liege (nation id);province (counties and baronies) — the feudal titles of the empires at the start date",
+            "institutions.csv": "index;institution;era (it opens);earliest (birth year);born;province (birthplace);province_name;embraced_provinces;nations_in_era",
+            "stations.csv": "province;name;owner;junction (two or more open lines stop here: travellers can change lines, at a time cost);lines (line ids)",
+            "roads.csv": "from;to (neighbouring province ids);quality (1 track, 2 paved road, 3 highway);kind;built (year of the last upgrade);km",
+            "airports.csv": "province;name;owner;opened",
+            "cities.csv": "rank;province;name;owner;population;capital;station;attraction (−1 to +1 at the start date);peak_population;peak_year — the 100 largest cities",
+            "ruins.csv": "province;name;population;peak_population;peak_year — cities that lost three quarters of their people (war, devastation, abandonment) and never recovered",
+            "province_nations.csv": "province;owner (nation, 0 = none);culture (majority at the start date, after assimilation);shares;population;railway (0 none, 1 track, 2 station, 3 junction);road (best road touching it: 0 none, 1 track, 2 paved, 3 highway);airport;integration (0–1: how well its owner's capital reaches it);port;harbour;institutions (embraced);realm",
             "trade_goods.csv": "good;kind (trade good, deposit, sea zone);category (staple, cash crop, livestock, forest, mineral, energy, sea);provinces;area_km2 — how much of the world has each good",
             "province_adjacency.csv": "from;to;type;border_km;barrier;crossing_km — every border between two provinces; type: land, river (along a border river), impassable (wasteland), coast (land–sea), lake, sea, strait (crossing_km = width); barrier = mean crossing cost of the border (0 = open)",
         },
@@ -609,7 +646,8 @@ fn province_pixel(g: &Grid, l: &Layers, prov: &[u32], cls: &[u8], noise: &Noise,
 /// matching neighbour of the nearest corner.
 #[allow(clippy::too_many_arguments)]
 fn province_at(g: &Grid, l: &Layers, prov: &[u32], cls: &[u8], p: Vec3, c: [usize; 3], wt: [f64; 3], want: u8) -> Option<u32> {
-    let amp = g.spacing * 0.35;
+    let on_river = !l.river_bank.is_empty() && c.iter().any(|&k| l.river_bank[k]);
+    let amp = if on_river { 0.0 } else { g.spacing * 0.35 };
     let f = 1.0 / (g.spacing * 3.0);
     let warp = Vec3::new(
         l.border_noise.fbm(p, f, 2),
@@ -884,6 +922,258 @@ fn write_cultures_png(dir: &Path, r: &clean::ProvRaster, t: &serde_json::Value, 
     wr.finish().map_err(|e| e.to_string())
 }
 
+/// nations.png (owners, borders, railways), railways.png and transport.png
+/// (roads by quality, railways with junctions, airports).
+#[allow(clippy::too_many_arguments)]
+fn write_nations_png(
+    dir: &Path,
+    r: &clean::ProvRaster,
+    t: &serde_json::Value,
+    centers: &std::collections::HashMap<u32, (f64, f64)>,
+    info: &std::collections::HashMap<u32, (u8, u16)>,
+    wpx: usize,
+    hpx: usize,
+    o: &ExportOptions,
+) -> Result<(), String> {
+    let mut owner_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for p in t["provinces"].as_array().into_iter().flatten() {
+        owner_of.insert(p["id"].as_u64().unwrap_or(0) as u32, p["owner"].as_u64().unwrap_or(0) as u32);
+    }
+    let mut color: std::collections::HashMap<u32, [u8; 3]> = std::collections::HashMap::new();
+    for n in t["nations"].as_array().into_iter().flatten() {
+        let c = &n["color"];
+        color.insert(n["id"].as_u64().unwrap_or(0) as u32, [c[0].as_u64().unwrap_or(0) as u8, c[1].as_u64().unwrap_or(0) as u8, c[2].as_u64().unwrap_or(0) as u8]);
+    }
+    // Railways as a pixel mask (1 track, 2 station, 3 junction), roads (1
+    // track, 2 paved, 3 highway) and airports.
+    let mut mask = vec![0u8; wpx * hpx];
+    let mut roads = vec![0u8; wpx * hpx];
+    let to_px = |id: u64| -> Option<(i64, i64)> {
+        let &(lat, lon) = centers.get(&(id as u32))?;
+        if lat < o.lat_min || lat > o.lat_max {
+            return None;
+        }
+        Some((((lon + 180.0) / 360.0 * wpx as f64).floor() as i64, ((o.lat_max - lat) / (o.lat_max - o.lat_min) * hpx as f64).floor() as i64))
+    };
+    let plot = |m: &mut [u8], x: i64, y: i64, v: u8, rad: i64| {
+        for dy in -rad..=rad {
+            for dx in -rad..=rad {
+                let (xx, yy) = ((x + dx).rem_euclid(wpx as i64), y + dy);
+                if yy >= 0 && (yy as usize) < hpx {
+                    let k = yy as usize * wpx + xx as usize;
+                    m[k] = m[k].max(v);
+                }
+            }
+        }
+    };
+    let seg = |m: &mut [u8], a: u64, b: u64, v: u8, rad: i64| {
+        let (Some(a), Some(mut b)) = (to_px(a), to_px(b)) else { return };
+        // Take the short way across the date line.
+        if (b.0 - a.0).abs() > wpx as i64 / 2 {
+            b.0 += if b.0 > a.0 { -(wpx as i64) } else { wpx as i64 };
+        }
+        let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+        for k in 0..=steps {
+            plot(m, a.0 + (b.0 - a.0) * k / steps, a.1 + (b.1 - a.1) * k / steps, v, rad);
+        }
+    };
+    let thick = ((wpx as f64 / 4096.0).round() as i64).max(0);
+    let junctions: std::collections::HashSet<u64> =
+        t["stations"].as_array().into_iter().flatten().filter(|s| s["junction"].as_bool() == Some(true)).filter_map(|s| s["province"].as_u64()).collect();
+    for line in t["railways"].as_array().into_iter().flatten().filter(|l| l["closed"].is_null()) {
+        let path: Vec<u64> = line["provinces"].as_array().into_iter().flatten().filter_map(|v| v.as_u64()).collect();
+        for w in path.windows(2) {
+            seg(&mut mask, w[0], w[1], 1, thick);
+        }
+        for s in line["stations"].as_array().into_iter().flatten().filter_map(|v| v.as_u64()) {
+            if let Some((x, y)) = to_px(s) {
+                plot(&mut mask, x, y, if junctions.contains(&s) { 3 } else { 2 }, thick + 1);
+            }
+        }
+    }
+    for r in t["roads"].as_array().into_iter().flatten() {
+        let q = r["quality"].as_u64().unwrap_or(1).clamp(1, 3) as u8;
+        seg(&mut roads, r["from"].as_u64().unwrap_or(0), r["to"].as_u64().unwrap_or(0), q, if q == 3 { thick + 1 } else { thick });
+    }
+    // Airports (1) and ports (2) as squares at their province's centre.
+    let mut air_mask = vec![0u8; wpx * hpx];
+    for (key, v) in [("ports", 2u8), ("airports", 1u8)] {
+        for a in t[key].as_array().into_iter().flatten() {
+            if let Some((x, y)) = to_px(a["province"].as_u64().unwrap_or(0)) {
+                plot(&mut air_mask, x, y, v, thick + 3);
+            }
+        }
+    }
+    let enc = |name: &str| -> Result<png::StreamWriter<'static, BufWriter<File>>, String> {
+        let file = File::create(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
+        let mut e = png::Encoder::new(BufWriter::new(file), wpx as u32, hpx as u32);
+        e.set_color(png::ColorType::Rgb);
+        e.set_depth(png::BitDepth::Eight);
+        e.set_compression(png::Compression::Fast);
+        e.write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())
+    };
+    let mut nw = enc("nations.png")?;
+    let mut rw = enc("railways.png")?;
+    let mut tw = enc("transport.png")?;
+    // (owner, class) per province id: class 0 land, 2 lake, 3 sea.
+    let key = |id: u32| -> (u32, u8) {
+        let k = info.get(&id).map_or(3, |x| x.0);
+        if k >= 2 {
+            (0, k)
+        } else {
+            (owner_of.get(&id).copied().unwrap_or(0), 0)
+        }
+    };
+    let mut nl = vec![0u8; wpx * 3];
+    let mut rl = vec![0u8; wpx * 3];
+    let mut tl = vec![0u8; wpx * 3];
+    let mut prev: Vec<(u32, u8)> = Vec::new();
+    for y in 0..hpx {
+        let row: Vec<(u32, u8)> = r.ids[y * wpx..(y + 1) * wpx].iter().map(|&id| key(id)).collect();
+        for x in 0..wpx {
+            let (n, k) = row[x];
+            let water = match k {
+                2 => Some([110, 160, 215]),
+                3 => Some([40, 70, 120]),
+                _ => None,
+            };
+            let mut rgb = water.unwrap_or_else(|| if n > 0 { color.get(&n).copied().unwrap_or([150, 146, 138]) } else { [150, 146, 138] });
+            let mut border = false;
+            if k == 0 {
+                let nbs = [if x > 0 { Some(row[x - 1]) } else { None }, prev.get(x).copied()];
+                if nbs.into_iter().flatten().any(|nb| nb.1 == 0 && nb.0 != n) {
+                    rgb = rgb.map(|v| (v as f64 * 0.45) as u8);
+                    border = true;
+                }
+            }
+            let i = y * wpx + x;
+            let m = mask[i];
+            let rail_rgb = match m {
+                3 => Some(([255, 255, 255], [30, 90, 220])),
+                2 => Some(([255, 255, 255], [200, 30, 30])),
+                1 => Some(([25, 25, 25], [0, 0, 0])),
+                _ => None,
+            };
+            let base_r = water.map(|w| w.map(|v| ((v as u32 + 255) / 2) as u8)).unwrap_or([205, 200, 190]);
+            let (a, b) = match rail_rgb {
+                Some((a, b)) => (a, b),
+                None => (rgb, base_r),
+            };
+            // transport.png: roads by quality under the railways, airports on top.
+            let base_t = if border && water.is_none() { [165, 160, 150] } else { base_r };
+            let tc = if air_mask[i] == 1 {
+                [140, 40, 170]
+            } else if air_mask[i] == 2 {
+                [20, 90, 170]
+            } else if let Some((_, b)) = rail_rgb {
+                b
+            } else {
+                match roads[i] {
+                    3 => [235, 130, 20],
+                    2 => [125, 85, 50],
+                    1 => [175, 150, 115],
+                    _ => base_t,
+                }
+            };
+            nl[x * 3..x * 3 + 3].copy_from_slice(&a);
+            rl[x * 3..x * 3 + 3].copy_from_slice(&b);
+            tl[x * 3..x * 3 + 3].copy_from_slice(&tc);
+        }
+        nw.write_all(&nl).map_err(|e| e.to_string())?;
+        rw.write_all(&rl).map_err(|e| e.to_string())?;
+        tw.write_all(&tl).map_err(|e| e.to_string())?;
+        prev = row;
+    }
+    tw.finish().map_err(|e| e.to_string())?;
+    nw.finish().map_err(|e| e.to_string())?;
+    rw.finish().map_err(|e| e.to_string())
+}
+
+/// nations.csv, nation_events.csv, railways.csv, stations.csv, roads.csv,
+/// airports.csv, province_nations.csv, cities.csv, ruins.csv.
+fn write_nation_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>, String> {
+    let empty = vec![];
+    let arr = |k: &str| t[k].as_array().unwrap_or(&empty);
+    let write = |name: &str, text: String| std::fs::write(dir.join(name), text).map_err(|e| format!("{name}: {e}"));
+    let hexc = |c: &serde_json::Value| format!("x{:02X}{:02X}{:02X}", c[0].as_u64().unwrap_or(0), c[1].as_u64().unwrap_or(0), c[2].as_u64().unwrap_or(0));
+    let opt = |v: &serde_json::Value| if v.is_null() { String::new() } else { csv_text(v) };
+    let ids = |v: &serde_json::Value| v.as_array().map(|a| a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    let mut na = String::from("id;name;government;color;capital_province;capital_name;primary_culture;culture_name;provinces;population;overseas_provinces;founded;ended;fate;fate_other;parent;era;tech;treasury;income;integration;track_km;paved_km;highway_km;rail_km;stations;airports;ports;liege;rank;realm;empire;institutions\n");
+    for n in arr("nations") {
+        let rk = &n["road_km"];
+        let inst = n["institutions"].as_array().map(|a| a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        na += &format!(
+            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
+            n["id"], csv_text(&n["name"]), csv_text(&n["government"]), hexc(&n["color"]), n["capital"], csv_text(&n["capital_name"]), n["primary_culture"], csv_text(&n["culture_name"]),
+            n["provinces"], n["population"], n["overseas_provinces"], n["founded"], opt(&n["ended"]), opt(&n["fate"]), n["fate_other"], n["parent"],
+            csv_text(&n["era"]), n["tech"], n["treasury"], n["income"], n["integration"], rk["track"], rk["paved"], rk["highway"], n["rail_km"], n["stations"], n["airports"],
+            n["ports"], n["liege"], csv_text(&n["rank"]), n["realm"], opt(&n["empire"]), inst,
+        );
+    }
+    write("nations.csv", na)?;
+    let mut ev = String::from("year;event;nation;other;province;text\n");
+    for e in arr("events") {
+        ev += &format!("{};{};{};{};{};{}\n", e["year"], csv_text(&e["event"]), e["nation"], e["other"], opt(&e["province"]), csv_text(&e["text"]));
+    }
+    write("nation_events.csv", ev)?;
+    let mut rw = String::from("id;name;owner;opened;closed;km;stations;provinces\n");
+    for r in arr("railways") {
+        rw += &format!("{};{};{};{};{};{};{};{}\n", r["id"], csv_text(&r["name"]), r["owner"], r["opened"], opt(&r["closed"]), r["km"], ids(&r["stations"]), ids(&r["provinces"]));
+    }
+    write("railways.csv", rw)?;
+    let mut st = String::from("province;name;owner;junction;lines\n");
+    for s in arr("stations") {
+        st += &format!("{};{};{};{};{}\n", s["province"], csv_text(&s["name"]), s["owner"], s["junction"], ids(&s["lines"]));
+    }
+    write("stations.csv", st)?;
+    let mut ro = String::from("from;to;quality;kind;built;km\n");
+    for r in arr("roads") {
+        ro += &format!("{};{};{};{};{};{}\n", r["from"], r["to"], r["quality"], csv_text(&r["kind"]), r["built"], r["km"]);
+    }
+    write("roads.csv", ro)?;
+    let mut ai = String::from("province;name;owner;opened\n");
+    for a in arr("airports") {
+        ai += &format!("{};{};{};{}\n", a["province"], csv_text(&a["name"]), a["owner"], a["opened"]);
+    }
+    write("airports.csv", ai)?;
+    let mut po = String::from("province;name;owner;opened;harbour\n");
+    for a in arr("ports") {
+        po += &format!("{};{};{};{};{}\n", a["province"], csv_text(&a["name"]), a["owner"], a["opened"], a["harbour"]);
+    }
+    write("ports.csv", po)?;
+    let mut ti = String::from("empire;level;title;holder;liege;province\n");
+    for a in arr("titles") {
+        ti += &format!("{};{};{};{};{};{}\n", a["empire"], csv_text(&a["level"]), csv_text(&a["title"]), a["holder"], a["liege"], opt(&a["province"]));
+    }
+    write("titles.csv", ti)?;
+    let mut pn = String::from("province;owner;culture;shares;population;railway;road;airport;port;harbour;integration;institutions;realm\n");
+    for p in arr("provinces") {
+        let sh = p["shares"].as_array().map(|a| a.iter().map(|s| format!("{}:{}", s[0], s[1])).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        let inst = p["institutions"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        pn += &format!(
+            "{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
+            p["id"], p["owner"], p["culture"], sh, p["population"], p["railway"], p["road"], p["airport"], p["port"], p["harbour"], p["integration"], inst, p["realm"]
+        );
+    }
+    write("province_nations.csv", pn)?;
+    let mut ci = String::from("rank;province;name;owner;population;capital;station;attraction;peak_population;peak_year\n");
+    for (k, c) in arr("cities").iter().enumerate() {
+        ci += &format!("{};{};{};{};{};{};{};{};{};{}\n", k + 1, c["province"], csv_text(&c["name"]), c["owner"], c["population"], c["capital"], c["station"], c["attraction"], c["peak"], c["peak_year"]);
+    }
+    write("cities.csv", ci)?;
+    let mut ru = String::from("province;name;population;peak_population;peak_year\n");
+    for r in arr("ruins") {
+        ru += &format!("{};{};{};{};{}\n", r["province"], csv_text(&r["name"]), r["population"], r["peak"], r["peak_year"]);
+    }
+    write("ruins.csv", ru)?;
+    let mut ins = String::from("index;institution;era;earliest;born;province;province_name;embraced_provinces;nations_in_era\n");
+    for a in arr("institutions") {
+        ins += &format!("{};{};{};{};{};{};{};{};{}\n", a["index"], csv_text(&a["name"]), csv_text(&a["era"]), a["earliest"], opt(&a["born"]), opt(&a["province"]), opt(&a["province_name"]), a["embraced_provinces"], a["nations_in_era"]);
+    }
+    write("institutions.csv", ins)?;
+    Ok(["nations.csv", "nation_events.csv", "railways.csv", "stations.csv", "roads.csv", "airports.csv", "ports.csv", "titles.csv", "institutions.csv", "province_nations.csv", "cities.csv", "ruins.csv"].map(String::from).to_vec())
+}
+
 /// cultures.csv, culture_groups.csv, culture_events.csv, province_cultures.csv.
 fn write_culture_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>, String> {
     let empty = vec![];
@@ -921,58 +1211,54 @@ fn write_culture_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>
 
 /// River chains, biggest first: each runs from a source down its main stem to
 /// where it joins a bigger river (inclusive) or reaches water.
-fn river_chains(n: usize, rank: &[u8], recv: &[i32], discharge: &[f32]) -> Vec<(f32, Vec<usize>)> {
-    // Main upstream of each river cell = the river donor with the most discharge.
-    let mut main_up = vec![-1i32; n];
-    for i in 0..n {
-        if rank[i] == 0 {
-            continue;
-        }
-        let r = recv[i];
-        if r >= 0 && rank[r as usize] > 0 {
+/// River courses over the corner tree (`to[t]` ≥ 0 on a river), each from its
+/// source down to where it joins a bigger river or reaches water, with the
+/// discharge it brings there. The last corner is the confluence or the shore.
+fn river_chains(to: &[i32], discharge: &[f32]) -> Vec<(f32, Vec<usize>)> {
+    let nt = to.len();
+    // Main upstream of each river corner = the river donor with the most discharge.
+    let mut main_up = vec![-1i32; nt];
+    for t in 0..nt {
+        let r = to[t];
+        if r >= 0 && to[r as usize] >= 0 {
             let r = r as usize;
-            if main_up[r] < 0 || discharge[i] > discharge[main_up[r] as usize] {
-                main_up[r] = i as i32;
+            if main_up[r] < 0 || discharge[t] > discharge[main_up[r] as usize] {
+                main_up[r] = t as i32;
             }
         }
     }
-    // Chains: from each source down to where it joins a bigger river or water.
     let mut chains: Vec<(f32, Vec<usize>)> = Vec::new();
-    for s in 0..n {
-        if rank[s] == 0 || main_up[s] >= 0 {
+    for s in 0..nt {
+        if to[s] < 0 || main_up[s] >= 0 {
             continue;
         }
         let mut chain = vec![s];
         let mut c = s;
         loop {
-            let r = recv[c];
+            let r = to[c];
             if r < 0 {
                 break;
             }
             let r = r as usize;
             chain.push(r);
-            if rank[r] == 0 || main_up[r] != c as i32 {
+            if to[r] < 0 || main_up[r] != c as i32 {
                 break;
             }
             c = r;
         }
-        // The last cell is the confluence or the sea: rank by this river's own flow.
         let q = discharge[chain[chain.len().saturating_sub(2)]];
         chains.push((q, chain));
     }
     chains.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1[0].cmp(&b.1[0])));
-
     chains
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_rivers(g: &Grid, rank: &[u8], recv: &[i32], discharge: &[f32], water: &[bool], w: usize, h: usize, o: &ExportOptions) -> Vec<u8> {
+fn draw_rivers(corner_ll: &[(f64, f64)], rank: &[u8], to: &[i32], discharge: &[f32], water: &[bool], w: usize, h: usize, o: &ExportOptions) -> Vec<u8> {
     use river_px::*;
     let mut img: Vec<u8> = water.iter().map(|&wt| if wt { WATER } else { LAND }).collect();
-    let n = g.len();
     let to_px = |i: usize| -> Option<(i64, i64)> {
-        let lat = g.lat[i].to_degrees();
-        let lon = g.lon[i].to_degrees();
+        let (lat, lon) = corner_ll[i];
         if lat < o.lat_min || lat > o.lat_max {
             return None;
         }
@@ -980,7 +1266,7 @@ fn draw_rivers(g: &Grid, rank: &[u8], recv: &[i32], discharge: &[f32], water: &[
         let y = ((o.lat_max - lat) / (o.lat_max - o.lat_min) * h as f64).floor() as i64;
         Some((x.clamp(0, w as i64 - 1), y.clamp(0, h as i64 - 1)))
     };
-    let chains = river_chains(n, rank, recv, discharge);
+    let chains = river_chains(to, discharge);
 
     for (_, chain) in &chains {
         let mut first = true;

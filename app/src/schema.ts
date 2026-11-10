@@ -1,5 +1,5 @@
 // UI description of the pipeline steps (seven for Stage 1, three for Stage 2,
-// one for Stage 3):
+// one each for Stages 3 and 4):
 // parameters, default layer and tools.
 
 import type { LayerId } from './layers';
@@ -17,11 +17,13 @@ export type Param = {
 
 export type ToolId =
   | 'navigate' | 'land' | 'sea' | 'mountain' | 'erase_hint' | 'scatter_land' | 'scatter_sea' | 'scatter_mountain' | 'pin' | 'arrow' | 'plate_paint'
-  | 'raise' | 'lower' | 'smooth' | 'flatten' | 'biome_paint' | 'biome_erase'
+  | 'raise' | 'lower' | 'smooth' | 'flatten' | 'old_mountain' | 'scatter_old_mountain' | 'old_mountain_erase' | 'biome_paint' | 'biome_erase'
   | 'barrier_paint' | 'barrier_erase' | 'site_pin' | 'state_paint' | 'province_paint'
-  | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase'
+  | 'fertility_paint' | 'fertility_erase' | 'band_pin' | 'band_erase' | 'nation_seed' | 'nation_seed_erase'
   | 'attraction' | 'attraction_erase'
-  | 'goods_paint' | 'province_merge' | 'state_merge' | 'province_to_state' | 'rename_province' | 'rename_state';
+  | 'goods_paint' | 'province_merge' | 'state_merge' | 'province_to_state' | 'rename_province' | 'rename_state'
+  | 'city_pin' | 'city_unpin'
+  | 'culture_merge' | 'culture_paint' | 'culture_split' | 'culture_split_traits' | 'culture_reparent' | 'rename_culture' | 'culture_new_name' | 'culture_lock';
 
 export type ToolDef = {
   id: ToolId;
@@ -30,7 +32,7 @@ export type ToolDef = {
   step: string; // step the edit belongs to (auto-run target)
   rust?: string; // core Tool name when it differs from the id
   scatter?: boolean; // noisy natural edge (scatter brush)
-  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people' | 'fertility' | 'bands' | 'goods' | 'attraction';
+  value?: 'metres' | 'plate' | 'terrain' | 'pin' | 'speed' | 'barrier' | 'people' | 'fertility' | 'bands' | 'goods' | 'attraction' | 'provinces' | 'parts';
   /** Click (or drag from a start to an end point) instead of painting with a brush. */
   gesture?: 'point' | 'link';
   /** Asks for a name when used. */
@@ -55,6 +57,9 @@ export const TOOLS: ToolDef[] = [
   { id: 'lower', label: 'Lower', step: 'relief', value: 'metres', defaultValue: 600, hint: 'Lower elevation (override layer).' },
   { id: 'smooth', label: 'Smooth', step: 'relief', hint: 'Smooth elevation (override layer).' },
   { id: 'flatten', label: 'Flatten', step: 'relief', value: 'metres', defaultValue: 200, hint: 'Flatten toward a target elevation (override layer).' },
+  { id: 'old_mountain', label: 'Old mountains', key: 'w', step: 'relief', defaultValue: 1, hint: 'Add worn, rounded mountains from noise (not from plates): hills and old ranges like the Appalachians or the Urals. Strength sets how much.' },
+  { id: 'scatter_old_mountain', label: 'Scatter old mountains', step: 'relief', rust: 'old_mountain', scatter: true, defaultValue: 1, hint: 'Old mountains in broken, patchy clusters.' },
+  { id: 'old_mountain_erase', label: 'Flatten old mountains', step: 'relief', hint: 'Remove the old (noise) mountains under the brush. Ranges raised by plates stay.' },
   { id: 'biome_paint', label: 'Biome paint', key: 'b', step: 'biomes', value: 'terrain', defaultValue: 5, hint: 'Force a game terrain (override layer).' },
   { id: 'biome_erase', label: 'Biome erase', step: 'biomes', hint: 'Remove biome paint.' },
   { id: 'barrier_paint', label: 'Add barrier', key: 'k', step: 'habitability', value: 'barrier', defaultValue: 6, hint: 'Make land costly to cross, so state and province borders follow your stroke.' },
@@ -66,6 +71,10 @@ export const TOOLS: ToolDef[] = [
   { id: 'band_erase', label: 'Remove founder', step: 'cultures', gesture: 'point', hint: 'Click near a founding-band pin to remove it.' },
   { id: 'attraction', label: 'Attraction', key: 'h', step: 'cultures', value: 'attraction', defaultValue: 0.8, hint: 'Paint where people are drawn (+, up to 5× as many: a metropolis) or driven away (−, down to none: a ghost town) during the culture simulation. States and provinces stay as they are.' },
   { id: 'attraction_erase', label: 'Erase attraction', step: 'cultures', hint: 'Remove attraction paint under the brush.' },
+  { id: 'nation_seed', label: 'Nation seed', key: 'x', step: 'nations', gesture: 'link', value: 'provinces', defaultValue: 0, hint: 'Click a province to found a nation there at the start year, with the name you give (empty: its capital\'s name) and this many provinces around its capital (0: the default size). Drag from a seed to move it. Seeds come before the initial nations placed by chance.' },
+  { id: 'nation_seed_erase', label: 'Remove seed', step: 'nations', gesture: 'point', hint: 'Click near a nation seed to remove it.' },
+  { id: 'city_pin', label: 'City pin', key: 'y', step: 'nations', gesture: 'link', value: 'attraction', defaultValue: 0.8, hint: 'In a live Stage 4 run: click a province to make it draw people (+, a boom town or metropolis) or lose them (−, an abandoned city) from now on. Drag from a pin to move it.' },
+  { id: 'city_unpin', label: 'Remove city pin', step: 'nations', gesture: 'point', hint: 'In a live Stage 4 run: click near a city pin to remove it.' },
   { id: 'goods_paint', label: 'Paint goods', key: 'q', step: 'provinces', value: 'goods', defaultValue: 1, hint: 'Provinces under the brush get this trade good, or gain or lose a deposit.' },
   { id: 'province_merge', label: 'Merge provinces', key: 'u', step: 'provinces', gesture: 'link', hint: 'Drag from a province (an island, a sliver) onto the province that should absorb it.' },
   { id: 'state_merge', label: 'Merge states', step: 'states', gesture: 'link', hint: 'Drag from a state onto the state that should absorb it.' },
@@ -74,18 +83,31 @@ export const TOOLS: ToolDef[] = [
   { id: 'rename_state', label: 'Rename state', step: 'states', gesture: 'point', rename: true, hint: 'Click a state and type its new name. Culture names will not replace it.' },
   { id: 'state_paint', label: 'Grow state', key: 'e', step: 'states', hint: 'Start the stroke inside a state, then paint: every land cell you cover joins that state.' },
   { id: 'province_paint', label: 'Grow province', key: 'o', step: 'provinces', hint: 'Start inside a province, then paint over its neighbours in the same state.' },
+  // Culture editor: cultures are picked by place, since their ids change when Stage 3 re-runs.
+  { id: 'culture_merge', label: 'Merge cultures', step: 'cultures', gesture: 'link', hint: 'Drag from a culture onto the culture that should absorb it.' },
+  { id: 'culture_paint', label: 'Paint culture', key: 'c', step: 'cultures', hint: 'Start the stroke inside a culture, then paint: provinces mostly under the brush join it.' },
+  { id: 'culture_split', label: 'Split by line', step: 'cultures', hint: 'Draw a line across a culture: the smaller side becomes a daughter culture. Draw a loop around part of a culture to make the provinces inside a daughter culture.' },
+  { id: 'culture_split_traits', label: 'Split by contacts', step: 'cultures', gesture: 'point', value: 'parts', defaultValue: 2, hint: 'Click a culture to split it into this many daughter cultures along the lines where its people are least in touch.' },
+  { id: 'culture_reparent', label: 'Re-parent', step: 'cultures', gesture: 'link', hint: 'Drag from a culture onto its new parent in the family tree (the parent must be older).' },
+  { id: 'rename_culture', label: 'Rename culture', step: 'cultures', gesture: 'point', rename: true, hint: 'Click a culture and type its new name.' },
+  { id: 'culture_new_name', label: 'New name', step: 'cultures', gesture: 'point', hint: 'Click a culture to give it another name from its own language.' },
+  { id: 'culture_lock', label: 'Lock / unlock', step: 'cultures', gesture: 'point', hint: 'Click a culture to lock it as it is now: re-running Stage 3 keeps its provinces and name, other edits leave it alone, and Stage 4 history never changes it. Click a locked culture to unlock it.' },
 ];
 
 /** Map editor (top bar): province, state and goods tools, available whatever step is open. */
-export const EDITOR_TOOLS: ToolId[] = ['province_merge', 'state_merge', 'province_to_state', 'province_paint', 'state_paint', 'rename_province', 'rename_state', 'goods_paint'];
+export const EDITOR_TOOLS: ToolId[] = ['province_merge', 'state_merge', 'province_to_state', 'province_paint', 'state_paint', 'rename_province', 'rename_state', 'goods_paint', 'culture_merge', 'culture_paint', 'culture_split', 'rename_culture', 'culture_lock'];
 
 /** Last step of each stage (the stage buttons run up to it). */
-export const STAGE_ENDS = [{ stage: 1, step: 'biomes' }, { stage: 2, step: 'provinces' }, { stage: 3, step: 'cultures' }];
+export const STAGE_ENDS = [{ stage: 1, step: 'biomes' }, { stage: 2, step: 'provinces' }, { stage: 3, step: 'cultures' }, { stage: 4, step: 'nations' }];
 
 /** Index of the first Stage 2 step. */
 export const STAGE2_START = 7;
 /** Index of the first Stage 3 step. */
 export const STAGE3_START = 10;
+/** Index of the first Stage 4 step. */
+export const STAGE4_START = 11;
+/** Steps that can run step by step (live simulation, directives, AI guide). */
+export const LIVE_STEPS = ['cultures', 'nations'];
 
 export type StepUI = {
   key: string;
@@ -113,14 +135,15 @@ export const STEPS: StepUI[] = [
       p('planet', 'perihelion_deg', 'Perihelion longitude (°)', 0, 360, 1),
       p('planet', 'solar_constant', 'Solar constant (W/m²)', 600, 2500, 1),
       p('planet', 'greenhouse', 'Greenhouse strength', 0.1, 8, 0.05, '1 = Earth. Each doubling adds about 30 W/m² of forcing.'),
-      p('planet', 'ocean_fraction', 'Target ocean fraction', 0.05, 0.95, 0.01, 'Used when continents are generated automatically.'),
+      p('planet', 'ocean_fraction', 'Target ocean fraction', 0.05, 0.95, 0.01, 'Used when continents are generated from the seed. Grown from a drawing, they keep the drawn land area.'),
     ],
   },
   {
     key: 'sketch', title: 'Continent sketch', layer: 'sketch', tools: ['land', 'sea', 'scatter_land', 'scatter_sea', 'mountain', 'scatter_mountain', 'erase_hint'],
-    blurb: 'Paint where the land is. Soft brush edges let coastline noise decide the exact shore.',
+    blurb: 'Paint where the land is, over generated continents, on an empty ocean, or as a rough drawing the generator turns into continents.',
     params: [
-      p('sketch', 'auto_continents', 'Generated continents', 0, 12, 1, 'Only used when “Start from generated continents” is on.'),
+      p('sketch', 'auto_continents', 'Generated continents', 0, 12, 1, 'Only used when starting from generated continents.'),
+      p('sketch', 'drawing_freedom_km', 'Freedom from the drawing (km)', 0, 2000, 10, 'Only used when starting from your drawing: how far generated coasts may stray from the drawn ones. 0 = the drawing exactly.'),
       p('sketch', 'coast_roughness', 'Coast roughness', 0, 1.5, 0.05),
       p('sketch', 'coast_scale_km', 'Coast feature size (km)', 100, 3000, 10),
     ],
@@ -138,8 +161,8 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'relief', title: 'Tectonic relief', layer: 'elevation', tools: ['raise', 'lower', 'smooth', 'flatten'],
-    blurb: 'Boundaries are classified by relative plate motion; each type adds its cross-section profile.',
+    key: 'relief', title: 'Tectonic relief', layer: 'elevation', tools: ['raise', 'lower', 'smooth', 'flatten', 'old_mountain', 'scatter_old_mountain', 'old_mountain_erase'],
+    blurb: 'Boundaries are classified by relative plate motion; each type adds its cross-section profile: high, sharp ranges where plates collide. Old mountains from noise add worn, rounded clusters away from the boundaries; paint or flatten them with their own brushes.',
     params: [
       p('tectonics', 'sketch_fidelity', 'Sketch fidelity', 0, 1, 0.01, '0 = pure tectonics, 1 = the sketched coastline always wins.'),
       p('tectonics', 'mountain_scale', 'Mountain height ×', 0.1, 3, 0.05),
@@ -147,11 +170,14 @@ export const STEPS: StepUI[] = [
       p('tectonics', 'hotspots', 'Hotspots', 0, 40, 1),
       p('tectonics', 'hint_height_m', 'Mountain hint height (m)', 0, 8000, 50),
       p('tectonics', 'max_influence_km', 'Boundary influence (km)', 300, 4000, 50),
+      p('tectonics', 'old_mountains', 'Old mountains (share of land)', 0, 0.5, 0.01, 'Worn, rounded mountain clusters from noise, away from plate boundaries.'),
+      p('tectonics', 'old_mountain_height_m', 'Old mountain height (m)', 0, 4000, 50),
+      p('tectonics', 'old_mountain_size_km', 'Old mountain cluster size (km)', 100, 3000, 10),
     ],
   },
   {
     key: 'climate', title: 'Climate', layer: 'temperature', tools: [],
-    blurb: 'Seasonal energy balance by latitude, three-cell winds, maritime air, coastal currents and moisture transport.',
+    blurb: 'Seasonal energy balance by latitude, three-cell winds, maritime air held back by mountains, coastal currents, moisture transport and Foehn.',
     params: [
       { group: 'climate', key: 'climate_level', label: 'Solve on grid level', options: [[5, '5 (fast)'], [6, '6'], [7, '7 (default)'], [8, '8 (slow)']] },
       p('climate', 'lapse_rate_c_per_km', 'Lapse rate (°C/km)', 0, 12, 0.1),
@@ -159,10 +185,12 @@ export const STEPS: StepUI[] = [
       p('climate', 'global_precip_mm', 'Global precipitation (mm/yr)', 100, 3000, 10),
       p('climate', 'ocean_current_c', 'Coastal currents (°C)', 0, 15, 0.5),
       p('climate', 'maritime_reach_km', 'Maritime reach (km)', 100, 5000, 50),
-      p('climate', 'orographic', 'Orographic rain ×', 0, 4, 0.05),
+      p('climate', 'orographic', 'Orographic rain ×', 0, 4, 0.05, 'Wet air forced up a slope turns vapour into cloud that rains or snows out over the slope and the crest; sinking air beyond dries what is left (rain shadow). Also shifts rain onto slopes facing the wind at full map detail. 0 = mountains add no rain.'),
       p('climate', 'moisture_passes', 'Moisture passes', 20, 300, 5),
       p('climate', 'thermal_wind', 'Thermal winds ×', 0, 3, 0.05, 'Winds driven by temperature-made pressure systems: monsoons, winter highs over continents, summer heat lows, plateau lows. 0 = zonal belts only.'),
       p('climate', 'mountain_blocking', 'Mountain blocking', 0, 1, 0.05, 'Share of upslope wind turned along steep terrain: air flows around ranges and through gaps instead of over them.'),
+      p('climate', 'sea_air_blocking', 'Mountains block sea air', 0, 3, 0.05, 'Mild sea air stays on the windward side of ranges: air coming down the lee side loses about half its maritime influence per 2 km of descent (at 1), so the land behind a range has hotter summers and colder winters. 0 = mountains do not hold it back.'),
+      p('climate', 'foehn', 'Foehn ×', 0, 3, 0.05, 'Air that rains out climbing a range comes down the far side warmer: 1.5 °C per km of wet climb at 1, approaching 4 °C in a month behind the highest, wettest ranges, fading over a few hundred km. Shown by the Foehn warming layer.'),
     ],
   },
   {
@@ -255,7 +283,7 @@ export const STEPS: StepUI[] = [
     ],
   },
   {
-    key: 'cultures', title: 'Cultures', layer: 'cultures', tools: ['band_pin', 'band_erase', 'attraction', 'attraction_erase'],
+    key: 'cultures', title: 'Cultures', layer: 'cultures', tools: ['band_pin', 'band_erase', 'attraction', 'attraction_erase', 'culture_merge', 'culture_paint', 'culture_split', 'culture_split_traits', 'culture_reparent', 'rename_culture', 'culture_new_name', 'culture_lock'],
     blurb: 'Bands of people spread over the provinces, grow, split and meet. Contact makes them alike, isolation and drift make them differ; where contact stays rare, cultures split. Groups are cultures that stay in touch.',
     params: [
       p('cultures', 'ticks', 'Generations', 20, 2000, 10, 'One generation is a tick of the simulation.'),
@@ -275,6 +303,58 @@ export const STEPS: StepUI[] = [
       p('cultures', 'caravan_people', 'Caravan stop size (people)', 0, 500000, 1000, 'From era 2: people a watered stop on the busiest route across dry land can hold.'),
       p('cultures', 'mining_people', 'Mining town size (people)', 0, 200000, 500, 'From era 3: people each metal deposit draws.'),
       p('cultures', 'irrigation_share', 'Irrigated share of dry river land', 0, 1, 0.05, 'From era 4: share of a dry province with a river that becomes farmland.'),
+    ],
+  },
+  {
+    key: 'nations', title: 'Nations & history', layer: 'nations', tools: ['nation_seed', 'nation_seed_erase', 'city_pin', 'city_unpin'],
+    blurb: 'Polities form where people are many, then grow over the culture map: they settle empty land, fight over borders, colonise overseas and break apart along culture lines. Borders can cut through states, and colonies and exclaves are allowed. Each era opens with an institution (gunpowder, navigation, industrialisation, synthetic fertilizer, motorisation, aviation) born in a province you choose or chance picks, spreading over land, roads, railways, ports and airports; nations enter the era as most of their provinces embrace it, the rich first. Good harbours become ports in the shipping era. Tags and feudal empires shape the story. Nations tax their people to pay for armies, roads (track, paved, highway), railway lines with junctions, and airports, which bind their land together. Run it in one go, step by step with your own directives, or let an AI guide steer it toward the history you describe.',
+    params: [
+      p('nations', 'start_year', 'First polities (year)', -5000, 1800, 10),
+      p('nations', 'start_date', 'Start date (year)', 1800, 2000, 1, 'The year the map shows: 1949 (default) for late in the second great war\'s era, 1910–1920 for an early-20th-century start.'),
+      p('nations', 'initial_nations', 'Nations at the start', 0, 100, 1, 'Polities that already exist in the first year, besides your nation seeds: in the most populous free provinces, spaced apart.'),
+      p('nations', 'initial_size', 'Their size (provinces)', 1, 50, 1),
+      p('nations', 'months_per_step', 'Months per step (at first)', 1, 300, 1, 'Time is counted in whole months. Steps get shorter toward the present: finer detail where history is denser.'),
+      p('nations', 'step_year_1', 'Shorter steps from (year)', -5000, 2100, 10),
+      p('nations', 'months_per_step_1', 'Months per step then', 1, 300, 1),
+      p('nations', 'step_year_2', 'Shortest steps from (year)', -5000, 2100, 10),
+      p('nations', 'months_per_step_2', 'Months per step then ', 1, 300, 1),
+      p('nations', 'found_population', 'People to found a polity', 1000, 1000000, 1000),
+      p('nations', 'found_rate', 'Founding chance per step', 0, 0.05, 0.0005),
+      p('nations', 'expansion_rate', 'Expansion', 0, 5, 0.05, 'Expansion attempts per nation and step.'),
+      p('nations', 'culture_weight', 'Culture border weight', 0, 10, 0.1, 'Extra cost of taking land of another culture (half within the culture group): higher values make borders follow cultures.'),
+      p('nations', 'barrier_weight', 'Barrier weight', 0, 5, 0.05),
+      p('nations', 'reach_km', 'Reach from the capital (km)', 100, 5000, 50, 'Expansion costs twice as much this far from the capital.'),
+      p('nations', 'collapse_rate', 'Breakups', 0, 0.2, 0.002, 'Chance of a breakup at instability 1 (mixed cultures, size, spread).'),
+      p('nations', 'assimilation', 'Assimilation per year', 0, 0.02, 0.0005, 'Share of a province\'s other cultures that takes its ruler\'s culture each year.'),
+      p('nations', 'gunpowder_year', 'Gunpowder (earliest birth)', 0, 2000, 10, 'Each era opens with an institution born in one province (you choose, or chance does) once the calendar reaches this year; it spreads over land, roads, railways, ports and airports, and a nation enters the era once most of its provinces have embraced it.'),
+      p('nations', 'shipping_year', 'Navigation (earliest birth)', 0, 2000, 10, 'Ocean shipping: ports, colonies across the sea.'),
+      p('nations', 'industrial_year', 'Industrialisation (earliest birth)', 0, 2000, 10, 'Railways and faster growth.'),
+      p('nations', 'fertilizer_year', 'Synthetic fertilizer (earliest birth)', 0, 2100, 1, 'Farmland holds more people, phased in over 20 years (1909 in our world).'),
+      p('nations', 'motor_year', 'Motorisation (earliest birth)', 0, 2100, 1, 'Cars and highways.'),
+      p('nations', 'air_year', 'Aviation (earliest birth)', 0, 2100, 1, 'Airports and air routes.'),
+      p('nations', 'institution_spread', 'Institution spread', 0, 5, 0.05, 'How fast institutions spread from province to province (per year, at full contact).'),
+      p('nations', 'institution_share', 'Share of provinces for an era', 0.05, 1, 0.05, 'Share of a nation\'s provinces that must embrace an institution before it enters the era.'),
+      p('nations', 'institution_candidates', 'Birthplace candidates', 1, 30, 1),
+      p('nations', 'port_quality', 'Harbour needed for a port', 0, 1, 0.01, 'Harbour quality (calm winds, deep water, shelter, a river mouth, no winter ice) a coastal province needs to become a port.'),
+      p('nations', 'port_people', 'People for a port', 0, 2000000, 5000, 'People in the province and around it before trade makes it a port.'),
+      p('nations', 'fertilizer_boost', 'Fertilizer boost', 1, 4, 0.05, 'How many times more people farmland holds with synthetic fertilizer.'),
+      p('nations', 'tech_lead_years', 'Technology lead (years)', 0, 100, 1, 'How far ahead of the calendar the most advanced nation can get.'),
+      p('nations', 'tech_spread', 'Technology catch-up', 0, 0.2, 0.005, 'Extra progress per year of gap to the level a nation\'s wealth, size and neighbours allow.'),
+      p('nations', 'tax', 'Tax share', 0, 0.5, 0.01, 'Share of output taxed: pays the army (30% of taxes), roads, railways and airports.'),
+      p('nations', 'road_cost', 'Road cost', 0, 10, 0.1, 'Multiplier on building and keeping roads.'),
+      p('nations', 'rail_cost', 'Railway and airport cost', 0, 10, 0.1, 'Multiplier on building and keeping railways and airports.'),
+      p('nations', 'road_every_years', 'Years between road projects', 1, 100, 1),
+      p('nations', 'railway_every_years', 'Years between railway projects', 1, 100, 1),
+      p('nations', 'transfer_km', 'Line change penalty (km)', 0, 2000, 10, 'Time lost changing trains at a junction, as km of travel on foot (a train covers about 8 km for each km on foot).'),
+      p('nations', 'overseas_km', 'Colony range (km)', 500, 20000, 100),
+      p('nations', 'railway_cities', 'Cities linked by rail per nation', 2, 40, 1),
+      p('nations', 'station_people', 'People per railway station', 0, 200000, 1000, 'Railway towns, also in the desert.'),
+      p('nations', 'capital_pull', 'Capital pull', 0, 1, 0.05, 'Attraction a capital grows into: people move there and it holds more (up to 5× at 1).'),
+      p('nations', 'capital_years', 'Years to grow a capital', 1, 300, 1),
+      p('nations', 'war_sack', 'Sack (share of people lost)', 0, 0.5, 0.01, 'When a province is conquered; four times as much for a capital.'),
+      p('nations', 'war_devastation', 'War devastation', 0, 1, 0.05, 'Conquest stops growth and drives people away until it heals: cities fought over again and again empty.'),
+      p('nations', 'recovery', 'Recovery per year', 0, 0.2, 0.005),
+      p('nations', 'migration', 'Migration to cities per year', 0, 0.05, 0.0005, 'Share of a nation\'s people that moves each year toward its capitals, stations and city pins.'),
     ],
   },
 ];

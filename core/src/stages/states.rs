@@ -27,6 +27,7 @@ use crate::edits::{stroke_coverage, Tool};
 use crate::fields::{Field, Fields};
 use crate::graph;
 use crate::names::{self, Lang};
+use crate::rivers::RiverEdges;
 use crate::rng::{hash_unit, stream, Rng};
 use crate::vec3::Vec3;
 use std::collections::{BTreeMap, HashSet};
@@ -42,7 +43,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let hab = ctx.input.f32("habitability");
     let bar = ctx.input.f32("barrier");
     let river_role = ctx.input.u8("river_role");
-    let recv = ctx.input.i32("receiver");
+    // A border river's crossing cost lies on the cell edge it runs along.
+    let river_bar = RiverEdges::new(g, ctx.input.i32("river_to"), ctx.input.f32("river_seg_barrier"));
     let land = |i: usize| wat[i] == water::LAND;
     let area: Vec<f64> = g.area.iter().map(|a| a * r2).collect();
 
@@ -95,10 +97,11 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         if !land(a) || !land(b) {
             return sea;
         }
-        if river_role[a] == role::BACKBONE && river_role[b] == role::BACKBONE && (recv[a] == b as i32 || recv[b] == a as i32) {
+        // A backbone river holds its valley together: cheap along and across it.
+        if river_role[a] == role::BACKBONE && river_role[b] == role::BACKBONE {
             return 0.35;
         }
-        1.0 + bw * 0.5 * (bar[a] + bar[b]) as f64
+        1.0 + bw * (0.5 * (bar[a] + bar[b]) + river_bar.get(g, a, b) * crate::rivers::CROSSING_WEIGHT) as f64
     });
 
     // State paint: cells under the stroke join the state under its first point.
@@ -174,7 +177,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     // Every landmass belongs to the nearest continent (its own if it is one).
     let sources: Vec<(u32, f64, u32)> =
         cont_lms.iter().enumerate().flat_map(|(k, &l)| lm_cells[l].iter().map(move |&c| (c, 0.0, k as u32))).collect();
-    let near = graph::multi_source(g, &sources, f64::INFINITY, |a, b, _| Some(g.pos[a].angle_to(g.pos[b]))).label;
+    let near = graph::multi_source(g, &sources, f64::INFINITY, |_a, _b, _, edge_len| Some(edge_len)).label;
     let lm_cont: Vec<u32> = lm_cells.iter().map(|c| near[c[0] as usize]).collect();
 
     // Per-state aggregates.

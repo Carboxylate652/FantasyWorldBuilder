@@ -1,5 +1,6 @@
 //! The pipeline: seven Stage 1 steps (make the planet), three Stage 2 steps
-//! (states and provinces) and the Stage 3 step (cultures). Each step reads
+//! (states and provinces), the Stage 3 step (cultures) and the Stage 4 step
+//! (nations and history). Each step reads
 //! plain fields from earlier steps and writes its own `Fields` plus a JSON
 //! `meta` summary.
 
@@ -8,6 +9,7 @@ pub mod climate;
 pub mod cultures;
 pub mod habitability;
 pub mod hydrology;
+pub mod nations;
 pub mod partition;
 pub mod plates;
 pub mod provinces;
@@ -37,9 +39,10 @@ pub enum Step {
     States,
     Provinces,
     Cultures,
+    Nations,
 }
 
-pub const N_STEPS: usize = 11;
+pub const N_STEPS: usize = 12;
 pub const STEPS: [Step; N_STEPS] = [
     Step::Planet,
     Step::Sketch,
@@ -52,9 +55,10 @@ pub const STEPS: [Step; N_STEPS] = [
     Step::States,
     Step::Provinces,
     Step::Cultures,
+    Step::Nations,
 ];
 /// The last step (`run` without a target goes this far).
-pub const LAST: Step = Step::Cultures;
+pub const LAST: Step = Step::Nations;
 
 impl Step {
     pub fn index(self) -> usize {
@@ -73,6 +77,7 @@ impl Step {
             Step::States => "states",
             Step::Provinces => "provinces",
             Step::Cultures => "cultures",
+            Step::Nations => "nations",
         }
     }
     pub fn title(self) -> &'static str {
@@ -88,6 +93,7 @@ impl Step {
             Step::States => "States",
             Step::Provinces => "Provinces",
             Step::Cultures => "Cultures",
+            Step::Nations => "Nations & history",
         }
     }
     pub fn from_key(k: &str) -> Option<Step> {
@@ -204,6 +210,7 @@ pub fn run_step(step: Step, ctx: &Ctx) -> StepOutput {
         Step::States => states::run(ctx),
         Step::Provinces => provinces::run(ctx),
         Step::Cultures => cultures::run(ctx),
+        Step::Nations => nations::run(ctx),
     }
 }
 
@@ -215,14 +222,27 @@ pub(crate) fn unapplied(layer: &str, index: usize, s: &crate::edits::Stroke, rea
     serde_json::json!({ "layer": layer, "index": index, "tool": s.tool, "at": s.points.first(), "reason": reason })
 }
 
-pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 2, 2, 4, 6, 2, 5, 3, 6, 5];
+pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 3, 2, 6, 7, 2, 6, 4, 7, 6, 7];
 
 /// Cache keys: each step hashes only the inputs it actually reads, chained to
 /// the previous step's key, so a change only invalidates what depends on it.
 pub fn input_hashes(p: &WorldParams, e: &Edits) -> [u64; N_STEPS] {
     let pl = &p.planet;
     let h0 = hash::json(&("planet", pl.seed, pl.grid_level, pl.radius_km));
-    let h1 = hash::combine(h0, hash::json(&("sketch", &p.sketch, pl.ocean_fraction, e.sketch.auto_base, &e.sketch.strokes)));
+    // The drawing base and its freedom are hashed only when in use, so other
+    // worlds keep their cache keys (the key struct serializes like the
+    // sketch parameters did before the freedom was added).
+    #[derive(Serialize)]
+    struct SketchKey {
+        coast_roughness: f64,
+        coast_scale_km: f64,
+        auto_continents: u32,
+    }
+    let sk = SketchKey { coast_roughness: p.sketch.coast_roughness, coast_scale_km: p.sketch.coast_scale_km, auto_continents: p.sketch.auto_continents };
+    let mut h1 = hash::combine(h0, hash::json(&("sketch", &sk, pl.ocean_fraction, e.sketch.auto_base, &e.sketch.strokes)));
+    if e.sketch.from_drawing {
+        h1 = hash::combine(h1, hash::json(&("drawing", p.sketch.drawing_freedom_km)));
+    }
     let h2 = hash::combine(h1, hash::json(&("plates", &p.plates, &e.sketch.pins, &e.sketch.arrows, &e.overrides.plates)));
     let h3 = hash::combine(h2, hash::json(&("relief", &p.tectonics, &e.overrides.elevation, &e.imports.elevation)));
     let h4 = hash::combine(
@@ -238,8 +258,16 @@ pub fn input_hashes(p: &WorldParams, e: &Edits) -> [u64; N_STEPS] {
     let h7 = hash::combine(h6, hash::json(&("habitability", &p.habitability, &e.overrides.barriers, &e.overrides.sites, &e.overrides.fertility)));
     let h8 = hash::combine(h7, hash::json(&("states", &p.states, &e.overrides.states)));
     let h9 = hash::combine(h8, hash::json(&("provinces", &p.provinces, &e.overrides.provinces, &e.imports.provinces)));
-    let h10 = hash::combine(h9, hash::json(&("cultures", &p.cultures, &e.overrides.bands, &e.overrides.attraction)));
-    let h = [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10];
+    // Directives are hashed only when there are some, so worlds without them keep their cache keys.
+    // So are culture edits.
+    let cdir = crate::directives::of_stage(&e.overrides.directives, "cultures");
+    let base10 = hash::json(&("cultures", &p.cultures, &e.overrides.bands, &e.overrides.attraction));
+    let mut h10 = if cdir.is_empty() { hash::combine(h9, base10) } else { hash::combine(h9, hash::json(&("cultures", &p.cultures, &e.overrides.bands, &e.overrides.attraction, &cdir))) };
+    if !e.overrides.cultures.is_empty() {
+        h10 = hash::combine(h10, hash::json(&("culture_edits", &e.overrides.cultures)));
+    }
+    let h11 = hash::combine(h10, hash::json(&("nations", &p.nations, &crate::directives::of_stage(&e.overrides.directives, "nations"), &e.overrides.nation_seeds)));
+    let h = [h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11];
     // Fold in the model versions, preserving the chain (a version bump in one
     // step invalidates every later step too).
     let mut out = [0u64; N_STEPS];

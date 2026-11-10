@@ -50,11 +50,14 @@ pub struct SketchParams {
     pub coast_scale_km: f64,
     /// Number of continents when the sketch is generated automatically (0 = noise only).
     pub auto_continents: u32,
+    /// When continents are grown from your drawing: how far, in km, the
+    /// generated coasts may stray from the drawn ones (0 = the drawing exactly).
+    pub drawing_freedom_km: f64,
 }
 
 impl Default for SketchParams {
     fn default() -> Self {
-        SketchParams { coast_roughness: 0.55, coast_scale_km: 900.0, auto_continents: 5 }
+        SketchParams { coast_roughness: 0.55, coast_scale_km: 900.0, auto_continents: 5, drawing_freedom_km: 500.0 }
     }
 }
 
@@ -97,6 +100,13 @@ pub struct TectonicParams {
     /// Strength of "mountains here" hint strokes (metres at full brush).
     pub hint_height_m: f64,
     pub max_influence_km: f64,
+    /// Old mountains from noise, away from plate boundaries: worn, rounded
+    /// clusters (Appalachians, Urals, Scottish Highlands) rather than the
+    /// high, sharp ranges of colliding plates. Share of continental land
+    /// they cover, their peak height, and the size of a cluster.
+    pub old_mountains: f64,
+    pub old_mountain_height_m: f64,
+    pub old_mountain_size_km: f64,
 }
 
 impl Default for TectonicParams {
@@ -108,6 +118,9 @@ impl Default for TectonicParams {
             hotspots: 8,
             hint_height_m: 3200.0,
             max_influence_km: 1600.0,
+            old_mountains: 0.1,
+            old_mountain_height_m: 1500.0,
+            old_mountain_size_km: 700.0,
         }
     }
 }
@@ -124,7 +137,10 @@ pub struct ClimateParams {
     pub ocean_current_c: f64,
     /// How far maritime air reaches inland along the wind (km).
     pub maritime_reach_km: f64,
-    /// Orographic rain strength.
+    /// Orographic rain strength: wet air forced up a slope condenses part of
+    /// its vapour into cloud that rains out over the slope and the crest (1 =
+    /// 63% within 800 m of climb), and rain shifts onto slopes facing the wind
+    /// on the world grid.
     pub orographic: f64,
     pub moisture_passes: u32,
     /// Heat transport toward the poles (W/m²/K, North's D).
@@ -133,6 +149,13 @@ pub struct ClimateParams {
     pub thermal_wind: f64,
     /// Fraction of upslope wind turned along the contours of steep terrain.
     pub mountain_blocking: f64,
+    /// How strongly mountains hold back maritime air (1 = air coming down the
+    /// lee side loses about half its maritime influence per 2 km of descent).
+    pub sea_air_blocking: f64,
+    /// Foehn strength: air that rains out climbing a range comes down the far
+    /// side warmer (1 = 1.5 °C per km of wet climb, at most about 4 °C in a
+    /// month, fading downwind).
+    pub foehn: f64,
 }
 
 impl Default for ClimateParams {
@@ -148,6 +171,8 @@ impl Default for ClimateParams {
             heat_diffusion: 0.68,
             thermal_wind: 1.0,
             mountain_blocking: 0.7,
+            sea_air_blocking: 1.0,
+            foehn: 1.0,
         }
     }
 }
@@ -474,6 +499,173 @@ impl Default for CultureParams {
     }
 }
 
+/// Stage 4: nations and history, from polity formation to the start date.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NationParams {
+    /// Year the first polities can form.
+    pub start_year: i32,
+    /// Year history stops: the map's start date (default 1949: late in the
+    /// second great war's era, early in the cold war's; 1910–1920 for a
+    /// pre-war start).
+    pub start_date: i32,
+    /// Months per simulation step at first; steps get shorter toward the
+    /// present (`step_year_1`/`months_per_step_1`, then `_2`), so recent
+    /// centuries are simulated in finer detail. Time is counted in whole
+    /// months; the year is the month count divided by 12.
+    pub months_per_step: u32,
+    pub step_year_1: i32,
+    pub months_per_step_1: u32,
+    pub step_year_2: i32,
+    pub months_per_step_2: u32,
+    /// People a province needs before a polity can form there.
+    pub found_population: f64,
+    /// Chance per step that a province with that many people and no ruler
+    /// founds a polity (more people, likelier).
+    pub found_rate: f64,
+    /// Expansion attempts per nation and step at aggression 1.
+    pub expansion_rate: f64,
+    /// Cost multiplier for barriers along a border (ridges, rivers, desert).
+    pub barrier_weight: f64,
+    /// Extra cost of taking land of another culture (half for the same group).
+    pub culture_weight: f64,
+    /// Distance from the capital (km) at which expansion costs twice as much.
+    pub reach_km: f64,
+    /// Chance per step of a breakup at instability 1 (mixed cultures, size, spread).
+    pub collapse_rate: f64,
+    /// Share of a province's other cultures that takes its ruler's culture per year.
+    pub assimilation: f64,
+    /// Population growth per year before and during the industrial era.
+    pub growth: f64,
+    pub industrial_growth: f64,
+    /// Era years: gunpowder states, ocean shipping (ports, overseas
+    /// colonies), industry (railways, faster growth). Each is the earliest
+    /// year the era's institution can be born; a nation enters the era when
+    /// most of its provinces have embraced the institution.
+    pub gunpowder_year: i32,
+    pub shipping_year: i32,
+    pub industrial_year: i32,
+    /// Farthest a colony can lie from its nation's coast (km), with ocean shipping.
+    pub overseas_km: f64,
+    /// Largest cities each nation links by rail.
+    pub railway_cities: u32,
+    /// Years between a nation's railway projects.
+    pub railway_every_years: u32,
+    /// People a railway station draws (railway towns, also in the desert).
+    pub station_people: f64,
+    /// Attraction (0–1) a capital grows into: people move there and it holds more.
+    pub capital_pull: f64,
+    /// Years a new capital takes to grow into its full pull.
+    pub capital_years: f64,
+    /// Share of a conquered province's people lost in the sack (four times for a capital).
+    pub war_sack: f64,
+    /// Attraction lost by a conquered province (devastation: people leave).
+    pub war_devastation: f64,
+    /// Share of devastation that heals each year.
+    pub recovery: f64,
+    /// Share of a nation's people that move each year toward its attractive
+    /// provinces (capitals, stations, city pins), more from devastated land.
+    pub migration: f64,
+    /// Earliest birth years of the institutions of synthetic fertilizer, the
+    /// motor age (highways) and the air age (airports). As with the other
+    /// eras, a nation enters them once most of its provinces have embraced
+    /// the institution, which spreads from its birthplace over land, roads,
+    /// railways, ports and airports.
+    pub fertilizer_year: i32,
+    pub motor_year: i32,
+    pub air_year: i32,
+    /// How much faster a nation catches up per year of technology gap to the
+    /// level its wealth, size and neighbours allow (0.02: a century behind,
+    /// three years of progress per year).
+    pub tech_spread: f64,
+    /// How far ahead of the calendar the most advanced nation can get (years).
+    pub tech_lead_years: f64,
+    /// Share of output collected as taxes (pays the army, roads, railways and airports).
+    pub tax: f64,
+    /// Multipliers on the cost of building and keeping roads, and railways and airports.
+    pub road_cost: f64,
+    pub rail_cost: f64,
+    /// Time lost changing trains at a junction (km of travel on foot).
+    pub transfer_km: f64,
+    /// How many more people farmland holds once a nation uses synthetic fertilizer.
+    pub fertilizer_boost: f64,
+    /// Years between a nation's road projects (and airport projects in the air age).
+    pub road_every_years: u32,
+    /// Harbour quality (0–1: calm winds, deep water, shelter, a river mouth,
+    /// no winter ice) a coastal province needs to become a port, and the
+    /// people it needs (with its neighbours) for trade to start there.
+    pub port_quality: f64,
+    pub port_people: f64,
+    /// Institutions: how fast they spread from province to province (per
+    /// year, at full contact), and the share of a nation's provinces that
+    /// must embrace one before the nation enters its era. The era years
+    /// above are the earliest years each institution can be born.
+    pub institution_spread: f64,
+    pub institution_share: f64,
+    /// How many candidate birthplaces are offered when an institution emerges.
+    pub institution_candidates: u32,
+    /// Polities that already exist at the start year, besides your nation
+    /// seeds: placed in the most populous free provinces, spaced apart, each
+    /// ruling about `initial_size` provinces around its capital.
+    pub initial_nations: u32,
+    pub initial_size: u32,
+}
+
+impl Default for NationParams {
+    fn default() -> Self {
+        NationParams {
+            start_year: 800,
+            start_date: 1949,
+            months_per_step: 24,
+            step_year_1: 1400,
+            months_per_step_1: 12,
+            step_year_2: 1800,
+            months_per_step_2: 6,
+            found_population: 60_000.0,
+            found_rate: 0.0015,
+            expansion_rate: 0.8,
+            barrier_weight: 1.0,
+            culture_weight: 1.5,
+            reach_km: 700.0,
+            collapse_rate: 0.01,
+            assimilation: 0.0015,
+            growth: 0.0018,
+            industrial_growth: 0.009,
+            gunpowder_year: 1450,
+            shipping_year: 1500,
+            industrial_year: 1830,
+            overseas_km: 9000.0,
+            railway_cities: 8,
+            railway_every_years: 8,
+            station_people: 15_000.0,
+            capital_pull: 0.5,
+            capital_years: 60.0,
+            war_sack: 0.03,
+            war_devastation: 0.25,
+            recovery: 0.03,
+            migration: 0.002,
+            fertilizer_year: 1909,
+            motor_year: 1920,
+            air_year: 1935,
+            tech_spread: 0.02,
+            tech_lead_years: 10.0,
+            tax: 0.08,
+            road_cost: 1.0,
+            rail_cost: 1.0,
+            transfer_km: 150.0,
+            fertilizer_boost: 1.6,
+            road_every_years: 10,
+            port_quality: 0.62,
+            port_people: 80_000.0,
+            institution_spread: 1.0,
+            institution_share: 0.5,
+            institution_candidates: 8,
+            initial_nations: 12,
+            initial_size: 6,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct WorldParams {
@@ -488,6 +680,7 @@ pub struct WorldParams {
     pub states: StateParams,
     pub provinces: ProvinceParams,
     pub cultures: CultureParams,
+    pub nations: NationParams,
 }
 
 impl WorldParams {

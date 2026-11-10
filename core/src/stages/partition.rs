@@ -97,9 +97,9 @@ pub fn seed_every_component(g: &Grid, group: &[u32], order: &[u32], seeds: &mut 
 /// km length of the edge a→b. Returns the seed index reaching each cell.
 pub fn grow(g: &Grid, r_km: f64, group: &[u32], seeds: &[u32], offsets: Option<&[f64]>, cost: impl Fn(usize, usize) -> f64) -> Vec<u32> {
     let sources: Vec<(u32, f64, u32)> = seeds.iter().enumerate().map(|(k, &c)| (c, offsets.map_or(0.0, |o| o[k]), k as u32)).collect();
-    graph::multi_source(g, &sources, f64::INFINITY, |a, b, _| {
+    graph::multi_source(g, &sources, f64::INFINITY, |a, b, _, edge_len| {
         if group[a] == group[b] {
-            Some(g.pos[a].angle_to(g.pos[b]) * r_km * cost(a, b))
+            Some(edge_len * r_km * cost(a, b))
         } else {
             None
         }
