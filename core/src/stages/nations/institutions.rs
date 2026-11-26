@@ -86,13 +86,7 @@ impl NationSim {
                 2 => 1.0 + if pr.coal { 0.6 } else { 0.0 } + if pr.iron { 0.4 } else { 0.0 },
                 3 => 0.5 + pr.fertile,
                 4 => 1.0 + if pr.oil { 0.6 } else { 0.0 },
-                5 => {
-                    if self.pop[p] >= BIG_CITY {
-                        1.5
-                    } else {
-                        1.0
-                    }
-                }
+                5 if self.pop[p] >= BIG_CITY => 1.5,
                 _ => 1.0,
             };
             let cradle = if self.has_state_tag(pr.state as u32, "institution_cradle") { 3.0 } else { 1.0 };
@@ -133,7 +127,9 @@ impl NationSim {
     pub fn pending_institution(&self) -> Option<Value> {
         let i = (0..INSTITUTIONS.len()).find(|&i| self.inst_due(i))?;
         // Chosen already, or a choice is queued for the next step.
-        let queued = self.directives[self.next_directive..].iter().any(|d| d.action == "institution_birth" && d.args["institution"].as_f64().map(|x| x.round() as usize) == Some(i));
+        let queued = self.directives[self.next_directive..]
+            .iter()
+            .any(|d| d.action == "institution_birth" && d.args["institution"].as_f64().filter(|x| x.is_finite() && *x >= 0.0).map(|x| x.round() as usize) == Some(i));
         if self.birth_choice[i].is_some() || queued {
             return None;
         }
@@ -228,9 +224,13 @@ impl NationSim {
                 continue;
             }
             let pres: Vec<f32> = self.presence.iter().map(|x| x[i]).collect();
-            // Once every settled province has it, there is nothing left to spread.
-            if (0..n).all(|p| !self.provs[p].land || self.pop[p] < 1.0 || pres[p] >= 0.999) {
+            // Permanently latch only once every land province has it; skip this step if all
+            // currently settled provinces are already saturated (colonies settled later still receive it).
+            if (0..n).all(|p| !self.provs[p].land || pres[p] >= 0.999) {
                 self.saturated[i] = true;
+                continue;
+            }
+            if (0..n).all(|p| !self.provs[p].land || self.pop[p] < 1.0 || pres[p] >= 0.999) {
                 continue;
             }
             let mut pressure = vec![0.0f32; n];
@@ -287,7 +287,7 @@ impl NationSim {
             // reaches: fully when its technology is near the institution's
             // year, hardly at all a century behind it.
             let year = self.era_year(i as u8 + 1) as f64;
-            let absorb: Vec<f32> = std::iter::once(0.3)
+            let absorb: Vec<f32> = std::iter::once(0.03)
                 .chain((1..=self.nations.len()).map(|m| ((1.0 - (year - self.nations[m - 1].tech) / ABSORB_YEARS).clamp(0.03, 1.0)) as f32))
                 .collect();
             let k = (dt * rate * SPEED[i]) as f32;

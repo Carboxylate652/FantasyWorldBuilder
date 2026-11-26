@@ -458,19 +458,14 @@ fn grow_regions(members: &[u32], seeds: &[u32], adj: &[Vec<(u32, f64)>], centroi
         dist.insert(s, (0.0, r as u32));
     }
     let mut done: HashSet<u32> = HashSet::new();
-    loop {
-        // Small graphs: a linear scan for the closest open node is enough.
-        let Some((&s, &(d, r))) = dist.iter().filter(|(s, _)| !done.contains(s)).min_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap().then(a.0.cmp(b.0)))
-        else {
-            break;
-        };
+    while let Some((&s, &(d, r))) = dist.iter().filter(|(s, _)| !done.contains(s)).min_by(|a, b| a.1 .0.total_cmp(&b.1 .0).then(a.0.cmp(b.0))) {
         done.insert(s);
         for &(t, w) in &adj[s as usize] {
             if !member.contains(&t) || done.contains(&t) {
                 continue;
             }
             let nd = d + w;
-            if dist.get(&t).map_or(true, |e| nd < e.0) {
+            if dist.get(&t).is_none_or(|e| nd < e.0) {
                 dist.insert(t, (nd, r));
             }
         }
@@ -483,7 +478,7 @@ fn grow_regions(members: &[u32], seeds: &[u32], adj: &[Vec<(u32, f64)>], centroi
                 .min_by(|&a, &b| {
                     let da = centroid[s as usize].angle_to(centroid[seeds[a] as usize]);
                     let db = centroid[s as usize].angle_to(centroid[seeds[b] as usize]);
-                    da.partial_cmp(&db).unwrap()
+                    da.total_cmp(&db)
                 })
                 .unwrap() as u32,
         };

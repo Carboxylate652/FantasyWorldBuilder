@@ -164,10 +164,10 @@ fn run_ebm(p: &WorldParams, heat_cap: &[f64; NB]) -> Ebm {
     let mut month_cnt = [0usize; 12];
     let (mut a, mut b, mut c, mut r) = ([0.0; NB], [0.0; NB], [0.0; NB], [0.0; NB]);
     for year in 0..years {
-        for day in 0..days {
+        for (day, q_day) in q.iter().enumerate() {
             for k in 0..NB {
                 let cdt = heat_cap[k] / DAY_S;
-                let asr = q[day][k] * (1.0 - albedo(t[k], band_x(k), t_ann_prev[k]));
+                let asr = q_day[k] * (1.0 - albedo(t[k], band_x(k), t_ann_prev[k]));
                 let kl = d * edge[k] / (dx * dx);
                 let kr = d * edge[k + 1] / (dx * dx);
                 a[k] = if k > 0 { -kl } else { 0.0 };
@@ -351,8 +351,8 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
         (0..nc)
             .map(|i| {
                 let mut s = Vec3::ZERO;
-                for m in 0..12 {
-                    s += w[m][i];
+                for wm in w.iter().take(12) {
+                    s += wm[i];
                 }
                 s * (1.0 / 12.0)
             })
@@ -444,9 +444,11 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 let va = adv * decay_adv;
                 let vi = iso * decay_iso;
                 if va >= vi {
-                    (va.max(mar[i]), adv_c)
+                    if va > mar[i] { (va, adv_c) } else { (mar[i], cur[i]) }
+                } else if vi > mar[i] {
+                    (vi, iso_c)
                 } else {
-                    (vi.max(mar[i]), iso_c)
+                    (mar[i], cur[i])
                 }
             })
             .collect();
@@ -572,49 +574,49 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
             // Iterate transport of vapour `w` and cloud water `cl`.
             let mut w = vec![0.0f64; nc];
             let mut cl = vec![0.0f64; nc];
+            let mut w_next = vec![0.0f64; nc];
+            let mut cl_next = vec![0.0f64; nc];
             let mut acc = vec![0.0f64; nc];
             let mut last_rain = vec![0.0f64; nc];
             const RECYCLE: f64 = 0.55;
             let warm = passes / 2;
             for pass in 0..passes {
-                let next: Vec<(f64, f64, f64)> = (0..nc)
-                    .map(|i| {
-                        let (mut inflow, mut inflow_cl) = (0.0, 0.0);
-                        for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
-                            let (j, wt) = (nbr_idx[e] as usize, out_w[nbr_rev[e] as usize]);
-                            inflow += w[j] * wt;
-                            inflow_cl += cl[j] * wt;
-                        }
-                        // Only air that arrives up the slope is lifted, so water
-                        // lingering in a cell is not wrung out again each pass.
-                        let cond = inflow * lift[i];
-                        // Land re-evaporates part of what fell on it last pass (recycling).
-                        let recycled = RECYCLE * (1.0 - water_frac[i]) * last_rain[i];
-                        let mut v = w[i] * stay[i] + evap[i] + recycled + inflow - cond;
-                        let mut c = cl[i] * stay[i] + inflow_cl + cond;
-                        // Sinking air dries the cloud it brings over the crest.
-                        let back = c * dissolve[i];
-                        c -= back;
-                        v += back;
-                        let r = v * rain_frac[i];
-                        // Vapour beyond what the (cold, high) air can hold turns to
-                        // cloud too, rather than all raining on one summit.
-                        if v - r > cap[i] {
-                            c += v - r - cap[i];
-                            v = cap[i] + r;
-                        }
-                        let rc = c * CLOUD_FALLOUT;
-                        (v - r, c - rc, r + rc)
-                    })
-                    .collect();
-                for (i, (v, c, r)) in next.into_iter().enumerate() {
-                    w[i] = v;
-                    cl[i] = c;
-                    last_rain[i] = r;
+                for i in 0..nc {
+                    let (mut inflow, mut inflow_cl) = (0.0, 0.0);
+                    for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
+                        let (j, wt) = (nbr_idx[e] as usize, out_w[nbr_rev[e] as usize]);
+                        inflow += w[j] * wt;
+                        inflow_cl += cl[j] * wt;
+                    }
+                    // Only air that arrives up the slope is lifted, so water
+                    // lingering in a cell is not wrung out again each pass.
+                    let cond = inflow * lift[i];
+                    // Land re-evaporates part of what fell on it last pass (recycling).
+                    let recycled = RECYCLE * (1.0 - water_frac[i]) * last_rain[i];
+                    let mut v = w[i] * stay[i] + evap[i] + recycled + inflow - cond;
+                    let mut c = cl[i] * stay[i] + inflow_cl + cond;
+                    // Sinking air dries the cloud it brings over the crest.
+                    let back = c * dissolve[i];
+                    c -= back;
+                    v += back;
+                    let r = v * rain_frac[i];
+                    // Vapour beyond what the (cold, high) air can hold turns to
+                    // cloud too, rather than all raining on one summit.
+                    if v - r > cap[i] {
+                        c += v - r - cap[i];
+                        v = cap[i] + r;
+                    }
+                    let rc = c * CLOUD_FALLOUT;
+                    let rain = r + rc;
+                    w_next[i] = v - r;
+                    cl_next[i] = c - rc;
+                    last_rain[i] = rain;
                     if pass >= warm {
-                        acc[i] += r;
+                        acc[i] += rain;
                     }
                 }
+                std::mem::swap(&mut w, &mut w_next);
+                std::mem::swap(&mut cl, &mut cl_next);
             }
             let k = 1.0 / (passes - warm) as f64;
             acc.iter().map(|a| a * k).collect()
@@ -831,7 +833,11 @@ fn orographic_downscale(fine: &Grid, t: &GridTransfer, nc: usize, elev: &[f32], 
                 // Slope along the wind (m/km); calm air barely lifts.
                 let s = w.dot(grad[i]) / speed;
                 let calm = (speed / 3.0).min(1.0);
-                calm * if s > 0.0 { (1.0 + DOWNSCALE_GAIN * strength * (1.0 - (-s / DOWNSCALE_SLOPE).exp())).ln() } else { s / DOWNSCALE_LEE }
+                calm * if s > 0.0 {
+                    (1.0 + DOWNSCALE_GAIN * strength * (1.0 - (-s / DOWNSCALE_SLOPE).exp())).ln()
+                } else {
+                    s * strength / DOWNSCALE_LEE
+                }
             })
             .collect();
         let lf = smooth(fine, &lf);

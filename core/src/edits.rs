@@ -545,11 +545,20 @@ impl Edits {
                 directives = Some(d);
             } else if l == EditLayer::Sketch {
                 let sk: Sketch = serde_json::from_value(v.clone()).map_err(|e| format!("layer sketch: {e}"))?;
+                if let Some(bad) = sk.strokes.iter().find(|s| s.tool.layer() != EditLayer::Sketch) {
+                    return Err(format!("layer sketch: a {:?} stroke does not belong to it", bad.tool));
+                }
+                if sk.strokes.iter().any(|s| s.points.is_empty()) {
+                    return Err("layer sketch: stroke has no points".into());
+                }
                 parsed.push((l, Some(sk), vec![]));
             } else {
                 let st: Vec<Stroke> = serde_json::from_value(v.clone()).map_err(|e| format!("layer {k}: {e}"))?;
                 if let Some(bad) = st.iter().find(|s| s.tool.layer() != l) {
                     return Err(format!("layer {k}: a {:?} stroke does not belong to it", bad.tool));
+                }
+                if st.iter().any(|s| s.points.is_empty()) {
+                    return Err(format!("layer {k}: stroke has no points"));
                 }
                 parsed.push((l, None, st));
             }
@@ -580,7 +589,19 @@ impl Edits {
                 }
                 None => {
                     out.push((l, st.len()));
-                    self.strokes_mut(l).extend(st);
+                    match l {
+                        EditLayer::Bands => {
+                            for s in st {
+                                add_pin(&mut self.overrides.bands, s, Tool::BandErase);
+                            }
+                        }
+                        EditLayer::NationSeeds => {
+                            for s in st {
+                                add_pin(&mut self.overrides.nation_seeds, s, Tool::NationSeedErase);
+                            }
+                        }
+                        _ => self.strokes_mut(l).extend(st),
+                    }
                 }
             }
         }
@@ -618,7 +639,7 @@ fn add_pin(pins: &mut Vec<Stroke>, s: Stroke, erase: Tool) {
     let (Some(first), Some(last)) = (s.points.first().copied(), s.points.last().copied()) else { return };
     let km = |a: [f64; 2], b: [f64; 2]| Vec3::from_lat_lon_deg(a[0], a[1]).angle_to(Vec3::from_lat_lon_deg(b[0], b[1])) * 6371.0;
     let nearest = |pins: &Vec<Stroke>, max: f64| {
-        pins.iter().enumerate().filter_map(|(k, p)| p.points.first().map(|q| (k, km(*q, first)))).filter(|x| x.1 <= max).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| x.0)
+        pins.iter().enumerate().filter_map(|(k, p)| p.points.first().map(|q| (k, km(*q, first)))).filter(|x| x.1 <= max).min_by(|a, b| a.1.total_cmp(&b.1)).map(|x| x.0)
     };
     match s.tool {
         t if t == erase => {
@@ -673,7 +694,7 @@ pub fn stroke_reach(stroke: &Stroke) -> f64 {
 /// distance to the nearest stroke point. Long gaps between points are filled in
 /// along great circles.
 pub fn stroke_coverage(grid: &Grid, stroke: &Stroke, radius_km: f64, scratch: &mut Vec<bool>) -> Vec<(u32, f32)> {
-    let r = (stroke.radius_km / radius_km).max(grid.spacing * 0.5);
+    let r = (stroke.radius_km / radius_km.max(1.0)).max(grid.spacing * 0.5);
     let reach = r * stroke_reach(stroke);
     let pts: Vec<Vec3> = stroke.points.iter().map(|p| Vec3::from_lat_lon_deg(p[0], p[1])).collect();
     let mut dense: Vec<Vec3> = Vec::with_capacity(pts.len() * 2);
@@ -682,9 +703,29 @@ pub fn stroke_coverage(grid: &Grid, stroke: &Stroke, radius_km: f64, scratch: &m
             let q = pts[k - 1];
             let ang = q.angle_to(p);
             let steps = (ang / (r * 0.3)).ceil() as usize;
-            for s in 1..steps {
-                let t = s as f64 / steps as f64;
-                dense.push((q * (1.0 - t) + p * t).normalized());
+            if steps > 1 {
+                let sin_a = ang.sin();
+                let ortho = if sin_a.abs() < 1e-6 {
+                    // Antipodal endpoints: pick a deterministic great-circle axis.
+                    let up = if q.y.abs() < 0.9 { Vec3::new(0.0, 1.0, 0.0) } else { Vec3::new(1.0, 0.0, 0.0) };
+                    q.cross(up).normalized()
+                } else {
+                    Vec3::ZERO
+                };
+                for s in 1..steps {
+                    let t = s as f64 / steps as f64;
+                    let mid = if sin_a.abs() < 1e-6 {
+                        let th = t * std::f64::consts::PI;
+                        (q * th.cos() + ortho * th.sin()).normalized()
+                    } else {
+                        let v = q * (1.0 - t) + p * t;
+                        if v.len() < 1e-12 {
+                            continue;
+                        }
+                        v.normalized()
+                    };
+                    dense.push(mid);
+                }
             }
         }
         dense.push(p);

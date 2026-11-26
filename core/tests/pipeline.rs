@@ -982,16 +982,16 @@ fn cities_rise_and_fall() {
             let o = *owner.get(&id)?;
             let nb: Vec<u64> = q["neighbors"].as_array()?.iter().filter_map(|x| x.as_u64()).collect();
             let cap = nt["nations"].as_array()?.iter().find(|n| n["id"] == o)?["capital"].as_u64()?;
-            (o > 0 && id != cap && nb.len() >= 3 && nb.iter().all(|x| owner.get(x).map_or(true, |&y| y == o))).then_some((o, id))
+            (o > 0 && id != cap && nb.len() >= 3 && nb.iter().all(|x| owner.get(x).is_none_or(|&y| y == o))).then_some((o, id))
         })
         .next()
         .expect("an interior province");
-    // Dated April 1913, inside the six-month step that starts in January.
-    w.edits.overrides.directives.push(d(1913, 4, "move_capital", serde_json::json!({ "nation": nation, "province": target })));
+    // Dated April 1948, inside the six-month step that starts in January.
+    w.edits.overrides.directives.push(d(1948, 4, "move_capital", serde_json::json!({ "nation": nation, "province": target })));
     w.run_to(Step::Nations, &|_, _, _| {});
     let m2 = w.meta(Step::Nations).unwrap();
     assert_eq!(m2["directives"].as_array().unwrap().last().unwrap()["applied"], true);
-    assert!(m2["table"]["events"].as_array().unwrap().iter().any(|e| e["event"] == "capital" && e["year"] == 1913 && e["province"] == target));
+    assert!(m2["table"]["events"].as_array().unwrap().iter().any(|e| e["event"] == "capital" && e["year"] == 1948 && e["province"] == target));
     let n2 = m2["table"]["nations"].as_array().unwrap().iter().find(|n| n["id"] == nation).unwrap();
     assert_eq!(n2["capital"], target);
 }
@@ -1591,4 +1591,149 @@ fn continents_grow_from_the_drawing() {
     assert_eq!(call("set_auto_base", serde_json::json!({ "value": false }))["edits"]["sketch_base"], "ocean");
     assert_eq!(call("undo", serde_json::json!({}))["edits"]["sketch_base"], "drawing");
     assert_eq!(call("undo", serde_json::json!({}))["edits"]["sketch_base"], "generated");
+}
+
+/// Validation must initialize the grid on freshly loaded projects so field checks run.
+#[test]
+fn validate_checks_fields_on_freshly_loaded_world() {
+    use worldcore::fields::Field;
+    let dir = std::env::temp_dir().join("fwm_validate_loaded_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut w = World::new(small_params(7));
+    w.run_to(Step::Provinces, &|_, _, _| {});
+    w.save(&dir).unwrap();
+
+    // Load fresh (World.grid is None until initialized), inject a nonexistent province ID
+    // into the loaded province field, and verify validate() initializes the grid and catches it.
+    let mut loaded = World::load(&dir).unwrap();
+    if let Some(step) = loaded.steps[Step::Provinces.index()].as_mut() {
+        if let Some(Field::U32(v)) = step.fields.0.get_mut("province") {
+            v[0] = 999_999;
+        }
+    }
+    let rep = worldcore::validate::validate(&mut loaded);
+    assert!(!rep.ok, "expected validation to catch corrupted province ID on loaded world");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A 1-point CultureSplit stroke must not panic; it should be reported as unapplied.
+#[test]
+fn culture_split_single_point_does_not_panic() {
+    let mut p = small_params(3);
+    p.cultures.ticks = 120;
+    let mut w = World::new(p);
+    w.edits.add_stroke(Stroke { tool: Tool::CultureSplit, points: vec![[10.0, 20.0]], ..Default::default() });
+    w.run_to(Step::Cultures, &|_, _, _| {});
+    let m = w.meta(Step::Cultures).unwrap();
+    let unapplied = m["unapplied_edits"].as_array().unwrap();
+    assert!(!unapplied.is_empty(), "single-point split should be recorded as unapplied");
+}
+
+/// Stage 4 cultural assimilation must accumulate under the default per-step rate (0.0015/yr)
+/// instead of being pruned to zero each tick, and province shares must remain valid.
+#[test]
+fn stage4_cultural_assimilation_accumulates_under_default_rate() {
+    use worldcore::directives::Directive;
+    let mut p = small_params(3);
+    p.cultures.ticks = 160;
+    p.nations.start_year = 1800;
+    p.nations.start_date = 1900;
+    p.nations.months_per_step = 6;
+    let mut w = World::new(p.clone());
+    w.run_to(Step::Nations, &|_, _, _| {});
+    let nt = w.meta(Step::Nations).unwrap()["table"].clone();
+    let provs = nt["provinces"].as_array().unwrap();
+    let nations = nt["nations"].as_array().unwrap();
+
+    // Every populated owned province has non-empty displayed shares (>= 5%) summing to <= 1.01.
+    for pr in provs {
+        if pr["owner"].as_u64().unwrap_or(0) > 0 && pr["population"].as_f64().unwrap_or(0.0) > 0.0 {
+            let shares = pr["shares"].as_array().unwrap();
+            assert!(!shares.is_empty(), "province {} lost all culture shares", pr["id"]);
+            let sum: f64 = shares.iter().filter_map(|s| s[1].as_f64()).sum();
+            assert!(sum > 0.0 && sum <= 1.01, "province {} shares sum to {sum}: {shares:?}", pr["id"]);
+        }
+    }
+
+    // Pick a surviving nation and a foreign-culture province (with 0% of that nation's primary
+    // culture), transfer it right at the start, and verify the ruler's primary culture accumulates
+    // above the 5% display cutoff over 100 years even though each 6-month step adds < 0.001.
+    let pair = nations.iter().find_map(|n| {
+        let nid = n["id"].as_u64()?;
+        let prim = n["primary_culture"].as_u64()?;
+        if !n["alive"].as_bool().unwrap_or(false) || prim == 0 {
+            return None;
+        }
+        let target = provs.iter().find(|pr| {
+            let pop = pr["population"].as_f64().unwrap_or(0.0);
+            let owner = pr["owner"].as_u64().unwrap_or(0);
+            let shares = pr["shares"].as_array();
+            owner > 0
+                && owner != nid
+                && pop > 5_000.0
+                && shares.is_some_and(|sh| !sh.is_empty() && sh.iter().all(|s| s[0].as_u64() != Some(prim)))
+        })?;
+        Some((nid, prim, target["id"].as_u64()?))
+    });
+    if let Some((nid, prim, pid)) = pair {
+        let mut w2 = World::new(p);
+        w2.edits.overrides.directives.push(Directive {
+            stage: "nations".into(),
+            at: 1802,
+            month: 1,
+            action: "transfer".into(),
+            args: serde_json::json!({ "nation": nid, "provinces": [pid] }),
+            note: String::new(),
+            by: String::new(),
+        });
+        w2.run_to(Step::Nations, &|_, _, _| {});
+        let pr = w2.meta(Step::Nations).unwrap()["table"]["provinces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"].as_u64() == Some(pid))
+            .unwrap();
+        if pr["owner"].as_u64() == Some(nid) {
+            let shares = pr["shares"].as_array().unwrap();
+            let got = shares.iter().find(|s| s[0].as_u64() == Some(prim)).and_then(|s| s[1].as_f64()).unwrap_or(0.0);
+            assert!(got >= 0.05, "expected primary culture {prim} to accumulate in province {pid}, got {got} (shares={shares:?})");
+        }
+    }
+}
+
+/// Session API clears stale live simulations on mutations and respects wind `limit`.
+#[test]
+fn session_live_sync_and_wind_limit() {
+    use worldcore::api::{handle, ProgressState, Reply, Session};
+    let mut p = small_params(3);
+    p.cultures.ticks = 40;
+    p.nations.start_year = 1800;
+    p.nations.start_date = 1810;
+    let session = std::sync::Mutex::new(Session::new(p));
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(ProgressState::default()));
+    let call_json = |cmd: &str, args: serde_json::Value| match handle(&session, &progress, cmd, args).unwrap() {
+        Reply::Json(v) => v,
+        _ => panic!("expected json for {cmd}"),
+    };
+
+    call_json("run", serde_json::json!({ "to": "climate" }));
+    let wbytes = match handle(&session, &progress, "wind", serde_json::json!({ "month": 0, "limit": 100 })).unwrap() {
+        Reply::Bytes(b) => b,
+        _ => panic!("expected bytes for wind"),
+    };
+    assert_eq!(wbytes.len(), 100 * 2 * 4);
+
+    // Start live Nations sim, verify active, then change a param and verify set_params clears it.
+    call_json("sim_start", serde_json::json!({ "stage": "nations" }));
+    assert!(!call_json("status", serde_json::json!({}))["live"].is_null());
+    let mut changed = session.lock().unwrap().world.params.clone();
+    changed.nations.assimilation += 0.001;
+    call_json("set_params", serde_json::json!({ "params": changed }));
+    assert!(call_json("status", serde_json::json!({}))["live"].is_null());
+
+    // Start live Nations sim again, then run nations to completion -> live must be cleared.
+    call_json("sim_start", serde_json::json!({ "stage": "nations" }));
+    assert!(!call_json("status", serde_json::json!({}))["live"].is_null());
+    call_json("run", serde_json::json!({ "to": "nations" }));
+    assert!(call_json("status", serde_json::json!({}))["live"].is_null());
 }

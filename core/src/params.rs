@@ -685,6 +685,30 @@ pub struct WorldParams {
 
 impl WorldParams {
     pub fn climate_level(&self) -> u32 {
-        self.climate.climate_level.min(self.planet.grid_level).max(4)
+        let gl = self.planet.grid_level.clamp(3, 10);
+        self.climate.climate_level.clamp(3, 10).min(gl).max(gl.min(4))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn climate_level_clamps_without_panicking() {
+        for gl in [0, 2, 3, 4, 6, 10, 99] {
+            for cl in [0, 2, 3, 4, 6, 10, 99] {
+                let mut p = WorldParams::default();
+                p.planet.grid_level = gl;
+                p.climate.climate_level = cl;
+                let eff = p.climate_level();
+                assert!((3..=10).contains(&eff), "eff={eff} out of 3..=10 for gl={gl}, cl={cl}");
+                assert!(eff <= gl.clamp(3, 10), "eff={eff} > clamped gl for gl={gl}, cl={cl}");
+            }
+        }
+        let mut p = WorldParams::default();
+        p.planet.grid_level = 3;
+        p.climate.climate_level = 6;
+        assert_eq!(p.climate_level(), 3);
     }
 }

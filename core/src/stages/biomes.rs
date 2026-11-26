@@ -98,14 +98,14 @@ pub fn koppen(t: &[f64; 12], p: &[f64; 12], north: bool, cd_threshold: f64) -> u
     let pdry = p.iter().cloned().fold(f64::MAX, f64::min);
     let summer = |m: usize| if north { (3..9).contains(&m) } else { !(3..9).contains(&m) };
     let (mut psdry, mut pswet, mut pwdry, mut pwwet, mut ps) = (f64::MAX, 0.0f64, f64::MAX, 0.0f64, 0.0);
-    for m in 0..12 {
+    for (m, &pm) in p.iter().enumerate() {
         if summer(m) {
-            psdry = psdry.min(p[m]);
-            pswet = pswet.max(p[m]);
-            ps += p[m];
+            psdry = psdry.min(pm);
+            pswet = pswet.max(pm);
+            ps += pm;
         } else {
-            pwdry = pwdry.min(p[m]);
-            pwwet = pwwet.max(p[m]);
+            pwdry = pwdry.min(pm);
+            pwwet = pwwet.max(pm);
         }
     }
     let pw = map - ps;
@@ -195,7 +195,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let relief: Vec<f32> = (0..n)
         .into_par_iter()
         .map(|i| {
-            let (mut lo, mut hi) = (elev[i], elev[i]);
+            let base = elev[i].max(0.0);
+            let (mut lo, mut hi) = (base, base);
             for &a in g.neighbors(i) {
                 for &b in g.neighbors(a as usize) {
                     let e = elev[b as usize].max(0.0);

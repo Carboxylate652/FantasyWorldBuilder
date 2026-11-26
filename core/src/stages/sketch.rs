@@ -232,11 +232,14 @@ fn from_drawing(ctx: &Ctx, drawn: &[f32], coast: &Noise, coast_freq: f64, rough:
 
 /// The value below which `fraction` of the planet's area lies.
 fn area_quantile(g: &crate::grid::Grid, raw: &[f64], fraction: f64) -> f64 {
+    if g.is_empty() {
+        return 0.0;
+    }
     let mut idx: Vec<usize> = (0..g.len()).collect();
-    idx.sort_by(|&a, &b| raw[a].partial_cmp(&raw[b]).unwrap().then(a.cmp(&b)));
-    let target = fraction * 4.0 * std::f64::consts::PI;
+    idx.sort_by(|&a, &b| raw[a].total_cmp(&raw[b]).then(a.cmp(&b)));
+    let target = fraction.clamp(0.0, 1.0) * 4.0 * std::f64::consts::PI;
     let mut acc = 0.0;
-    let mut thr = raw[idx[idx.len() / 2]];
+    let mut thr = raw[*idx.last().unwrap()];
     for &i in &idx {
         acc += g.area[i];
         if acc >= target {

@@ -33,18 +33,35 @@ pub fn louvain(n: usize, edges: &[(u32, u32, f64)], resolution: f64) -> Vec<u32>
 
 /// Renumber labels 0.. in order of first appearance; returns the count.
 pub fn renumber(labels: &mut [u32]) -> usize {
-    let max = labels.iter().copied().max().map_or(0, |m| m as usize + 1);
-    let mut map = vec![u32::MAX; max];
-    let mut next = 0u32;
-    for l in labels.iter_mut() {
-        let m = &mut map[*l as usize];
-        if *m == u32::MAX {
-            *m = next;
-            next += 1;
-        }
-        *l = *m;
+    let max = labels.iter().copied().max().map_or(0, |m| m as usize);
+    if labels.is_empty() {
+        return 0;
     }
-    next as usize
+    if max < labels.len().saturating_mul(4).max(1024) {
+        let mut map = vec![u32::MAX; max + 1];
+        let mut next = 0u32;
+        for l in labels.iter_mut() {
+            let m = &mut map[*l as usize];
+            if *m == u32::MAX {
+                *m = next;
+                next += 1;
+            }
+            *l = *m;
+        }
+        next as usize
+    } else {
+        let mut map = std::collections::HashMap::with_capacity(labels.len());
+        let mut next = 0u32;
+        for l in labels.iter_mut() {
+            let id = *map.entry(*l).or_insert_with(|| {
+                let id = next;
+                next += 1;
+                id
+            });
+            *l = id;
+        }
+        next as usize
+    }
 }
 
 /// Compressed adjacency with separate self-loop weights.
@@ -63,7 +80,7 @@ impl Graph {
         let mut lists: Vec<Vec<(u32, f64)>> = vec![Vec::new(); n];
         let mut selfw = vec![0.0; n];
         for &(a, b, w) in edges {
-            if w <= 0.0 {
+            if !(w > 0.0 && w.is_finite()) || (a as usize) >= n || (b as usize) >= n {
                 continue;
             }
             if a == b {
@@ -180,18 +197,19 @@ impl Graph {
 /// Modularity of a partition at the given resolution (for tests and reports).
 pub fn modularity(n: usize, edges: &[(u32, u32, f64)], comm: &[u32], resolution: f64) -> f64 {
     let g = Graph::new(n, edges);
-    if g.m2 <= 0.0 {
+    if g.m2 <= 0.0 || n == 0 || comm.len() < n {
         return 0.0;
     }
-    let k = comm.iter().copied().max().map_or(0, |m| m as usize + 1);
+    let mut compact = comm[..n].to_vec();
+    let k = renumber(&mut compact);
     let mut inside = vec![0.0; k];
     let mut tot = vec![0.0; k];
     for i in 0..n {
-        let c = comm[i] as usize;
+        let c = compact[i] as usize;
         tot[c] += g.deg[i];
         inside[c] += 2.0 * g.selfw[i];
         for &(j, w) in g.neighbours(i) {
-            if comm[j as usize] as usize == c {
+            if compact[j as usize] as usize == c {
                 inside[c] += w;
             }
         }
