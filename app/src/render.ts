@@ -163,15 +163,33 @@ function compile(gl: WebGL2RenderingContext, vs: string, fs: string): WebGLProgr
     const s = gl.createShader(type)!;
     gl.shaderSource(s, src);
     gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) ?? 'shader error');
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(s) ?? 'shader error';
+      gl.deleteShader(s);
+      throw new Error(log);
+    }
     return s;
   };
+  const vShader = mk(gl.VERTEX_SHADER, vs);
+  let fShader: WebGLShader | null = null;
   const p = gl.createProgram()!;
-  gl.attachShader(p, mk(gl.VERTEX_SHADER, vs));
-  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
-  gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) ?? 'link error');
-  return p;
+  try {
+    fShader = mk(gl.FRAGMENT_SHADER, fs);
+    gl.attachShader(p, vShader);
+    gl.attachShader(p, fShader);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      const log = gl.getProgramInfoLog(p) ?? 'link error';
+      gl.deleteProgram(p);
+      throw new Error(log);
+    }
+    gl.detachShader(p, vShader);
+    gl.detachShader(p, fShader);
+    return p;
+  } finally {
+    gl.deleteShader(vShader);
+    if (fShader) gl.deleteShader(fShader);
+  }
 }
 
 // ---- small matrix helpers (column-major)
@@ -207,6 +225,28 @@ export type LineSet = { pos: Float32Array; color: Float32Array; count: number };
 /** Segments with a width in CSS pixels: a/b are xyz (globe) or lon,lat,0 (flat). */
 export type RibbonSet = { a: Float32Array; b: Float32Array; width: Float32Array; color: Float32Array; count: number };
 
+type GpuLine = {
+  vao: WebGLVertexArrayObject;
+  posBuf: WebGLBuffer;
+  colBuf: WebGLBuffer;
+  count: number;
+};
+
+type GpuLinePair = { globe: GpuLine; flat: GpuLine };
+
+type GpuRibbon = {
+  vao: WebGLVertexArrayObject;
+  aBuf: WebGLBuffer;
+  bBuf: WebGLBuffer;
+  wBuf: WebGLBuffer;
+  cBuf: WebGLBuffer;
+  count: number;
+};
+
+type GpuRibbonPair = { globe: GpuRibbon; flat: GpuRibbon };
+
+const LIGHT_VEC = norm([-0.5, 0.6, 0.65]);
+
 export class Renderer {
   gl: WebGL2RenderingContext;
   canvas: HTMLCanvasElement;
@@ -223,23 +263,57 @@ export class Renderer {
   smooth = false;
   private mesh: WebGLProgram;
   private line: WebGLProgram;
+  private ribbonProg: WebGLProgram;
+  private meshU: {
+    uTris: WebGLUniformLocation | null;
+    uPos: WebGLUniformLocation | null;
+    uColor: WebGLUniformLocation | null;
+    uElev: WebGLUniformLocation | null;
+    uMVP: WebGLUniformLocation | null;
+    uMode: WebGLUniformLocation | null;
+    uSmooth: WebGLUniformLocation | null;
+    uExag: WebGLUniformLocation | null;
+    uFlat: WebGLUniformLocation | null;
+    uLight: WebGLUniformLocation | null;
+  };
+  private lineU: {
+    uMVP: WebGLUniformLocation | null;
+    uMode: WebGLUniformLocation | null;
+    uFlat: WebGLUniformLocation | null;
+    uShift: WebGLUniformLocation | null;
+  };
+  private ribbonU: {
+    uMVP: WebGLUniformLocation | null;
+    uMode: WebGLUniformLocation | null;
+    uFlat: WebGLUniformLocation | null;
+    uViewport: WebGLUniformLocation | null;
+    uScale: WebGLUniformLocation | null;
+    uShift: WebGLUniformLocation | null;
+  };
+  private lineAttr: { aPos: number; aColor: number };
+  private ribbonAttr: { aA: number; aB: number; aW: number; aC: number };
   private triTex: WebGLTexture | null = null;
   private posTex: WebGLTexture | null = null;
   private colorTex: WebGLTexture | null = null;
   private elevTex: WebGLTexture | null = null;
+  private colorBuf: Uint8Array | null = null;
+  private elevBuf: Float32Array | null = null;
   private triCount = 0;
   private nCells = 0;
   private vao: WebGLVertexArrayObject;
-  private lineVao: WebGLVertexArrayObject;
-  private lineBuf: WebGLBuffer;
-  private lineColBuf: WebGLBuffer;
-  private overlays: Map<string, { globe: LineSet; flat: LineSet }> = new Map();
-  private graticule: { globe: LineSet; flat: LineSet } | null = null;
-  private ribbonProg: WebGLProgram;
-  private ribbonVao: WebGLVertexArrayObject;
-  private ribbonBufs: Record<string, WebGLBuffer> = {};
-  private ribbons: Map<string, { globe: RibbonSet; flat: RibbonSet }> = new Map();
-  private dirty = true;
+  private overlays: Map<string, GpuLinePair> = new Map();
+  private graticule: GpuLinePair | null = null;
+  private ribbons: Map<string, GpuRibbonPair> = new Map();
+  private dirty = false;
+  private rafId: number | null = null;
+  private disposed = false;
+  private contextLost = false;
+  private clearColor: [number, number, number] = [0.05, 0.07, 0.09];
+  private ro: ResizeObserver;
+  private themeMedia: MediaQueryList | null = null;
+  private onThemeChange: () => void;
+  private onContextLost: (e: Event) => void;
+  private onContextRestored: () => void;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -248,46 +322,216 @@ export class Renderer {
     this.gl = gl;
     this.mesh = compile(gl, MESH_VS, MESH_FS);
     this.line = compile(gl, LINE_VS, LINE_FS);
-    this.vao = gl.createVertexArray()!;
-    this.lineVao = gl.createVertexArray()!;
-    this.lineBuf = gl.createBuffer()!;
-    this.lineColBuf = gl.createBuffer()!;
-    gl.bindVertexArray(this.lineVao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
-    const aPos = gl.getAttribLocation(this.line, 'aPos');
-    gl.enableVertexAttribArray(aPos);
-    gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.lineColBuf);
-    const aCol = gl.getAttribLocation(this.line, 'aColor');
-    gl.enableVertexAttribArray(aCol);
-    gl.vertexAttribPointer(aCol, 4, gl.FLOAT, false, 0, 0);
-    gl.bindVertexArray(null);
     this.ribbonProg = compile(gl, RIBBON_VS, LINE_FS);
-    this.ribbonVao = gl.createVertexArray()!;
-    gl.bindVertexArray(this.ribbonVao);
-    for (const [name, size] of [['aA', 3], ['aB', 3], ['aW', 1], ['aC', 4]] as [string, number][]) {
-      const buf = gl.createBuffer()!;
-      this.ribbonBufs[name] = buf;
-      const loc = gl.getAttribLocation(this.ribbonProg, name);
-      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.enableVertexAttribArray(loc);
-      gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
-      gl.vertexAttribDivisor(loc, 1);
+    this.meshU = {
+      uTris: gl.getUniformLocation(this.mesh, 'uTris'),
+      uPos: gl.getUniformLocation(this.mesh, 'uPos'),
+      uColor: gl.getUniformLocation(this.mesh, 'uColor'),
+      uElev: gl.getUniformLocation(this.mesh, 'uElev'),
+      uMVP: gl.getUniformLocation(this.mesh, 'uMVP'),
+      uMode: gl.getUniformLocation(this.mesh, 'uMode'),
+      uSmooth: gl.getUniformLocation(this.mesh, 'uSmooth'),
+      uExag: gl.getUniformLocation(this.mesh, 'uExag'),
+      uFlat: gl.getUniformLocation(this.mesh, 'uFlat'),
+      uLight: gl.getUniformLocation(this.mesh, 'uLight'),
+    };
+    this.lineU = {
+      uMVP: gl.getUniformLocation(this.line, 'uMVP'),
+      uMode: gl.getUniformLocation(this.line, 'uMode'),
+      uFlat: gl.getUniformLocation(this.line, 'uFlat'),
+      uShift: gl.getUniformLocation(this.line, 'uShift'),
+    };
+    this.ribbonU = {
+      uMVP: gl.getUniformLocation(this.ribbonProg, 'uMVP'),
+      uMode: gl.getUniformLocation(this.ribbonProg, 'uMode'),
+      uFlat: gl.getUniformLocation(this.ribbonProg, 'uFlat'),
+      uViewport: gl.getUniformLocation(this.ribbonProg, 'uViewport'),
+      uScale: gl.getUniformLocation(this.ribbonProg, 'uScale'),
+      uShift: gl.getUniformLocation(this.ribbonProg, 'uShift'),
+    };
+    this.lineAttr = {
+      aPos: gl.getAttribLocation(this.line, 'aPos'),
+      aColor: gl.getAttribLocation(this.line, 'aColor'),
+    };
+    this.ribbonAttr = {
+      aA: gl.getAttribLocation(this.ribbonProg, 'aA'),
+      aB: gl.getAttribLocation(this.ribbonProg, 'aB'),
+      aW: gl.getAttribLocation(this.ribbonProg, 'aW'),
+      aC: gl.getAttribLocation(this.ribbonProg, 'aC'),
+    };
+    this.vao = gl.createVertexArray()!;
+
+    this.updateTheme();
+    this.onThemeChange = () => {
+      this.updateTheme();
+      this.requestDraw();
+    };
+    if (typeof window.matchMedia === 'function') {
+      this.themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+      this.themeMedia.addEventListener?.('change', this.onThemeChange);
     }
-    gl.bindVertexArray(null);
-    const loop = () => {
-      if (this.dirty) {
+
+    this.onContextLost = (e: Event) => {
+      e.preventDefault();
+      this.contextLost = true;
+    };
+    this.onContextRestored = () => {
+      this.contextLost = false;
+      this.requestDraw();
+    };
+    canvas.addEventListener('webglcontextlost', this.onContextLost);
+    canvas.addEventListener('webglcontextrestored', this.onContextRestored);
+
+    this.ro = new ResizeObserver(() => {
+      this.updateTheme();
+      this.requestDraw();
+    });
+    this.ro.observe(canvas);
+    this.requestDraw();
+  }
+
+  updateTheme() {
+    const bg = getComputedStyle(document.documentElement).getPropertyValue('--viewport-bg').trim() || '#0d1117';
+    this.clearColor = parseColor(bg);
+  }
+
+  private schedule() {
+    if (this.rafId !== null || this.disposed) return;
+    this.rafId = requestAnimationFrame(() => {
+      this.rafId = null;
+      if (this.dirty && !this.disposed) {
         this.dirty = false;
         this.draw();
       }
-      requestAnimationFrame(loop);
-    };
-    requestAnimationFrame(loop);
-    new ResizeObserver(() => this.requestDraw()).observe(canvas);
+    });
   }
 
   requestDraw() {
     this.dirty = true;
+    this.schedule();
+  }
+
+  setExag(v: number) {
+    if (this.exag === v) return;
+    this.exag = v;
+    this.requestDraw();
+  }
+
+  private createGpuLine(): GpuLine {
+    const gl = this.gl;
+    const vao = gl.createVertexArray()!;
+    const posBuf = gl.createBuffer()!;
+    const colBuf = gl.createBuffer()!;
+    gl.bindVertexArray(vao);
+    if (this.lineAttr.aPos >= 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+      gl.enableVertexAttribArray(this.lineAttr.aPos);
+      gl.vertexAttribPointer(this.lineAttr.aPos, 3, gl.FLOAT, false, 0, 0);
+    }
+    if (this.lineAttr.aColor >= 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
+      gl.enableVertexAttribArray(this.lineAttr.aColor);
+      gl.vertexAttribPointer(this.lineAttr.aColor, 4, gl.FLOAT, false, 0, 0);
+    }
+    gl.bindVertexArray(null);
+    return { vao, posBuf, colBuf, count: 0 };
+  }
+
+  private uploadGpuLine(dst: GpuLine, set: LineSet, usage: number) {
+    const gl = this.gl;
+    dst.count = set.count;
+    if (set.count === 0) return;
+    gl.bindBuffer(gl.ARRAY_BUFFER, dst.posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, set.pos, usage);
+    gl.bindBuffer(gl.ARRAY_BUFFER, dst.colBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, set.color, usage);
+  }
+
+  private deleteGpuLinePair(pair: GpuLinePair) {
+    const gl = this.gl;
+    for (const part of [pair.globe, pair.flat]) {
+      gl.deleteBuffer(part.posBuf);
+      gl.deleteBuffer(part.colBuf);
+      gl.deleteVertexArray(part.vao);
+    }
+  }
+
+  private createGpuRibbon(): GpuRibbon {
+    const gl = this.gl;
+    const vao = gl.createVertexArray()!;
+    const aBuf = gl.createBuffer()!;
+    const bBuf = gl.createBuffer()!;
+    const wBuf = gl.createBuffer()!;
+    const cBuf = gl.createBuffer()!;
+    gl.bindVertexArray(vao);
+    const bindAttr = (loc: number, buf: WebGLBuffer, size: number) => {
+      if (loc < 0) return;
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+      gl.vertexAttribDivisor(loc, 1);
+    };
+    bindAttr(this.ribbonAttr.aA, aBuf, 3);
+    bindAttr(this.ribbonAttr.aB, bBuf, 3);
+    bindAttr(this.ribbonAttr.aW, wBuf, 1);
+    bindAttr(this.ribbonAttr.aC, cBuf, 4);
+    gl.bindVertexArray(null);
+    return { vao, aBuf, bBuf, wBuf, cBuf, count: 0 };
+  }
+
+  private uploadGpuRibbon(dst: GpuRibbon, set: RibbonSet) {
+    const gl = this.gl;
+    dst.count = set.count;
+    if (set.count === 0) return;
+    gl.bindBuffer(gl.ARRAY_BUFFER, dst.aBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, set.a, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, dst.bBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, set.b, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, dst.wBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, set.width, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, dst.cBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, set.color, gl.STATIC_DRAW);
+  }
+
+  private deleteGpuRibbonPair(pair: GpuRibbonPair) {
+    const gl = this.gl;
+    for (const part of [pair.globe, pair.flat]) {
+      gl.deleteBuffer(part.aBuf);
+      gl.deleteBuffer(part.bBuf);
+      gl.deleteBuffer(part.wBuf);
+      gl.deleteBuffer(part.cBuf);
+      gl.deleteVertexArray(part.vao);
+    }
+  }
+
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    this.ro.disconnect();
+    this.themeMedia?.removeEventListener?.('change', this.onThemeChange);
+    this.canvas.removeEventListener('webglcontextlost', this.onContextLost);
+    this.canvas.removeEventListener('webglcontextrestored', this.onContextRestored);
+    const gl = this.gl;
+    for (const t of [this.triTex, this.posTex, this.colorTex, this.elevTex]) if (t) gl.deleteTexture(t);
+    this.triTex = this.posTex = this.colorTex = this.elevTex = null;
+    if (this.graticule) {
+      this.deleteGpuLinePair(this.graticule);
+      this.graticule = null;
+    }
+    for (const pair of this.overlays.values()) this.deleteGpuLinePair(pair);
+    this.overlays.clear();
+    for (const pair of this.ribbons.values()) this.deleteGpuRibbonPair(pair);
+    this.ribbons.clear();
+    gl.deleteVertexArray(this.vao);
+    gl.deleteProgram(this.mesh);
+    gl.deleteProgram(this.line);
+    gl.deleteProgram(this.ribbonProg);
+    this.colorBuf = null;
+    this.elevBuf = null;
   }
 
   private tex(internal: number, format: number, type: number, data: ArrayBufferView, comps: number, count: number): WebGLTexture {
@@ -314,46 +558,88 @@ export class Renderer {
     this.elevTex = this.tex(gl.R32F, gl.RED, gl.FLOAT, new Float32Array(g.n), 1, g.n);
     this.triCount = g.t;
     this.nCells = g.n;
+    const rows = Math.max(1, Math.ceil(g.n / TEX_W));
+    this.colorBuf = new Uint8Array(TEX_W * rows * 4);
+    this.elevBuf = new Float32Array(TEX_W * rows);
     this.requestDraw();
   }
 
   setColors(rgba: Uint8Array) {
+    if (!this.colorTex || this.nCells === 0) return;
     const gl = this.gl;
-    const rows = Math.ceil(this.nCells / TEX_W);
-    const full = new Uint8Array(TEX_W * rows * 4);
-    full.set(rgba);
+    const rows = Math.max(1, Math.ceil(this.nCells / TEX_W));
+    const needed = TEX_W * rows * 4;
+    if (!this.colorBuf || this.colorBuf.length !== needed) {
+      this.colorBuf = new Uint8Array(needed);
+    }
+    this.colorBuf.set(rgba);
     gl.bindTexture(gl.TEXTURE_2D, this.colorTex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, TEX_W, rows, gl.RGBA, gl.UNSIGNED_BYTE, full);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, TEX_W, rows, gl.RGBA, gl.UNSIGNED_BYTE, this.colorBuf);
     this.requestDraw();
   }
 
   /** Elevation for globe displacement, as a fraction of the radius. */
   setRelief(frac: Float32Array) {
+    if (!this.elevTex || this.nCells === 0) return;
     const gl = this.gl;
-    const rows = Math.ceil(this.nCells / TEX_W);
-    const full = new Float32Array(TEX_W * rows);
-    full.set(frac);
+    const rows = Math.max(1, Math.ceil(this.nCells / TEX_W));
+    const needed = TEX_W * rows;
+    if (!this.elevBuf || this.elevBuf.length !== needed) {
+      this.elevBuf = new Float32Array(needed);
+    }
+    this.elevBuf.set(frac);
     gl.bindTexture(gl.TEXTURE_2D, this.elevTex);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, TEX_W, rows, gl.RED, gl.FLOAT, full);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, TEX_W, rows, gl.RED, gl.FLOAT, this.elevBuf);
     this.requestDraw();
   }
 
   setOverlay(name: string, globe: LineSet | null, flat: LineSet | null) {
-    if (!globe || !flat) this.overlays.delete(name);
-    else this.overlays.set(name, { globe, flat });
+    const existing = this.overlays.get(name);
+    if (!globe || !flat) {
+      if (existing) {
+        this.deleteGpuLinePair(existing);
+        this.overlays.delete(name);
+      }
+    } else {
+      const pair = existing ?? { globe: this.createGpuLine(), flat: this.createGpuLine() };
+      const usage = name === 'brush' ? this.gl.DYNAMIC_DRAW : this.gl.STATIC_DRAW;
+      this.uploadGpuLine(pair.globe, globe, usage);
+      this.uploadGpuLine(pair.flat, flat, usage);
+      if (!existing) this.overlays.set(name, pair);
+    }
     this.requestDraw();
   }
 
   /** Reference lines drawn under every other overlay (null removes them). */
   setGraticule(globe: LineSet | null, flat: LineSet | null) {
-    this.graticule = globe && flat ? { globe, flat } : null;
+    if (!globe || !flat) {
+      if (this.graticule) {
+        this.deleteGpuLinePair(this.graticule);
+        this.graticule = null;
+      }
+    } else {
+      const pair = this.graticule ?? { globe: this.createGpuLine(), flat: this.createGpuLine() };
+      this.uploadGpuLine(pair.globe, globe, this.gl.STATIC_DRAW);
+      this.uploadGpuLine(pair.flat, flat, this.gl.STATIC_DRAW);
+      this.graticule = pair;
+    }
     this.requestDraw();
   }
 
   setRibbons(name: string, globe: RibbonSet | null, flat: RibbonSet | null) {
-    if (!globe || !flat) this.ribbons.delete(name);
-    else this.ribbons.set(name, { globe, flat });
+    const existing = this.ribbons.get(name);
+    if (!globe || !flat) {
+      if (existing) {
+        this.deleteGpuRibbonPair(existing);
+        this.ribbons.delete(name);
+      }
+    } else {
+      const pair = existing ?? { globe: this.createGpuRibbon(), flat: this.createGpuRibbon() };
+      this.uploadGpuRibbon(pair.globe, globe);
+      this.uploadGpuRibbon(pair.flat, flat);
+      if (!existing) this.ribbons.set(name, pair);
+    }
     this.requestDraw();
   }
 
@@ -384,11 +670,11 @@ export class Renderer {
   }
 
   draw() {
+    if (this.disposed || this.contextLost) return;
     const gl = this.gl;
     const [w, h] = this.resize();
     gl.viewport(0, 0, w, h);
-    const bg = getComputedStyle(document.documentElement).getPropertyValue('--viewport-bg').trim() || '#0d1117';
-    const c = parseColor(bg);
+    const c = this.clearColor;
     gl.clearColor(c[0], c[1], c[2], 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     if (!this.triTex) return;
@@ -397,23 +683,22 @@ export class Renderer {
 
     gl.useProgram(this.mesh);
     gl.bindVertexArray(this.vao);
-    const U = (n: string) => gl.getUniformLocation(this.mesh, n);
-    const bind = (unit: number, t: WebGLTexture | null, name: string) => {
+    const u = this.meshU;
+    const bind = (unit: number, t: WebGLTexture | null, loc: WebGLUniformLocation | null) => {
       gl.activeTexture(gl.TEXTURE0 + unit);
       gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.uniform1i(U(name), unit);
+      gl.uniform1i(loc, unit);
     };
-    bind(0, this.triTex, 'uTris');
-    bind(1, this.posTex, 'uPos');
-    bind(2, this.colorTex, 'uColor');
-    bind(3, this.elevTex, 'uElev');
-    gl.uniformMatrix4fv(U('uMVP'), false, mvp);
-    gl.uniform1i(U('uMode'), this.mode);
-    gl.uniform1i(U('uSmooth'), this.smooth ? 1 : 0);
-    gl.uniform1f(U('uExag'), this.exag);
-    gl.uniform4f(U('uFlat'), fl[0], fl[1], fl[2], fl[3]);
-    const lv = norm([-0.5, 0.6, 0.65]);
-    gl.uniform3f(U('uLight'), lv[0], lv[1], lv[2]);
+    bind(0, this.triTex, u.uTris);
+    bind(1, this.posTex, u.uPos);
+    bind(2, this.colorTex, u.uColor);
+    bind(3, this.elevTex, u.uElev);
+    gl.uniformMatrix4fv(u.uMVP, false, mvp);
+    gl.uniform1i(u.uMode, this.mode);
+    gl.uniform1i(u.uSmooth, this.smooth ? 1 : 0);
+    gl.uniform1f(u.uExag, this.exag);
+    gl.uniform4f(u.uFlat, fl[0], fl[1], fl[2], fl[3]);
+    gl.uniform3f(u.uLight, LIGHT_VEC[0], LIGHT_VEC[1], LIGHT_VEC[2]);
     if (this.mode === 0) {
       gl.enable(gl.DEPTH_TEST);
       gl.enable(gl.CULL_FACE);
@@ -432,58 +717,58 @@ export class Renderer {
     // Ribbons (rivers), drawn under the line overlays.
     if (this.ribbons.size) {
       gl.useProgram(this.ribbonProg);
-      gl.bindVertexArray(this.ribbonVao);
-      const Q = (n: string) => gl.getUniformLocation(this.ribbonProg, n);
-      gl.uniformMatrix4fv(Q('uMVP'), false, mvp);
-      gl.uniform1i(Q('uMode'), this.mode);
-      gl.uniform4f(Q('uFlat'), fl[0], fl[1], fl[2], fl[3]);
-      gl.uniform2f(Q('uViewport'), w, h);
+      const q = this.ribbonU;
+      gl.uniformMatrix4fv(q.uMVP, false, mvp);
+      gl.uniform1i(q.uMode, this.mode);
+      gl.uniform4f(q.uFlat, fl[0], fl[1], fl[2], fl[3]);
+      gl.uniform2f(q.uViewport, w, h);
       const dpr = window.devicePixelRatio || 1;
       // Rivers thicken a little as you zoom in.
       const zoomK = this.mode === 0 ? Math.min(3, Math.max(0.8, Math.sqrt(2.2 / (this.dist - 1)))) : Math.min(3, Math.max(0.8, Math.sqrt(this.zoom)));
-      gl.uniform1f(Q('uScale'), dpr * zoomK);
+      gl.uniform1f(q.uScale, dpr * zoomK);
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      const shifts = this.mode === 0 ? [0] : [-2 * Math.PI, 0, 2 * Math.PI];
       for (const rb of this.ribbons.values()) {
         const set = this.mode === 0 ? rb.globe : rb.flat;
         if (!set.count) continue;
-        const put = (n: string, d: Float32Array) => { gl.bindBuffer(gl.ARRAY_BUFFER, this.ribbonBufs[n]); gl.bufferData(gl.ARRAY_BUFFER, d, gl.DYNAMIC_DRAW); };
-        put('aA', set.a); put('aB', set.b); put('aW', set.width); put('aC', set.color);
-        for (const s of this.mode === 0 ? [0] : [-2 * Math.PI, 0, 2 * Math.PI]) {
-          gl.uniform1f(Q('uShift'), s);
+        gl.bindVertexArray(set.vao);
+        for (const s of shifts) {
+          gl.uniform1f(q.uShift, s);
           gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, set.count);
         }
       }
       gl.disable(gl.BLEND);
+      gl.bindVertexArray(null);
     }
 
     // Line overlays (wind, plate motion, hairline borders, markers).
-    this.drawLines([...this.overlays.values()].map((ov) => (this.mode === 0 ? ov.globe : ov.flat)), mvp, fl);
+    if (this.overlays.size) {
+      const sets: GpuLine[] = [];
+      for (const ov of this.overlays.values()) sets.push(this.mode === 0 ? ov.globe : ov.flat);
+      this.drawLines(sets, mvp, fl);
+    }
   }
 
   /** Hairlines (GL lines) over the map; on the flat map, also one world to each side. */
-  private drawLines(sets: LineSet[], mvp: M4, fl: [number, number, number, number]) {
+  private drawLines(sets: GpuLine[], mvp: M4, fl: [number, number, number, number]) {
     const gl = this.gl;
     gl.useProgram(this.line);
-    gl.bindVertexArray(this.lineVao);
-    const L = (n: string) => gl.getUniformLocation(this.line, n);
-    gl.uniformMatrix4fv(L('uMVP'), false, mvp);
-    gl.uniform1i(L('uMode'), this.mode);
-    gl.uniform4f(L('uFlat'), fl[0], fl[1], fl[2], fl[3]);
+    const l = this.lineU;
+    gl.uniformMatrix4fv(l.uMVP, false, mvp);
+    gl.uniform1i(l.uMode, this.mode);
+    gl.uniform4f(l.uFlat, fl[0], fl[1], fl[2], fl[3]);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     for (const set of sets) {
       if (set.count === 0) continue;
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
-      gl.bufferData(gl.ARRAY_BUFFER, set.pos, gl.DYNAMIC_DRAW);
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.lineColBuf);
-      gl.bufferData(gl.ARRAY_BUFFER, set.color, gl.DYNAMIC_DRAW);
+      gl.bindVertexArray(set.vao);
       if (this.mode === 0) {
-        gl.uniform1f(L('uShift'), 0);
+        gl.uniform1f(l.uShift, 0);
         gl.drawArrays(gl.LINES, 0, set.count);
       } else {
         for (const s of [-2 * Math.PI, 0, 2 * Math.PI]) {
-          gl.uniform1f(L('uShift'), s);
+          gl.uniform1f(l.uShift, s);
           gl.drawArrays(gl.LINES, 0, set.count);
         }
       }
