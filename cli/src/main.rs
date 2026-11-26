@@ -1,7 +1,9 @@
 //! `worldgen` — headless Fantasy World Maker: batch generation, seed sweeps,
 //! determinism checks, export, and an HTTP server for the UI.
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use worldcore::api::{self, ProgressState, Reply, Session};
@@ -63,11 +65,17 @@ USAGE:
   worldgen serve [--port 8765] [--static DIR] [--project DIR] [--debug]
 
 LAYERS: sketch, plates, elevation, biomes, barriers, sites, fertility, states,
-        provinces, bands, attraction
+        provinces, bands, attraction, cultures, nation_seeds, directives
 
 STEPS: planet, sketch, plates, relief, climate, hydrology, biomes (Stage 1),
        habitability, states, provinces (Stage 2), cultures (Stage 3), nations (Stage 4; default: nations)
 ";
+
+/// Flags that never take a following value token (so they do not swallow positional arguments).
+const BOOL_FLAGS: &[&str] = &[
+    "run", "json", "remove", "replace", "debug", "export", "no-export", "list", "betas", "stable",
+    "prereleases", "no-open", "help",
+];
 
 struct Args {
     pos: Vec<String>,
@@ -76,18 +84,31 @@ struct Args {
 
 impl Args {
     fn parse() -> Args {
+        Self::parse_from(std::env::args().skip(1))
+    }
+    fn parse_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
         let mut pos = Vec::new();
         let mut opts = Vec::new();
-        let raw: Vec<String> = std::env::args().skip(1).collect();
+        let raw: Vec<String> = iter.into_iter().collect();
         let mut i = 0;
         while i < raw.len() {
             let a = &raw[i];
-            if let Some(k) = a.strip_prefix("--") {
-                let v = raw.get(i + 1).filter(|v| !v.starts_with("--")).cloned();
-                if v.is_some() {
-                    i += 1;
+            if a == "--" {
+                pos.extend(raw[i + 1..].iter().cloned());
+                break;
+            }
+            if let Some(rest) = a.strip_prefix("--") {
+                if let Some((k, v)) = rest.split_once('=') {
+                    opts.push((k.to_string(), Some(v.to_string())));
+                } else if BOOL_FLAGS.contains(&rest) {
+                    opts.push((rest.to_string(), None));
+                } else {
+                    let v = raw.get(i + 1).filter(|v| !v.starts_with("--")).cloned();
+                    if v.is_some() {
+                        i += 1;
+                    }
+                    opts.push((rest.to_string(), v));
                 }
-                opts.push((k.to_string(), v));
             } else {
                 pos.push(a.clone());
             }
@@ -101,8 +122,47 @@ impl Args {
     fn flag(&self, k: &str) -> bool {
         self.opts.iter().any(|(n, _)| n == k)
     }
+    fn opt_raw(&self, k: &str) -> Option<Option<&str>> {
+        self.opts.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_deref())
+    }
+    fn parse_num<T: std::str::FromStr>(&self, k: &str, d: T) -> Result<T, String> {
+        match self.opt_raw(k) {
+            None => Ok(d),
+            Some(None) => Err(format!("missing value for --{k}")),
+            Some(Some(v)) => v.parse::<T>().map_err(|_| format!("invalid --{k} `{v}`")),
+        }
+    }
     fn num<T: std::str::FromStr>(&self, k: &str, d: T) -> T {
-        self.get(k).and_then(|v| v.parse().ok()).unwrap_or(d)
+        self.parse_num(k, d).unwrap_or_else(|e| die(&e))
+    }
+    fn parse_fnum(&self, k: &str, d: f64) -> Result<f64, String> {
+        match self.opt_raw(k) {
+            None => Ok(d),
+            Some(None) => Err(format!("missing value for --{k}")),
+            Some(Some(v)) => {
+                let parsed = v.parse::<f64>().map_err(|_| format!("invalid --{k} `{v}`"))?;
+                if !parsed.is_finite() {
+                    return Err(format!("--{k} must be a finite number (got `{v}`)"));
+                }
+                Ok(parsed)
+            }
+        }
+    }
+    fn fnum(&self, k: &str, d: f64) -> f64 {
+        self.parse_fnum(k, d).unwrap_or_else(|e| die(&e))
+    }
+    fn opt_fnum(&self, k: &str) -> Option<f64> {
+        match self.opt_raw(k) {
+            None => None,
+            Some(None) => die(&format!("missing value for --{k}")),
+            Some(Some(v)) => {
+                let parsed = v.parse::<f64>().unwrap_or_else(|_| die(&format!("invalid --{k} `{v}`")));
+                if !parsed.is_finite() {
+                    die(&format!("--{k} must be a finite number (got `{v}`)"));
+                }
+                Some(parsed)
+            }
+        }
     }
 }
 
@@ -135,8 +195,8 @@ fn export_opts(args: &Args) -> ExportOptions {
     ExportOptions {
         width: args.num("width", d.width),
         height: args.num("height", d.height),
-        lat_min: args.num("lat-min", d.lat_min),
-        lat_max: args.num("lat-max", d.lat_max),
+        lat_min: args.fnum("lat-min", d.lat_min),
+        lat_max: args.fnum("lat-max", d.lat_max),
         ..d
     }
 }
@@ -177,7 +237,7 @@ fn summary(w: &World) {
             "hydrology" => format!("{:.0} km of rivers along cell edges, {} lakes ({} endorheic)", m["river_km"].as_f64().unwrap_or(0.0), m["lakes"], m["endorheic_lakes"]),
             "biomes" => {
                 let mut v: Vec<(String, f64)> = m["koppen_share"].as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_f64().unwrap_or(0.0))).collect()).unwrap_or_default();
-                v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                v.sort_by(|a, b| b.1.total_cmp(&a.1));
                 v.iter().take(6).map(|(k, s)| format!("{k} {:.0}%", s * 100.0)).collect::<Vec<_>>().join(", ")
             }
             "habitability" => format!(
@@ -256,7 +316,11 @@ fn main() {
             let out = PathBuf::from(args.get("out").unwrap_or_else(|| die("missing --out")));
             let seeds = args.get("seeds").unwrap_or("1..4");
             let (a, b) = seeds.split_once("..").unwrap_or_else(|| die("--seeds A..B"));
-            let (a, b): (u64, u64) = (a.parse().unwrap_or(1), b.parse().unwrap_or(4));
+            let a: u64 = a.parse().unwrap_or_else(|_| die(&format!("invalid --seeds start `{a}`")));
+            let b: u64 = b.parse().unwrap_or_else(|_| die(&format!("invalid --seeds end `{b}`")));
+            if a > b {
+                die(&format!("--seeds start ({a}) must be <= end ({b})"));
+            }
             let to = step_arg(&args);
             let mut csv = String::from("seed;level;land_pct;states;provinces;land_provinces;cultures;culture_groups;population_m;cash_crop_provinces;oil_provinces;unapplied_edits;validation;seconds\n");
             for seed in a..=b {
@@ -305,11 +369,11 @@ fn main() {
             let mut w = World::load(&dir).unwrap_or_else(|e| die(&e));
             let enc = match args.get("encoding").unwrap_or("heightmap16") {
                 "heightmap16" => HeightEncoding::Heightmap16,
-                "paradox8" => HeightEncoding::Paradox8 { sea_level_value: args.num("sea-level", 20.0), max_elevation_m: args.num("max", 6500.0), max_depth_m: args.num("depth", 6000.0) },
-                "linear" => HeightEncoding::Linear { min_m: args.num("min", -11000.0), max_m: args.num("max", 9000.0) },
+                "paradox8" => HeightEncoding::Paradox8 { sea_level_value: args.fnum("sea-level", 20.0), max_elevation_m: args.fnum("max", 6500.0), max_depth_m: args.fnum("depth", 6000.0) },
+                "linear" => HeightEncoding::Linear { min_m: args.fnum("min", -11000.0), max_m: args.fnum("max", 9000.0) },
                 e => die(&format!("unknown encoding `{e}` (heightmap16, paradox8, linear)")),
             };
-            let imp = worldcore::import::describe(png, enc, args.num("lat-min", -90.0), args.num("lat-max", 90.0), args.num("blend", 1.0)).unwrap_or_else(|e| die(&e));
+            let imp = worldcore::import::describe(png, enc, args.fnum("lat-min", -90.0), args.fnum("lat-max", 90.0), args.fnum("blend", 1.0)).unwrap_or_else(|e| die(&e));
             w.edits.imports.elevation = Some(imp);
             run_world(&mut w, step_arg(&args));
             w.save(&dir).unwrap_or_else(|e| die(&e.to_string()));
@@ -322,7 +386,7 @@ fn main() {
                 w.edits.imports.provinces = None;
             } else {
                 let png = args.pos.get(2).unwrap_or_else(|| die("missing provinces png"));
-                let (imp, rep) = worldcore::province_import::describe(png, args.get("csv"), args.get("lat-min").and_then(|v| v.parse().ok()), args.get("lat-max").and_then(|v| v.parse().ok()))
+                let (imp, rep) = worldcore::province_import::describe(png, args.get("csv"), args.opt_fnum("lat-min"), args.opt_fnum("lat-max"))
                     .unwrap_or_else(|e| die(&e));
                 print_report(&rep);
                 if !rep.ok {
@@ -401,6 +465,9 @@ fn main() {
             }
             let dir = PathBuf::from(args.pos.get(1).unwrap_or_else(|| die("missing project dir")));
             let mut w = World::load(&dir).unwrap_or_else(|e| die(&e));
+            if args.opt_raw("at").is_none() {
+                die("missing --at (generation for cultures, year for nations; --month 1–12 for a month of that year)");
+            }
             let d = worldcore::directives::Directive {
                 stage: args.get("stage").unwrap_or_else(|| die("missing --stage")).to_string(),
                 at: args.num("at", i64::MIN).max(i64::MIN + 1),
@@ -410,9 +477,6 @@ fn main() {
                 note: args.get("note").unwrap_or("").to_string(),
                 by: "user".into(),
             };
-            if args.get("at").is_none() {
-                die("missing --at (generation for cultures, year for nations; --month 1–12 for a month of that year)");
-            }
             worldcore::directives::validate(&d).unwrap_or_else(|e| die(&e));
             w.edits.overrides.directives.push(d);
             println!("{} directives", w.edits.overrides.directives.len());
@@ -461,11 +525,11 @@ fn stats(mut w: World) {
     };
     let elev = get(&w, "elevation");
     let (tm, tw, tc, pa) = (get(&w, "t_mean"), get(&w, "t_warm"), get(&w, "t_cold"), get(&w, "p_ann"));
-    let temp = match w.field("temp") {
-        Some((Field::F32(v), _, _)) => v.clone(),
-        _ => vec![0.0; 12 * g.len()],
-    };
     let n = g.len();
+    let temp = match w.field("temp") {
+        Some((Field::F32(v), _, _)) if v.len() == 12 * n => v.clone(),
+        _ => vec![0.0; 12 * n],
+    };
     println!(" lat  | land: Tmean  Tjan  Tjul  Tcold Twarm  P(mm) | sea: Tmean  P(mm) | land%");
     for b in 0..18 {
         let (lo, hi) = (-90.0 + b as f64 * 10.0, -80.0 + b as f64 * 10.0);
@@ -487,7 +551,6 @@ fn stats(mut w: World) {
             } else {
                 acc[7] += a;
                 acc[8] += a * tm[i] as f64;
-                acc[2 + 0] += 0.0;
             }
         }
         let sea_p: f64 = (0..n).filter(|&i| elev[i] <= 0.0 && (lo..hi).contains(&g.lat[i].to_degrees())).map(|i| g.area[i] * pa[i] as f64).sum();
@@ -505,7 +568,7 @@ fn stats(mut w: World) {
         Some((Field::F32(v), _, _)) => v.clone(),
         _ => vec![0.0; 12 * n],
     };
-    if wu.len() == 12 * n {
+    if wu.len() == 12 * n && wv.len() == 12 * n && pr.len() == 12 * n {
         println!("\n lat  | land wind m/s: |Jan| |Jul|  v(Jan) v(Jul) | summer/winter rain");
         for b in 0..18 {
             let (lo, hi) = (-90.0 + b as f64 * 10.0, -80.0 + b as f64 * 10.0);
@@ -600,7 +663,7 @@ fn overrides(args: &Args) {
             println!("removed {n} edits from {}", l.key());
         }
         "prune" => {
-            run_world(&mut w, Step::Provinces);
+            run_world(&mut w, Step::Cultures);
             let r = api::overrides_report(&w);
             let mut by_layer: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
             for u in r["unapplied"].as_array().into_iter().flatten() {
@@ -659,10 +722,10 @@ fn edit(args: &Args) {
     let st = Stroke {
         tool,
         points,
-        value: args.num("value", d.value),
-        radius_km: args.num("radius", d.radius_km),
-        strength: args.num("strength", d.strength),
-        hardness: args.num("hardness", d.hardness),
+        value: args.fnum("value", d.value),
+        radius_km: args.fnum("radius", d.radius_km),
+        strength: args.fnum("strength", d.strength),
+        hardness: args.fnum("hardness", d.hardness),
         name: args.get("name").unwrap_or("").to_string(),
         ..d
     };
@@ -692,8 +755,8 @@ fn sketch_base(args: &Args) {
         .unwrap_or_else(|_| die("the base is generated, drawing or ocean"));
     let mut w = World::load(&dir).unwrap_or_else(|e| die(&e));
     w.edits.sketch.set_base(base);
-    if args.get("freedom").is_some() {
-        w.params.sketch.drawing_freedom_km = args.num("freedom", w.params.sketch.drawing_freedom_km).max(0.0);
+    if args.opt_raw("freedom").is_some() {
+        w.params.sketch.drawing_freedom_km = args.fnum("freedom", w.params.sketch.drawing_freedom_km).max(0.0);
     }
     println!(
         "the continent sketch starts from {} ({} sketch strokes{})",
@@ -717,6 +780,12 @@ fn guide(args: &Args) {
     let dir = args.pos.get(1).unwrap_or_else(|| die("missing project dir"));
     let goal = args.get("goal").unwrap_or_else(|| die("missing --goal \"the history you want\""));
     let stage = args.get("stage").unwrap_or("nations");
+    let mut years: f64 = args.fnum("years", 50.0);
+    if years <= 0.0 {
+        die("--years must be greater than 0");
+    }
+    let max_turns: usize = args.num("max-turns", 60);
+    let max_actions: u64 = args.num("max-actions", 4);
     let session = Mutex::new(Session::default());
     let progress = Arc::new(Mutex::new(ProgressState::default()));
     let call = |cmd: &str, a: serde_json::Value| match api::handle(&session, &progress, cmd, a) {
@@ -727,9 +796,6 @@ fn guide(args: &Args) {
     call("open", serde_json::json!({ "path": dir }));
     eprintln!("bringing earlier steps up to date and starting the {stage} simulation…");
     call("sim_start", serde_json::json!({ "stage": stage }));
-    let mut years = args.num("years", 50.0);
-    let max_turns: usize = args.num("max-turns", 60);
-    let max_actions: u64 = args.num("max-actions", 4);
     let (mut tin, mut tout) = (0u64, 0u64);
     for k in 0..max_turns {
         // The first turn looks at the start; later turns advance first.
@@ -771,7 +837,7 @@ fn check_update(args: &Args) {
         let shown = std::sync::atomic::AtomicU64::new(u64::MAX);
         let path = fwm_update::download(a, std::path::Path::new(dir), &|d, t| {
             // One line per 10%.
-            let step = if t > 0 { d * 10 / t } else { d >> 20 };
+            let step = (d * 10).checked_div(t).unwrap_or(d >> 20);
             if shown.swap(step, std::sync::atomic::Ordering::Relaxed) != step {
                 eprintln!("  {:>5.1} / {:.1} MB", d as f64 / 1e6, t as f64 / 1e6);
             }
@@ -811,41 +877,154 @@ fn check(args: &Args) {
     }
 }
 
+const MAX_CONCURRENT_REQUESTS: usize = 64;
+const MAX_API_BODY: u64 = 16 * 1024 * 1024;
+const MAX_UPLOAD_BODY: u64 = 64 * 1024 * 1024;
+
+struct ActiveGuard(Arc<AtomicUsize>);
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+enum BodyError {
+    TooLarge,
+    Io(std::io::Error),
+}
+
+fn read_body_capped(reader: &mut dyn Read, limit: u64) -> Result<Vec<u8>, BodyError> {
+    let mut buf = Vec::new();
+    reader.take(limit.saturating_add(1)).read_to_end(&mut buf).map_err(BodyError::Io)?;
+    if buf.len() as u64 > limit {
+        return Err(BodyError::TooLarge);
+    }
+    Ok(buf)
+}
+
+fn is_allowed_host(host: &str) -> bool {
+    let h = host.trim();
+    if let Some(rest) = h.strip_prefix('[') {
+        let Some((addr, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if addr != "::1" {
+            return false;
+        }
+        return after.is_empty() || after.strip_prefix(':').is_some_and(|p| p.parse::<u16>().is_ok());
+    }
+    let (name, port_ok) = match h.split_once(':') {
+        Some((n, p)) => (n, p.parse::<u16>().is_ok()),
+        None => (h, true),
+    };
+    port_ok && (name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1")
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            let b = ((hi << 4) | lo) as u8;
+            if b == 0 {
+                return None;
+            }
+            out.push(b);
+            i += 3;
+        } else if bytes[i] == 0 {
+            return None;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn is_safe_upload_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return false;
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) {
+        return false;
+    }
+    let mut comps = Path::new(name).components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+}
+
+fn resolve_static_file(canon_root: &Path, raw_url: &str) -> Option<(PathBuf, String)> {
+    let raw_rel = raw_url.split('?').next().unwrap_or("/").trim_start_matches('/');
+    let decoded = percent_decode(raw_rel)?;
+    let rel = if decoded.is_empty() { "index.html".to_string() } else { decoded };
+    if rel.contains('\\') {
+        return None;
+    }
+    let rel_path = Path::new(&rel);
+    let mut has_component = false;
+    for comp in rel_path.components() {
+        if !matches!(comp, Component::Normal(_)) {
+            return None;
+        }
+        has_component = true;
+    }
+    if !has_component {
+        return None;
+    }
+    let canon_target = std::fs::canonicalize(canon_root.join(rel_path)).ok()?;
+    if !canon_target.starts_with(canon_root) || !canon_target.is_file() {
+        return None;
+    }
+    Some((canon_target, rel))
+}
+
 fn serve(args: &Args) {
     let port: u16 = args.num("port", 8765);
-    let static_dir = args.get("static").map(PathBuf::from);
+    let static_dir = args.get("static").map(|p| std::fs::canonicalize(p).unwrap_or_else(|e| die(&format!("--static {p}: {e}"))));
     let debug = args.flag("debug");
     let mut session = Session::default();
     if let Some(p) = args.get("project") {
-        let w = World::load(std::path::Path::new(p)).unwrap_or_else(|e| die(&e));
+        let w = World::load(Path::new(p)).unwrap_or_else(|e| die(&e));
         session.world = w;
         session.path = Some(PathBuf::from(p));
     }
     let session = Arc::new(Mutex::new(session));
     let progress = Arc::new(Mutex::new(ProgressState::default()));
+    let active = Arc::new(AtomicUsize::new(0));
     let server = tiny_http::Server::http(("127.0.0.1", port)).unwrap_or_else(|e| die(&e.to_string()));
     println!("worldgen serving on http://127.0.0.1:{port}/");
     for mut req in server.incoming_requests() {
+        let acquired = {
+            let mut cur = active.load(Ordering::Acquire);
+            loop {
+                if cur >= MAX_CONCURRENT_REQUESTS {
+                    break false;
+                }
+                match active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => break true,
+                    Err(next) => cur = next,
+                }
+            }
+        };
+        if !acquired {
+            let _ = req.respond(tiny_http::Response::from_string("server busy").with_status_code(503));
+            continue;
+        }
+        let guard = ActiveGuard(active.clone());
         let session = session.clone();
         let progress = progress.clone();
         let static_dir = static_dir.clone();
-        let debug = debug;
         std::thread::spawn(move || {
+            let _guard = guard;
             // Only this server's own pages and the Vite dev server may call the API.
             // A JSON content type is required, which forces a CORS preflight for any
             // cross-site request, so other websites cannot drive the local engine.
             let header = |name: &str| req.headers().iter().find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name)).map(|h| h.value.as_str().to_string());
-            let origin = header("Origin");
-            let allowed = [format!("http://127.0.0.1:{port}"), format!("http://localhost:{port}"), "http://localhost:5173".into(), "http://127.0.0.1:5173".into()];
-            let origin_ok = origin.as_ref().map_or(true, |o| allowed.contains(o));
-            let cors: Vec<tiny_http::Header> = match origin.as_ref().filter(|_| origin_ok) {
-                Some(o) => vec![
-                    tiny_http::Header::from_bytes("Access-Control-Allow-Origin", o.as_bytes()).unwrap(),
-                    tiny_http::Header::from_bytes("Access-Control-Allow-Headers", "content-type").unwrap(),
-                    tiny_http::Header::from_bytes("Vary", "Origin").unwrap(),
-                ],
-                None => vec![],
-            };
             let respond = |req: tiny_http::Request, status: u16, ctype: &str, data: Vec<u8>, cors: &[tiny_http::Header]| {
                 let mut r = tiny_http::Response::from_data(data).with_status_code(status);
                 r.add_header(tiny_http::Header::from_bytes("Content-Type", ctype).unwrap());
@@ -853,6 +1032,23 @@ fn serve(args: &Args) {
                     r.add_header(h.clone());
                 }
                 let _ = req.respond(r);
+            };
+            if let Some(host) = header("Host") {
+                if !is_allowed_host(&host) {
+                    respond(req, 403, "text/plain", b"invalid Host header".to_vec(), &[]);
+                    return;
+                }
+            }
+            let origin = header("Origin");
+            let allowed = [format!("http://127.0.0.1:{port}"), format!("http://localhost:{port}"), "http://localhost:5173".into(), "http://127.0.0.1:5173".into()];
+            let origin_ok = origin.as_ref().is_none_or(|o| allowed.contains(o));
+            let cors: Vec<tiny_http::Header> = match origin.as_ref().filter(|_| origin_ok) {
+                Some(o) => vec![
+                    tiny_http::Header::from_bytes("Access-Control-Allow-Origin", o.as_bytes()).unwrap(),
+                    tiny_http::Header::from_bytes("Access-Control-Allow-Headers", "content-type").unwrap(),
+                    tiny_http::Header::from_bytes("Vary", "Origin").unwrap(),
+                ],
+                None => vec![],
             };
             let url = req.url().to_string();
             if req.method() == &tiny_http::Method::Options {
@@ -867,13 +1063,30 @@ fn serve(args: &Args) {
                     respond(req, 403, "text/plain", b"forbidden".to_vec(), &cors);
                     return;
                 }
-                let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-').collect();
+                if req.method() != &tiny_http::Method::Post && req.method() != &tiny_http::Method::Put {
+                    respond(req, 405, "text/plain", b"method not allowed".to_vec(), &cors);
+                    return;
+                }
+                if !is_safe_upload_name(name) {
+                    respond(req, 400, "text/plain", b"invalid upload filename".to_vec(), &cors);
+                    return;
+                }
+                let body = match read_body_capped(req.as_reader(), MAX_UPLOAD_BODY) {
+                    Ok(b) => b,
+                    Err(BodyError::TooLarge) => {
+                        respond(req, 413, "text/plain", b"upload exceeds size limit".to_vec(), &cors);
+                        return;
+                    }
+                    Err(BodyError::Io(e)) => {
+                        respond(req, 400, "text/plain", format!("read failed: {e}").into_bytes(), &cors);
+                        return;
+                    }
+                };
                 let dir = std::env::temp_dir().join("fwm-debug");
                 let _ = std::fs::create_dir_all(&dir);
-                let mut body = Vec::new();
-                let _ = req.as_reader().read_to_end(&mut body);
-                let ok = std::fs::write(dir.join(&name), &body).is_ok();
-                let msg = dir.join(&name).display().to_string().into_bytes();
+                let dest = dir.join(name);
+                let ok = std::fs::write(&dest, &body).is_ok();
+                let msg = dest.display().to_string().into_bytes();
                 respond(req, if ok { 200 } else { 500 }, "text/plain", msg, &cors);
                 return;
             }
@@ -883,9 +1096,35 @@ fn serve(args: &Args) {
                     return;
                 }
                 let cmd = cmd.to_string();
-                let mut body = String::new();
-                let _ = req.as_reader().read_to_string(&mut body);
-                let a: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                let raw_body = match read_body_capped(req.as_reader(), MAX_API_BODY) {
+                    Ok(b) => b,
+                    Err(BodyError::TooLarge) => {
+                        respond(req, 413, "text/plain; charset=utf-8", b"request body exceeds size limit".to_vec(), &cors);
+                        return;
+                    }
+                    Err(BodyError::Io(e)) => {
+                        respond(req, 400, "text/plain; charset=utf-8", format!("failed to read request body: {e}").into_bytes(), &cors);
+                        return;
+                    }
+                };
+                let body = match String::from_utf8(raw_body) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        respond(req, 400, "text/plain; charset=utf-8", format!("request body is not valid UTF-8: {e}").into_bytes(), &cors);
+                        return;
+                    }
+                };
+                let a: serde_json::Value = if body.trim().is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    match serde_json::from_str(&body) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            respond(req, 400, "text/plain; charset=utf-8", format!("invalid JSON body: {e}").into_bytes(), &cors);
+                            return;
+                        }
+                    }
+                };
                 if cmd == "update_install" {
                     respond(req, 400, "text/plain; charset=utf-8", b"Installing updates works in the desktop app; download the new release from GitHub instead".to_vec(), &cors);
                     return;
@@ -912,11 +1151,9 @@ fn serve(args: &Args) {
                 return;
             }
             // Static UI files.
-            if let Some(root) = static_dir {
-                let rel = url.split('?').next().unwrap_or("/").trim_start_matches('/');
-                let rel = if rel.is_empty() { "index.html" } else { rel };
-                if !rel.contains("..") {
-                    if let Ok(data) = std::fs::read(root.join(rel)) {
+            if let Some(canon_root) = static_dir {
+                if let Some((target, rel)) = resolve_static_file(&canon_root, &url) {
+                    if let Ok(data) = std::fs::read(&target) {
                         let ctype = match rel.rsplit('.').next() {
                             Some("html") => "text/html; charset=utf-8",
                             Some("js") => "text/javascript",
@@ -935,5 +1172,92 @@ fn serve(args: &Args) {
             }
             let _ = req.respond(tiny_http::Response::from_string("not found").with_status_code(404));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Args {
+        Args::parse_from(items.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn args_do_not_swallow_positionals_after_bool_flags() {
+        let a = args(&["validate", "--run", "my-project", "--json"]);
+        assert_eq!(a.pos, vec!["validate", "my-project"]);
+        assert!(a.flag("run"));
+        assert!(a.flag("json"));
+
+        let b = args(&["new", "proj", "--seed=42", "--level", "6"]);
+        assert_eq!(b.pos, vec!["new", "proj"]);
+        assert_eq!(b.parse_num::<u64>("seed", 0).unwrap(), 42);
+        assert_eq!(b.parse_num::<u32>("level", 0).unwrap(), 6);
+    }
+
+    #[test]
+    fn args_reject_invalid_and_non_finite_numbers() {
+        let a = args(&["new", "proj", "--seed", "abc", "--years", "NaN", "--lat-min", "inf"]);
+        assert!(a.parse_num::<u64>("seed", 1).is_err());
+        assert!(a.parse_fnum("years", 50.0).is_err());
+        assert!(a.parse_fnum("lat-min", -90.0).is_err());
+    }
+
+    #[test]
+    fn host_validation_blocks_dns_rebinding() {
+        assert!(is_allowed_host("localhost"));
+        assert!(is_allowed_host("localhost:8765"));
+        assert!(is_allowed_host("127.0.0.1:8765"));
+        assert!(is_allowed_host("[::1]"));
+        assert!(is_allowed_host("[::1]:8765"));
+        assert!(!is_allowed_host("evil.com"));
+        assert!(!is_allowed_host("localhost.evil.com:8765"));
+        assert!(!is_allowed_host("[2001:db8::1]:8765"));
+        assert!(!is_allowed_host("127.0.0.1:notaport"));
+    }
+
+    #[test]
+    fn upload_name_validation_rejects_traversal() {
+        assert!(is_safe_upload_name("snap-01.png"));
+        assert!(is_safe_upload_name("world_shot.png"));
+        assert!(!is_safe_upload_name(""));
+        assert!(!is_safe_upload_name("."));
+        assert!(!is_safe_upload_name(".."));
+        assert!(!is_safe_upload_name("../evil.png"));
+        assert!(!is_safe_upload_name("a/b.png"));
+        assert!(!is_safe_upload_name("a\\b.png"));
+    }
+
+    #[test]
+    fn static_resolution_blocks_traversal_and_symlinks() {
+        let base = std::env::temp_dir().join(format!("worldgen-static-test-{}", std::process::id()));
+        let root = base.join("root");
+        let outside = base.join("secret.txt");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.html"), b"ok").unwrap();
+        std::fs::write(&outside, b"secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("link.txt")).unwrap();
+
+        let canon_root = std::fs::canonicalize(&root).unwrap();
+        assert!(resolve_static_file(&canon_root, "/").is_some());
+        assert!(resolve_static_file(&canon_root, "/index.html?v=1").is_some());
+        assert!(resolve_static_file(&canon_root, "/../secret.txt").is_none());
+        assert!(resolve_static_file(&canon_root, "/%2e%2e/secret.txt").is_none());
+        assert!(resolve_static_file(&canon_root, "/%00index.html").is_none());
+        #[cfg(unix)]
+        assert!(resolve_static_file(&canon_root, "/link.txt").is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn body_cap_rejects_oversized_payloads() {
+        let mut small = std::io::Cursor::new(b"hello".to_vec());
+        assert_eq!(read_body_capped(&mut small, 5).ok(), Some(b"hello".to_vec()));
+        let mut big = std::io::Cursor::new(b"hello!".to_vec());
+        assert!(matches!(read_body_capped(&mut big, 5), Err(BodyError::TooLarge)));
     }
 }
