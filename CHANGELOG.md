@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+Hardening (from the audit pass merged with the climate refinements).
+
+- **Safer updates and server:** downloads only from this project's GitHub releases, with size and SHA-256 checks and a byte cap; release pages are validated before opening. The local CLI server, the AI guide and the desktop shell were hardened, and CLI flags no longer swallow the argument after them.
+- **Fixes:** simulation, validation and export bugs in the core; state races and layer bugs in the app; faster WebGL rendering. CI now runs clippy with warnings as errors, the CLI tests and a smoke test.
 
 A more realistic climate, tuned on Earth's real terrain.
 
