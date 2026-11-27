@@ -22,7 +22,7 @@ impl Hasher for FastHasher {
         }
     }
     fn write_u64(&mut self, i: u64) {
-        self.0 = crate::rng::mix64(i);
+        self.0 = crate::rng::mix64(self.0 ^ i);
     }
 }
 pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
@@ -179,7 +179,7 @@ impl Grid {
         let mut cnt = 0usize;
         for i in (0..n).step_by((n / 5000).max(1)) {
             for j in off[i]..off[i + 1] {
-                sum += pos[i].angle_to(pos[nbr[j as usize] as usize]);
+                sum += nbr_len[j as usize];
                 cnt += 1;
             }
         }
@@ -206,6 +206,10 @@ impl Grid {
 
     pub fn len(&self) -> usize {
         self.pos.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pos.is_empty()
     }
 
     #[inline]
@@ -263,13 +267,21 @@ impl Grid {
             .collect()
     }
 
+    /// The two cells on either side of the boundary between adjacent corners, or `None` if not adjacent.
+    pub fn try_corner_edge_cells(&self, t: usize, u: usize) -> Option<(usize, usize)> {
+        if t == u {
+            return None;
+        }
+        let (a, b) = (self.tris.get(t)?, self.tris.get(u)?);
+        let mut shared = a.iter().filter(|c| b.contains(c));
+        let x = *shared.next()? as usize;
+        let y = *shared.next()? as usize;
+        Some((x, y))
+    }
+
     /// The two cells on either side of the boundary between adjacent corners.
     pub fn corner_edge_cells(&self, t: usize, u: usize) -> (usize, usize) {
-        let (a, b) = (self.tris[t], self.tris[u]);
-        let mut shared = a.iter().filter(|c| b.contains(c));
-        let x = *shared.next().expect("corners are not adjacent") as usize;
-        let y = *shared.next().expect("corners are not adjacent") as usize;
-        (x, y)
+        self.try_corner_edge_cells(t, u).expect("corners are not adjacent")
     }
 
     fn build_start_table(&mut self) {
@@ -354,7 +366,7 @@ impl Grid {
             *scratch = vec![false; self.len()];
         }
         let start = self.nearest(p, hint);
-        let cos_r = (radius + self.spacing * 0.5).cos();
+        let cos_r = (radius + self.spacing * 0.5).min(std::f64::consts::PI).cos();
         let mut stack = vec![start];
         let mut seen = vec![start];
         scratch[start] = true;
@@ -443,5 +455,30 @@ impl GridTransfer {
             .zip(&self.w)
             .map(|(t, w)| coarse[t[0] as usize] * w[0] + coarse[t[1] as usize] * w[1] + coarse[t[2] as usize] * w[2])
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    #[test]
+    fn fast_hasher_mixes_composite_keys() {
+        let hash_one = |k: (u32, u64)| {
+            let mut h = FastHasher::default();
+            k.hash(&mut h);
+            h.finish()
+        };
+        assert_ne!(hash_one((1, 42)), hash_one((2, 42)));
+        assert_ne!(hash_one((0, 0)), hash_one((1, 0)));
+    }
+
+    #[test]
+    fn try_corner_edge_cells_handles_non_adjacent_tris() {
+        let g = Grid::new(3);
+        assert!(!g.is_empty());
+        assert!(g.try_corner_edge_cells(0, 0).is_none());
+        assert!(g.try_corner_edge_cells(g.tris.len(), 0).is_none());
     }
 }

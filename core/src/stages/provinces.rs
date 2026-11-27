@@ -433,7 +433,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let rwidth = ctx.input.f32("river_width");
     let site = ctx.input.f32("site");
     let site_kind = ctx.input.u8("site_kind");
-    let temp = ctx.input.f32("temp");
+    let t_mean = ctx.input.f32("t_mean");
     let temp_adj = ctx.input.f32("temp_adjust");
     let mut sig = vec![super::resources::Signals::default(); count];
     let mut river = vec![false; count];
@@ -449,8 +449,8 @@ pub fn run(ctx: &Ctx) -> StepOutput {
             continue;
         }
         let e = elev[i] as f64;
-        let t_mean = (0..12).map(|m| temp[m * n + i] as f64).sum::<f64>() / 12.0 + temp_adj[i] as f64;
-        s.temp_c += a * t_mean;
+        let tm = t_mean[i] as f64 + temp_adj[i] as f64;
+        s.temp_c += a * tm;
         s.elev_m += a * e.max(0.0);
         s.rain_mm += a * p_ann[i] as f64;
         s.orogen += a * (stress[i] as f64 * 2.0).min(1.0);
@@ -756,6 +756,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let edge_km = g.spacing * r_km / 3f64.sqrt();
     let political = |k: u8| k == kind::LAND || k == kind::WASTELAND;
     let mut adjacency_json = Vec::with_capacity(nb_set.len() + straits_json.len());
+    let mut emitted_pairs = std::collections::HashSet::with_capacity(nb_set.len() + straits_json.len());
     let mut by_type: BTreeMap<&str, usize> = BTreeMap::new();
     for (&(a, b), e) in &nb_set {
         let (ka, kb) = (provs[a as usize].kind, provs[b as usize].kind);
@@ -776,6 +777,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         };
         *by_type.entry(ty).or_insert(0) += 1;
         let (fa, fb) = (ids[a as usize].min(ids[b as usize]), ids[a as usize].max(ids[b as usize]));
+        emitted_pairs.insert((fa, fb));
         adjacency_json.push(serde_json::json!({
             "from": fa, "to": fb, "type": ty,
             "border_km": (e.edges as f64 / 2.0 * edge_km).round(),
@@ -783,8 +785,14 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         }));
     }
     for s in &straits_json {
+        let a = s["from"].as_u64().unwrap_or(0) as u32;
+        let b = s["to"].as_u64().unwrap_or(0) as u32;
+        let (fa, fb) = (a.min(b), a.max(b));
+        if !emitted_pairs.insert((fa, fb)) {
+            continue;
+        }
         *by_type.entry("strait").or_insert(0) += 1;
-        adjacency_json.push(serde_json::json!({ "from": s["from"], "to": s["to"], "type": "strait", "border_km": 0, "barrier": 0, "crossing_km": s["km"] }));
+        adjacency_json.push(serde_json::json!({ "from": fa, "to": fb, "type": "strait", "border_km": 0, "barrier": 0, "crossing_km": s["km"] }));
     }
     adjacency_json.sort_by_key(|a| (a["from"].as_u64().unwrap_or(0), a["to"].as_u64().unwrap_or(0)));
 

@@ -165,13 +165,26 @@ fn u8_of<'a>(w: &'a World, name: &str) -> Option<&'a [u8]> {
 
 pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(dyn Fn(f32, &str) + Sync)) -> Result<ExportReport, String> {
     let t0 = std::time::Instant::now();
+    if !opts.lat_min.is_finite() || !opts.lat_max.is_finite() || opts.lat_min >= opts.lat_max {
+        return Err(format!("invalid latitude range [{}, {}]", opts.lat_min, opts.lat_max));
+    }
+    if !opts.max_elevation_m.is_finite() || opts.max_elevation_m <= 0.0 {
+        return Err("max_elevation_m must be finite and positive".into());
+    }
+    if !opts.max_depth_m.is_finite() || opts.max_depth_m <= 0.0 {
+        return Err("max_depth_m must be finite and positive".into());
+    }
+    if opts.sea_level_value == 255 {
+        return Err("sea_level_value must be below 255".into());
+    }
     let grid = world.grid();
-    if !world.is_fresh(Step::Relief) {
+    let hashes = world.expected_hashes();
+    if !world.is_fresh_with(Step::Relief, &hashes) {
         return Err("Run the steps up to Tectonic relief before exporting.".into());
     }
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let w = world as &World;
-    let fresh = |s: Step| w.is_fresh(s);
+    let fresh = |s: Step| w.is_fresh_with(s, &hashes);
     let layers = Layers {
         elev: f32_of(w, "elevation").ok_or("no elevation")?,
         stress: f32_of(w, "stress"),
@@ -198,6 +211,9 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         border_noise: Noise::new(w.params.planet.seed, stream::BORDER_NOISE),
         river_bank: if fresh(Step::Hydrology) { f32_of(w, "river_width").map(|v| v.iter().map(|&x| x > 0.0).collect()).unwrap_or_default() } else { Vec::new() },
     };
+    if layers.province.is_some() && layers.prov_class.is_some() && layers.water.is_none() {
+        return Err("no water map".into());
+    }
     let (wpx, hpx) = (opts.width.clamp(64, 32768) as usize, opts.height.clamp(32, 16384) as usize);
     let noise = Noise::new(w.params.planet.seed, stream::EXPORT_NOISE);
     let r_km = w.params.planet.radius_km;
@@ -216,46 +232,38 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         e.set_compression(png::Compression::Fast);
         e
     };
-    let mut height8 = encoder(mk("heightmap.png")?, png::ColorType::Grayscale, png::BitDepth::Eight, None).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?;
-    let mut height16 = encoder(mk("heightmap16.png")?, png::ColorType::Grayscale, png::BitDepth::Sixteen, None).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?;
-    files.extend(["heightmap.png".to_string(), "heightmap16.png".to_string()]);
-    let terrain_pal: Vec<u8> = TERRAIN.iter().flat_map(|(_, c)| *c).collect();
-    let mut terrain_w = match layers.terrain {
-        Some(_) => {
-            files.push("terrain.png".into());
-            Some(encoder(mk("terrain.png")?, png::ColorType::Indexed, png::BitDepth::Eight, Some(terrain_pal)).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?)
-        }
-        None => None,
-    };
-    let mut biomes_w = match layers.koppen {
-        Some(_) => {
-            files.push("biomes.png".into());
-            Some(encoder(mk("biomes.png")?, png::ColorType::Rgb, png::BitDepth::Eight, None).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?)
-        }
-        None => None,
-    };
     // Provinces first: rasterise, clean up, write provinces.png and states.png.
-    // The clean-up's surface fixes then feed the other layers.
+    // The clean-up's surface fixes then feed the other layers, and we keep
+    // the detailed elevation computed here so the second pass does not redo
+    // 5-octave fBM noise for every pixel.
     let lat_span = opts.lat_max - opts.lat_min;
     let mut clean_report = None;
+    let mut cached_elev: Option<Vec<f32>> = None;
     let raster = match (layers.province, layers.prov_class.as_deref()) {
         (Some(prov), Some(cls)) => {
             progress(0.0, "Rasterising provinces");
             let mut ids = vec![0u32; wpx * hpx];
             let mut pcls = vec![0u8; wpx * hpx];
-            ids.par_chunks_mut(wpx).zip(pcls.par_chunks_mut(wpx)).enumerate().for_each(|(y, (ri, rc))| {
-                let lat = (opts.lat_max - (y as f64 + 0.5) / hpx as f64 * lat_span).to_radians();
-                let mut hint = None;
-                for x in 0..wpx {
-                    let lon = (-180.0 + (x as f64 + 0.5) / wpx as f64 * 360.0).to_radians();
-                    let p = Vec3::from_lat_lon(lat, lon);
-                    let (v, tri, wt) = grid.locate(p, hint);
-                    hint = Some(v);
-                    let (c, id) = province_pixel(&grid, &layers, prov, cls, &noise, opts, r_km, p, tri, wt);
-                    ri[x] = id;
-                    rc[x] = c;
-                }
-            });
+            let mut elev_buf = vec![0.0f32; wpx * hpx];
+            ids.par_chunks_mut(wpx)
+                .zip(pcls.par_chunks_mut(wpx))
+                .zip(elev_buf.par_chunks_mut(wpx))
+                .enumerate()
+                .for_each(|(y, ((ri, rc), re))| {
+                    let lat = (opts.lat_max - (y as f64 + 0.5) / hpx as f64 * lat_span).to_radians();
+                    let mut hint = None;
+                    for x in 0..wpx {
+                        let lon = (-180.0 + (x as f64 + 0.5) / wpx as f64 * 360.0).to_radians();
+                        let p = Vec3::from_lat_lon(lat, lon);
+                        let (v, tri, wt) = grid.locate(p, hint);
+                        hint = Some(v);
+                        let (c, id, e) = province_pixel(&grid, &layers, prov, cls, &noise, opts, r_km, p, tri, wt);
+                        ri[x] = id;
+                        rc[x] = c;
+                        re[x] = e as f32;
+                    }
+                });
+            cached_elev = Some(elev_buf);
             progress(0.25, "Cleaning up province pieces");
             let wm = layers.water.ok_or("no water map")?;
             let (land_body, _) = crate::graph::components(&grid, |i| wm[i] != 1);
@@ -280,7 +288,16 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
             let mut r = clean::ProvRaster { w: wpx, h: hpx, ids, cls: pcls };
             let scale = clean::row_scale(wpx, hpx, opts.lat_max, opts.lat_min, grid.len());
             let prov_info = province_info(w);
-            let max_id = prov_info.keys().chain(r.ids.iter()).max().copied().unwrap_or(0) as usize;
+            let max_id = prov_info
+                .keys()
+                .chain(r.ids.iter())
+                .chain(anchors.iter().map(|a| &a.id))
+                .max()
+                .copied()
+                .unwrap_or(0) as usize;
+            if max_id > 4_000_000 {
+                return Err(format!("province id {max_id} exceeds export table limit"));
+            }
             let mut kind_of = vec![clean::UNKNOWN; max_id + 1];
             for (&id, &(k, _)) in &prov_info {
                 kind_of[id as usize] = match k {
@@ -321,6 +338,24 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
         }
         _ => None,
     };
+    let mut height8 = encoder(mk("heightmap.png")?, png::ColorType::Grayscale, png::BitDepth::Eight, None).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?;
+    let mut height16 = encoder(mk("heightmap16.png")?, png::ColorType::Grayscale, png::BitDepth::Sixteen, None).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?;
+    files.extend(["heightmap.png".to_string(), "heightmap16.png".to_string()]);
+    let terrain_pal: Vec<u8> = TERRAIN.iter().flat_map(|(_, c)| *c).collect();
+    let mut terrain_w = match layers.terrain {
+        Some(_) => {
+            files.push("terrain.png".into());
+            Some(encoder(mk("terrain.png")?, png::ColorType::Indexed, png::BitDepth::Eight, Some(terrain_pal)).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
+    let mut biomes_w = match layers.koppen {
+        Some(_) => {
+            files.push("biomes.png".into());
+            Some(encoder(mk("biomes.png")?, png::ColorType::Rgb, png::BitDepth::Eight, None).write_header().and_then(|w| w.into_stream_writer()).map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
     let mut climate_w = match layers.t_mean {
         Some(_) => {
             files.extend(["climate.png".to_string(), "precipitation.png".to_string()]);
@@ -349,8 +384,10 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
                     let p = Vec3::from_lat_lon(lat, lon);
                     let (v, tri, wt) = grid.locate(p, hint);
                     hint = Some(v);
-                    let surf = raster.as_ref().map(|r| r.cls[y * wpx + x]);
-                    sample(&grid, &layers, &noise, opts, r_km, p, tri, wt, sea, &mut row, x, surf);
+                    let idx = y * wpx + x;
+                    let surf = raster.as_ref().map(|r| r.cls[idx]);
+                    let pre_e = cached_elev.as_ref().map(|eb| eb[idx] as f64);
+                    sample(&grid, &layers, &noise, opts, r_km, p, tri, wt, sea, &mut row, x, surf, pre_e);
                 }
                 row
             })
@@ -506,7 +543,7 @@ pub fn export(world: &mut World, dir: &Path, opts: &ExportOptions, progress: &(d
             "airports.csv": "province;name;owner;opened",
             "cities.csv": "rank;province;name;owner;population;capital;station;attraction (−1 to +1 at the start date);peak_population;peak_year — the 100 largest cities",
             "ruins.csv": "province;name;population;peak_population;peak_year — cities that lost three quarters of their people (war, devastation, abandonment) and never recovered",
-            "province_nations.csv": "province;owner (nation, 0 = none);culture (majority at the start date, after assimilation);shares;population;railway (0 none, 1 track, 2 station, 3 junction);road (best road touching it: 0 none, 1 track, 2 paved, 3 highway);airport;integration (0–1: how well its owner's capital reaches it);port;harbour;institutions (embraced);realm",
+            "province_nations.csv": "province;owner (nation, 0 = none);culture (majority at the start date, after assimilation);shares;population;railway (0 none, 1 track, 2 station, 3 junction);road (best road touching it: 0 none, 1 track, 2 paved, 3 highway);airport;port;harbour;integration (0–1: how well its owner's capital reaches it);institutions (embraced);realm",
             "trade_goods.csv": "good;kind (trade good, deposit, sea zone);category (staple, cash crop, livestock, forest, mineral, energy, sea);provinces;area_km2 — how much of the world has each good",
             "province_adjacency.csv": "from;to;type;border_km;barrier;crossing_km — every border between two provinces; type: land, river (along a border river), impassable (wasteland), coast (land–sea), lake, sea, strait (crossing_km = width); barrier = mean crossing cost of the border (0 = open)",
         },
@@ -544,15 +581,22 @@ impl RowOut {
 }
 
 /// Elevation with detail noise, land/sea state, lake flag and heaviest corner of a pixel.
-fn surface(l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, c: [usize; 3], wt: [f64; 3]) -> (f64, bool, Option<bool>, usize) {
+#[allow(clippy::too_many_arguments)]
+fn surface(l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, c: [usize; 3], wt: [f64; 3], pre_e: Option<f64>) -> (f64, bool, Option<bool>, usize) {
     let interp = |v: &[f32]| -> f64 { v[c[0]] as f64 * wt[0] + v[c[1]] as f64 * wt[1] + v[c[2]] as f64 * wt[2] };
-    let mut e = interp(l.elev);
-    if o.detail_noise {
-        let stress = l.stress.map(|s| interp(s)).unwrap_or(0.0);
-        let amp = 35.0 + 650.0 * stress;
-        e += noise.fbm(p, r_km / 25.0, 5) * amp;
-    }
-    let kmax = (0..3).max_by(|&a, &b| wt[a].partial_cmp(&wt[b]).unwrap()).unwrap();
+    let e = match pre_e {
+        Some(e) => e,
+        None => {
+            let mut e = interp(l.elev);
+            if o.detail_noise {
+                let stress = l.stress.map(interp).unwrap_or(0.0);
+                let amp = 35.0 + 650.0 * stress;
+                e += noise.fbm(p, r_km / 25.0, 5) * amp;
+            }
+            e
+        }
+    };
+    let kmax = (0..3).max_by(|&a, &b| wt[a].total_cmp(&wt[b])).unwrap();
     let is_lake = l.lake.map(|lk| lk[c[kmax]] == 1 || lk[c[kmax]] == 2);
     // Dry basins below sea level (all corners land in the water map) stay land.
     let dry_basin = l.water.is_some_and(|wm| c.iter().all(|&k| wm[k] == 0));
@@ -562,10 +606,10 @@ fn surface(l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, c: 
 /// One pixel of every layer. `surf` is the cleaned province raster's surface
 /// class for this pixel: it can turn a noise islet into sea or a pond into land.
 #[allow(clippy::too_many_arguments)]
-fn sample(g: &Grid, l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, tri: [u32; 3], wt: [f64; 3], sea: f64, row: &mut RowOut, x: usize, surf: Option<u8>) {
+fn sample(g: &Grid, l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, tri: [u32; 3], wt: [f64; 3], sea: f64, row: &mut RowOut, x: usize, surf: Option<u8>, pre_e: Option<f64>) {
     let c = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
     let interp = |v: &[f32]| -> f64 { v[c[0]] as f64 * wt[0] + v[c[1]] as f64 * wt[1] + v[c[2]] as f64 * wt[2] };
-    let (mut e, mut land, mut is_lake, _) = surface(l, noise, o, r_km, p, c, wt);
+    let (mut e, mut land, mut is_lake, _) = surface(l, noise, o, r_km, p, c, wt, pre_e);
     match surf {
         Some(clean::LAND) => {
             if !land {
@@ -602,7 +646,7 @@ fn sample(g: &Grid, l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: 
                 Some(wm) => wm[c[k]] != 1,
                 None => l.elev[c[k]] > 0.0,
             };
-            if corner_land == land && best.map_or(true, |b| wt[k] > wt[b]) {
+            if corner_land == land && best.is_none_or(|b| wt[k] > wt[b]) {
                 best = Some(k);
             }
         }
@@ -610,7 +654,7 @@ fn sample(g: &Grid, l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: 
             Some(k) => cls[c[k]],
             None if land => {
                 // Land pixel between sea cells: borrow from the nearest land neighbour.
-                let k = (0..3).max_by(|&a, &b| wt[a].partial_cmp(&wt[b]).unwrap()).unwrap();
+                let k = (0..3).max_by(|&a, &b| wt[a].total_cmp(&wt[b])).unwrap();
                 g.neighbors(c[k]).iter().map(|&j| j as usize).find(|&j| l.elev[j] > 0.0).map(|j| cls[j]).unwrap_or(cls[c[k]])
             }
             None => 0,
@@ -621,7 +665,8 @@ fn sample(g: &Grid, l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: 
     }
     if let Some(k) = l.koppen {
         let cls = if is_lake == Some(true) { 31 } else if land { pick(k).max(1) } else { 0 };
-        row.biome[x * 3..x * 3 + 3].copy_from_slice(&KOPPEN[cls as usize].1);
+        let col = KOPPEN.get(cls as usize).unwrap_or(&KOPPEN[0]).1;
+        row.biome[x * 3..x * 3 + 3].copy_from_slice(&col);
     }
     if let (Some(t), Some(pa)) = (l.t_mean, l.p_ann) {
         row.temp[x * 3..x * 3 + 3].copy_from_slice(&temperature_color(interp(t) as f32));
@@ -629,15 +674,15 @@ fn sample(g: &Grid, l: &Layers, noise: &Noise, o: &ExportOptions, r_km: f64, p: 
     }
 }
 
-/// Surface class and province of a pixel, before clean-up.
+/// Surface class, province, and detailed elevation of a pixel, before clean-up.
 #[allow(clippy::too_many_arguments)]
-fn province_pixel(g: &Grid, l: &Layers, prov: &[u32], cls: &[u8], noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, tri: [u32; 3], wt: [f64; 3]) -> (u8, u32) {
+fn province_pixel(g: &Grid, l: &Layers, prov: &[u32], cls: &[u8], noise: &Noise, o: &ExportOptions, r_km: f64, p: Vec3, tri: [u32; 3], wt: [f64; 3]) -> (u8, u32, f64) {
     let c = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
-    let (_, land, is_lake, kmax) = surface(l, noise, o, r_km, p, c, wt);
+    let (e, land, is_lake, kmax) = surface(l, noise, o, r_km, p, c, wt, None);
     // Surface class of this pixel, consistent with the heightmap coastline.
     let want: u8 = if is_lake == Some(true) { clean::LAKE } else if land { clean::LAND } else { clean::SEA };
     let id = province_at(g, l, prov, cls, p, c, wt, want).or_else(|| if want == clean::LAKE { province_at(g, l, prov, cls, p, c, wt, clean::LAND) } else { None });
-    (want, id.unwrap_or(prov[c[kmax]]))
+    (want, id.unwrap_or(prov[c[kmax]]), e)
 }
 
 /// Province for a pixel of surface class `want`: the heaviest matching corner
@@ -646,21 +691,26 @@ fn province_pixel(g: &Grid, l: &Layers, prov: &[u32], cls: &[u8], noise: &Noise,
 /// matching neighbour of the nearest corner.
 #[allow(clippy::too_many_arguments)]
 fn province_at(g: &Grid, l: &Layers, prov: &[u32], cls: &[u8], p: Vec3, c: [usize; 3], wt: [f64; 3], want: u8) -> Option<u32> {
-    let on_river = !l.river_bank.is_empty() && c.iter().any(|&k| l.river_bank[k]);
-    let amp = if on_river { 0.0 } else { g.spacing * 0.35 };
-    let f = 1.0 / (g.spacing * 3.0);
-    let warp = Vec3::new(
-        l.border_noise.fbm(p, f, 2),
-        l.border_noise.fbm(p + Vec3::new(5.2, 1.3, 2.8), f, 2),
-        l.border_noise.fbm(p + Vec3::new(1.7, 9.2, 3.4), f, 2),
-    );
-    let q = (p + warp * amp).normalized();
-    let (_, tq, wq) = g.locate(q, Some(c[0]));
     let best = |tri: [usize; 3], w: [f64; 3]| -> Option<u32> {
-        (0..3).filter(|&k| cls[tri[k]] == want).max_by(|&a, &b| w[a].partial_cmp(&w[b]).unwrap()).map(|k| prov[tri[k]])
+        (0..3).filter(|&k| cls[tri[k]] == want).max_by(|&a, &b| w[a].total_cmp(&w[b])).map(|k| prov[tri[k]])
     };
-    best([tq[0] as usize, tq[1] as usize, tq[2] as usize], wq).or_else(|| best(c, wt)).or_else(|| {
-        let k = (0..3).max_by(|&a, &b| wt[a].partial_cmp(&wt[b]).unwrap()).unwrap();
+    let on_river = !l.river_bank.is_empty() && c.iter().any(|&k| l.river_bank[k]);
+    let warped = if on_river {
+        None
+    } else {
+        let amp = g.spacing * 0.35;
+        let f = 1.0 / (g.spacing * 3.0);
+        let warp = Vec3::new(
+            l.border_noise.fbm(p, f, 2),
+            l.border_noise.fbm(p + Vec3::new(5.2, 1.3, 2.8), f, 2),
+            l.border_noise.fbm(p + Vec3::new(1.7, 9.2, 3.4), f, 2),
+        );
+        let q = (p + warp * amp).normalized();
+        let (_, tq, wq) = g.locate(q, Some(c[0]));
+        best([tq[0] as usize, tq[1] as usize, tq[2] as usize], wq)
+    };
+    warped.or_else(|| best(c, wt)).or_else(|| {
+        let k = (0..3).max_by(|&a, &b| wt[a].total_cmp(&wt[b])).unwrap();
         g.neighbors(c[k]).iter().map(|&j| j as usize).find(|&j| cls[j] == want).map(|j| prov[j])
     })
 }
@@ -685,7 +735,7 @@ fn province_info(w: &World) -> std::collections::HashMap<u32, (u8, u16)> {
 /// Distinct colour per state (golden-angle hues, alternating lightness).
 pub fn state_color(id: u16) -> [u8; 3] {
     let h = (id as f64 * 137.508) % 360.0;
-    let l = if id % 3 == 0 { 0.48 } else if id % 3 == 1 { 0.6 } else { 0.7 };
+    let l = if id.is_multiple_of(3) { 0.48 } else if id % 3 == 1 { 0.6 } else { 0.7 };
     let s = 0.5;
     let c = (1.0 - (2.0 * l - 1.0f64).abs()) * s;
     let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
@@ -995,9 +1045,9 @@ fn write_nations_png(
         let q = r["quality"].as_u64().unwrap_or(1).clamp(1, 3) as u8;
         seg(&mut roads, r["from"].as_u64().unwrap_or(0), r["to"].as_u64().unwrap_or(0), q, if q == 3 { thick + 1 } else { thick });
     }
-    // Airports (1) and ports (2) as squares at their province's centre.
+    // Ports (1) and airports (2) as squares at their province's centre; plot uses max so airports draw on top.
     let mut air_mask = vec![0u8; wpx * hpx];
-    for (key, v) in [("ports", 2u8), ("airports", 1u8)] {
+    for (key, v) in [("ports", 1u8), ("airports", 2u8)] {
         for a in t[key].as_array().into_iter().flatten() {
             if let Some((x, y)) = to_px(a["province"].as_u64().unwrap_or(0)) {
                 plot(&mut air_mask, x, y, v, thick + 3);
@@ -1059,11 +1109,11 @@ fn write_nations_png(
                 Some((a, b)) => (a, b),
                 None => (rgb, base_r),
             };
-            // transport.png: roads by quality under the railways, airports on top.
+            // transport.png: roads by quality under the railways, airports on top of ports.
             let base_t = if border && water.is_none() { [165, 160, 150] } else { base_r };
-            let tc = if air_mask[i] == 1 {
+            let tc = if air_mask[i] == 2 {
                 [140, 40, 170]
-            } else if air_mask[i] == 2 {
+            } else if air_mask[i] == 1 {
                 [20, 90, 170]
             } else if let Some((_, b)) = rail_rgb {
                 b
@@ -1105,15 +1155,15 @@ fn write_nation_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>,
         na += &format!(
             "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
             n["id"], csv_text(&n["name"]), csv_text(&n["government"]), hexc(&n["color"]), n["capital"], csv_text(&n["capital_name"]), n["primary_culture"], csv_text(&n["culture_name"]),
-            n["provinces"], n["population"], n["overseas_provinces"], n["founded"], opt(&n["ended"]), opt(&n["fate"]), n["fate_other"], n["parent"],
-            csv_text(&n["era"]), n["tech"], n["treasury"], n["income"], n["integration"], rk["track"], rk["paved"], rk["highway"], n["rail_km"], n["stations"], n["airports"],
-            n["ports"], n["liege"], csv_text(&n["rank"]), n["realm"], opt(&n["empire"]), inst,
+            n["provinces"], n["population"], n["overseas_provinces"], n["founded"], opt(&n["ended"]), opt(&n["fate"]), opt(&n["fate_other"]), opt(&n["parent"]),
+            csv_text(&n["era"]), n["tech"], n["treasury"], n["income"], n["integration"], opt(&rk["track"]), opt(&rk["paved"]), opt(&rk["highway"]), n["rail_km"], n["stations"], n["airports"],
+            n["ports"], opt(&n["liege"]), csv_text(&n["rank"]), n["realm"], opt(&n["empire"]), inst,
         );
     }
     write("nations.csv", na)?;
     let mut ev = String::from("year;event;nation;other;province;text\n");
     for e in arr("events") {
-        ev += &format!("{};{};{};{};{};{}\n", e["year"], csv_text(&e["event"]), e["nation"], e["other"], opt(&e["province"]), csv_text(&e["text"]));
+        ev += &format!("{};{};{};{};{};{}\n", e["year"], csv_text(&e["event"]), e["nation"], opt(&e["other"]), opt(&e["province"]), csv_text(&e["text"]));
     }
     write("nation_events.csv", ev)?;
     let mut rw = String::from("id;name;owner;opened;closed;km;stations;provinces\n");
@@ -1180,13 +1230,13 @@ fn write_culture_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>
     let arr = |k: &str| t[k].as_array().unwrap_or(&empty);
     let write = |name: &str, text: String| std::fs::write(dir.join(name), text).map_err(|e| format!("{name}: {e}"));
     let hexc = |c: &serde_json::Value| format!("x{:02X}{:02X}{:02X}", c[0].as_u64().unwrap_or(0), c[1].as_u64().unwrap_or(0), c[2].as_u64().unwrap_or(0));
-    let opt = |v: &serde_json::Value| if v.is_null() { String::new() } else { v.to_string() };
+    let opt = |v: &serde_json::Value| if v.is_null() { String::new() } else { csv_text(v) };
     let mut cu = String::from("id;name;group;color;parent;alive;population;provinces;founded_year;ended_year;fate;fate_other\n");
     for c in arr("cultures") {
         cu += &format!(
             "{};{};{};{};{};{};{};{};{};{};{};{}\n",
-            c["id"], csv_text(&c["name"]), c["group"], hexc(&c["color"]), c["parent"], c["alive"], c["population"], c["provinces"],
-            c["founded_year"], opt(&c["ended_year"]), csv_text(&c["fate"]), c["fate_other"],
+            c["id"], csv_text(&c["name"]), c["group"], hexc(&c["color"]), opt(&c["parent"]), c["alive"], c["population"], c["provinces"],
+            c["founded_year"], opt(&c["ended_year"]), csv_text(&c["fate"]), opt(&c["fate_other"]),
         );
     }
     write("cultures.csv", cu)?;
@@ -1197,7 +1247,7 @@ fn write_culture_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>
     write("culture_groups.csv", gr)?;
     let mut ev = String::from("year;event;culture;other\n");
     for e in arr("events") {
-        ev += &format!("{};{};{};{}\n", e["year"], csv_text(&e["kind"]), e["culture"], e["other"]);
+        ev += &format!("{};{};{};{}\n", e["year"], csv_text(&e["kind"]), e["culture"], opt(&e["other"]));
     }
     write("culture_events.csv", ev)?;
     let mut pc = String::from("province;population;culture;shares\n");
@@ -1215,12 +1265,12 @@ fn write_culture_tables(dir: &Path, t: &serde_json::Value) -> Result<Vec<String>
 /// source down to where it joins a bigger river or reaches water, with the
 /// discharge it brings there. The last corner is the confluence or the shore.
 fn river_chains(to: &[i32], discharge: &[f32]) -> Vec<(f32, Vec<usize>)> {
-    let nt = to.len();
+    let nt = to.len().min(discharge.len());
     // Main upstream of each river corner = the river donor with the most discharge.
     let mut main_up = vec![-1i32; nt];
     for t in 0..nt {
         let r = to[t];
-        if r >= 0 && to[r as usize] >= 0 {
+        if r >= 0 && (r as usize) < nt && to[r as usize] >= 0 {
             let r = r as usize;
             if main_up[r] < 0 || discharge[t] > discharge[main_up[r] as usize] {
                 main_up[r] = t as i32;
@@ -1228,28 +1278,34 @@ fn river_chains(to: &[i32], discharge: &[f32]) -> Vec<(f32, Vec<usize>)> {
         }
     }
     let mut chains: Vec<(f32, Vec<usize>)> = Vec::new();
+    let mut seen = vec![false; nt];
     for s in 0..nt {
         if to[s] < 0 || main_up[s] >= 0 {
             continue;
         }
         let mut chain = vec![s];
+        seen[s] = true;
         let mut c = s;
-        loop {
+        while chain.len() <= nt {
             let r = to[c];
-            if r < 0 {
+            if r < 0 || (r as usize) >= nt {
                 break;
             }
             let r = r as usize;
             chain.push(r);
-            if to[r] < 0 || main_up[r] != c as i32 {
+            if seen[r] || to[r] < 0 || main_up[r] != c as i32 {
                 break;
             }
+            seen[r] = true;
             c = r;
+        }
+        for &node in &chain {
+            seen[node] = false;
         }
         let q = discharge[chain[chain.len().saturating_sub(2)]];
         chains.push((q, chain));
     }
-    chains.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1[0].cmp(&b.1[0])));
+    chains.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1[0].cmp(&b.1[0])));
     chains
 }
 
@@ -1267,6 +1323,7 @@ fn draw_rivers(corner_ll: &[(f64, f64)], rank: &[u8], to: &[i32], discharge: &[f
         Some((x.clamp(0, w as i64 - 1), y.clamp(0, h as i64 - 1)))
     };
     let chains = river_chains(to, discharge);
+    let wi = w as i64;
 
     for (_, chain) in &chains {
         let mut first = true;
@@ -1274,18 +1331,23 @@ fn draw_rivers(corner_ll: &[(f64, f64)], rank: &[u8], to: &[i32], discharge: &[f
         'chain: for win in chain.windows(2) {
             let (a, b) = (win[0], win[1]);
             let (Some(pa), Some(pb)) = (to_px(a), to_px(b)) else { break };
-            if (pa.0 - pb.0).abs() > w as i64 / 2 {
-                break;
+            // Wrap shortest horizontal displacement across the ±180° seam.
+            let mut raw_dx = pb.0 - pa.0;
+            if raw_dx > wi / 2 {
+                raw_dx -= wi;
+            } else if raw_dx < -wi / 2 {
+                raw_dx += wi;
             }
             let color = WIDTH0 + rank[a].saturating_sub(1).min(8);
             // 4-connected line: step in x or y, whichever the ideal line crosses first.
             let (mut x, mut y) = pa;
-            let (dx, dy) = ((pb.0 - pa.0).abs(), (pb.1 - pa.1).abs());
-            let (sx, sy) = (if pa.0 < pb.0 { 1 } else { -1 }, if pa.1 < pb.1 { 1 } else { -1 });
+            let (dx, dy) = (raw_dx.abs(), (pb.1 - pa.1).abs());
+            let (sx, sy) = (if raw_dx >= 0 { 1 } else { -1 }, if pb.1 >= pa.1 { 1 } else { -1 });
             let (mut ix, mut iy) = (0i64, 0i64);
             loop {
-                if Some((x, y)) != last {
-                    let idx = y as usize * w + x as usize;
+                let wx = x.rem_euclid(wi);
+                if Some((wx, y)) != last {
+                    let idx = y as usize * w + wx as usize;
                     let px = img[idx];
                     if px == WATER {
                         break 'chain;
@@ -1302,7 +1364,7 @@ fn draw_rivers(corner_ll: &[(f64, f64)], rank: &[u8], to: &[i32], discharge: &[f
                     }
                     img[idx] = if first { SOURCE } else { color };
                     first = false;
-                    last = Some((x, y));
+                    last = Some((wx, y));
                 }
                 if ix >= dx && iy >= dy {
                     break;
@@ -1317,6 +1379,5 @@ fn draw_rivers(corner_ll: &[(f64, f64)], rank: &[u8], to: &[i32], discharge: &[f
             }
         }
     }
-    let _ = SPLIT;
     img
 }

@@ -302,7 +302,7 @@ fn run_ebm(p: &WorldParams, bands: &Bands) -> Ebm {
     let dome_drop = p.climate.lapse_rate_c_per_km * ICE_DOME_M / 1000.0;
     for year in 0..years {
         let seas_on = year >= 8;
-        for day in 0..days {
+        for (day, q_day) in q.iter().enumerate() {
             if has_sheet {
                 sink = [0.0; NB];
                 for j in 0..NB {
@@ -336,7 +336,7 @@ fn run_ebm(p: &WorldParams, bands: &Bands) -> Ebm {
                     0.0
                 };
                 let (alb, _, _) = albedo(t[k], band_x(k), t_summer_prev[k], lf, land_drop[k]);
-                let asr = q[day][k] * (1.0 - alb) - sink[k];
+                let asr = q_day[k] * (1.0 - alb) - sink[k];
                 let kl = d * edge[k] / (dx * dx);
                 let kr = d * edge[k + 1] / (dx * dx);
                 a[k] = if k > 0 { -kl } else { 0.0 };
@@ -1265,60 +1265,60 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 // its moisture does, and one that cannot dries out.
                 let mut w: Vec<f64> = sat.iter().map(|s| START_HUMIDITY * s).collect();
                 let mut cl = vec![0.0f64; nc];
+                let mut w_next = vec![0.0f64; nc];
+                let mut cl_next = vec![0.0f64; nc];
                 let mut acc = vec![0.0f64; nc];
                 let mut last_rain = vec![0.0f64; nc];
                 let mut wide_sum = vec![0.0f64; storm_grid.len()];
                 let warm = passes / 2;
                 for pass in 0..passes {
-                    let next: Vec<(f64, f64, f64)> = (0..nc)
-                        .map(|i| {
-                            let (mut inflow, mut inflow_cl) = (0.0, 0.0);
-                            for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
-                                let (j, wt) = (nbr_idx[e] as usize, in_w[e]);
-                                inflow += w[j] * wt;
-                                inflow_cl += cl[j] * wt;
-                            }
-                            // Advect specific humidity and cloud as mixing ratios
-                            // (normalized by air mass `m`), preventing 2-D wind
-                            // divergence from deleting moisture on east coasts or
-                            // 2-D stagnation from piling dry desert air to saturation.
-                            let m = mass[i].max(1e-6);
-                            let mut v = ((w[i] * stay[i] + inflow) / m) * sub_dry[i] + recycle[i] * last_rain[i];
-                            // Only humid air that arrives up the slope condenses
-                            // into cloud (dry air lifted slightly stays unsaturated).
-                            let cond = ((inflow / m) * lift[i] * smoothstep(0.30, 0.95, v / sat[i])).min(v);
-                            v -= cond;
-                            v += evap[i] * (sat[i] - v).max(0.0) + soil[i].min(LAND_EVAPORATION_RATE * (sat[i] - v).max(0.0));
-                            let mut c = (cl[i] * stay[i] + inflow_cl) / m + cond;
-                            // Cloud that comes down a lee side evaporates into
-                            // air that has room for it.
-                            let back = dissolve[i] * c.min((sat[i] - v).max(0.0));
-                            c -= back;
-                            v += back;
-                            // Rain grows steeply with relative humidity: hot,
-                            // dry air keeps what little vapour it has.
-                            let humid = (v / sat[i]).min(1.2);
-                            let ready = showery[i] * humid * humid + (1.0 - showery[i]) * smoothstep(0.55, 1.0, humid);
-                            let r = (v * rain_rate[i] * ready).min(0.6 * v);
-                            v -= r;
-                            // Air that cools (climbing, or moving over colder
-                            // ground) condenses what it can no longer hold.
-                            if v > sat[i] {
-                                c += (v - sat[i]) * cond_eff[i];
-                                v = sat[i];
-                            }
-                            let rc = c * CLOUD_FALLOUT;
-                            (v, c - rc, r + rc)
-                        })
-                        .collect();
-                    for (i, (v, c, r)) in next.into_iter().enumerate() {
-                        w[i] = v;
-                        cl[i] = c;
-                        last_rain[i] = r;
+                    for i in 0..nc {
+                        let (mut inflow, mut inflow_cl) = (0.0, 0.0);
+                        for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
+                            let (j, wt) = (nbr_idx[e] as usize, in_w[e]);
+                            inflow += w[j] * wt;
+                            inflow_cl += cl[j] * wt;
+                        }
+                        // Advect specific humidity and cloud as mixing ratios
+                        // (normalized by air mass `m`), preventing 2-D wind
+                        // divergence from deleting moisture on east coasts or
+                        // 2-D stagnation from piling dry desert air to saturation.
+                        let m = mass[i].max(1e-6);
+                        let mut v = ((w[i] * stay[i] + inflow) / m) * sub_dry[i] + recycle[i] * last_rain[i];
+                        // Only humid air that arrives up the slope condenses
+                        // into cloud (dry air lifted slightly stays unsaturated).
+                        let cond = ((inflow / m) * lift[i] * smoothstep(0.30, 0.95, v / sat[i])).min(v);
+                        v -= cond;
+                        v += evap[i] * (sat[i] - v).max(0.0) + soil[i].min(LAND_EVAPORATION_RATE * (sat[i] - v).max(0.0));
+                        let mut c = (cl[i] * stay[i] + inflow_cl) / m + cond;
+                        // Cloud that comes down a lee side evaporates into
+                        // air that has room for it.
+                        let back = dissolve[i] * c.min((sat[i] - v).max(0.0));
+                        c -= back;
+                        v += back;
+                        // Rain grows steeply with relative humidity: hot,
+                        // dry air keeps what little vapour it has.
+                        let humid = (v / sat[i]).min(1.2);
+                        let ready = showery[i] * humid * humid + (1.0 - showery[i]) * smoothstep(0.55, 1.0, humid);
+                        let r = (v * rain_rate[i] * ready).min(0.6 * v);
+                        v -= r;
+                        // Air that cools (climbing, or moving over colder
+                        // ground) condenses what it can no longer hold.
+                        if v > sat[i] {
+                            c += (v - sat[i]) * cond_eff[i];
+                            v = sat[i];
+                        }
+                        let rc = c * CLOUD_FALLOUT;
+                        let rain = r + rc;
+                        w_next[i] = v;
+                        cl_next[i] = c - rc;
+                        last_rain[i] = rain;
                         if pass >= warm {
-                            acc[i] += r;
+                            acc[i] += rain;
                         }
                     }
+                    std::mem::swap(&mut w, &mut w_next);
+                    std::mem::swap(&mut cl, &mut cl_next);
                     // Every few passes, storms even out the vapour of the
                     // storm belts over a wide area (the mean wind alone would
                     // leave the land downwind of mountains and far from the
@@ -1651,7 +1651,11 @@ fn orographic_downscale(fine: &Grid, t: &GridTransfer, nc: usize, elev: &[f32], 
                 // Slope along the wind (m/km); calm air barely lifts.
                 let s = w.dot(grad[i]) / speed;
                 let calm = (speed / 3.0).min(1.0);
-                calm * if s > 0.0 { (1.0 + DOWNSCALE_GAIN * strength * (1.0 - (-s / DOWNSCALE_SLOPE).exp())).ln() } else { s * strength / DOWNSCALE_LEE }
+                calm * if s > 0.0 {
+                    (1.0 + DOWNSCALE_GAIN * strength * (1.0 - (-s / DOWNSCALE_SLOPE).exp())).ln()
+                } else {
+                    s * strength / DOWNSCALE_LEE
+                }
             })
             .collect();
         let lf = smooth(fine, &lf);

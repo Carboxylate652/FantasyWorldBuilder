@@ -190,7 +190,7 @@ pub fn validate(img: &Indexed, defs: Option<&[Def]>, min_pixels: usize) -> (Repo
         rep.errors.push(format!("{blended} pixels look like anti-aliased blends between two provinces (first at x={x}, y={y}); paint with a hard-edged pencil"));
     }
     if !missing.is_empty() {
-        let mut v: Vec<(usize, (usize, (usize, usize)))> = missing.into_iter().collect();
+        let mut v: Vec<_> = missing.into_iter().collect();
         v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
         let total = v.len();
         let list: Vec<String> = v.iter().take(8).map(|(k, (n, (x, y)))| format!("{} ({n} px, first at x={x}, y={y})", hex(img.colors[*k]))).collect();
@@ -326,11 +326,16 @@ pub fn describe(png: &str, csv: Option<&str>, lat_min: Option<f64>, lat_max: Opt
     };
     let (rep, _) = validate(&img, defs.as_deref(), 8);
     let (a, b) = package_lat_range(png);
+    let lo = lat_min.unwrap_or(a);
+    let hi = lat_max.unwrap_or(b);
+    if !lo.is_finite() || !hi.is_finite() || lo >= hi {
+        return Err(format!("invalid latitude range [{lo}, {hi}]"));
+    }
     let imp = ProvinceImport {
         png: png.to_string(),
         csv: csv.map(|s| s.to_string()),
-        lat_min: lat_min.unwrap_or(a),
-        lat_max: lat_max.unwrap_or(b),
+        lat_min: lo,
+        lat_max: hi,
         content_hash: content_hash(png, csv)?,
     };
     Ok((imp, rep))
@@ -347,6 +352,9 @@ pub struct Votes {
 /// Each cell takes the province with the most pixels inside it; cells that got
 /// no pixels copy a neighbour.
 pub fn rasterize(imp: &ProvinceImport, g: &Grid) -> Result<Votes, String> {
+    if !imp.lat_min.is_finite() || !imp.lat_max.is_finite() || imp.lat_min >= imp.lat_max {
+        return Err(format!("invalid latitude range [{}, {}]", imp.lat_min, imp.lat_max));
+    }
     let img = read_png(&imp.png)?;
     let defs = match &imp.csv {
         Some(c) => Some(read_definition(c)?),
@@ -366,8 +374,8 @@ pub fn rasterize(imp: &ProvinceImport, g: &Grid) -> Result<Votes, String> {
         }
     }
     let n = g.len();
-    // Up to four candidate provinces per cell, with pixel counts.
-    let mut votes = vec![[(u32::MAX, 0u32); 4]; n];
+    // Candidate provinces per cell with pixel counts; dynamically grows when >4 provinces overlap a cell.
+    let mut votes: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
     let (w, h) = (img.width, img.height);
     let span = imp.lat_max - imp.lat_min;
     let mut hint = None;
@@ -384,26 +392,30 @@ pub fn rasterize(imp: &ProvinceImport, g: &Grid) -> Result<Votes, String> {
             let slots = &mut votes[c];
             if let Some(s) = slots.iter_mut().find(|s| s.0 == d) {
                 s.1 += 1;
-            } else if let Some(s) = slots.iter_mut().find(|s| s.0 == u32::MAX) {
-                *s = (d, 1);
+            } else {
+                slots.push((d, 1));
             }
         }
     }
-    let mut cell: Vec<u32> = votes.iter().map(|v| v.iter().filter(|s| s.0 != u32::MAX).max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map_or(u32::MAX, |s| s.0)).collect();
-    // Cells without pixels (outside the band, or a coarse image) copy a neighbour.
-    for _ in 0..n {
-        let mut changed = false;
-        for i in 0..n {
-            if cell[i] != u32::MAX {
-                continue;
-            }
-            if let Some(&j) = g.neighbors(i).iter().find(|&&j| cell[j as usize] != u32::MAX) {
-                cell[i] = cell[j as usize];
-                changed = true;
-            }
+    let mut cell: Vec<u32> = votes
+        .iter()
+        .map(|v| v.iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map_or(u32::MAX, |s| s.0))
+        .collect();
+    // Cells without pixels (outside the band, or a coarse image) copy the nearest filled cell via BFS.
+    let mut queue = std::collections::VecDeque::new();
+    for (i, &c) in cell.iter().enumerate() {
+        if c != u32::MAX {
+            queue.push_back(i);
         }
-        if !changed {
-            break;
+    }
+    while let Some(i) = queue.pop_front() {
+        let val = cell[i];
+        for &j in g.neighbors(i) {
+            let ju = j as usize;
+            if cell[ju] == u32::MAX {
+                cell[ju] = val;
+                queue.push_back(ju);
+            }
         }
     }
     Ok(Votes { cell, defs: out_defs, report })

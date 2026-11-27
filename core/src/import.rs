@@ -15,20 +15,36 @@ pub struct Heightmap {
 
 /// Build an import record for a file, hashing its contents as the cache key.
 pub fn describe(path: &str, encoding: HeightEncoding, lat_min: f64, lat_max: f64, blend: f64) -> Result<ElevationImport, String> {
+    if !lat_min.is_finite() || !lat_max.is_finite() || lat_min >= lat_max {
+        return Err(format!("invalid latitude range [{lat_min}, {lat_max}]"));
+    }
+    if !blend.is_finite() {
+        return Err("blend must be finite".into());
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     let imp = ElevationImport { path: path.to_string(), encoding, lat_min, lat_max, blend: blend.clamp(0.0, 1.0), content_hash: hash::hex(hash::bytes(&bytes)) };
-    load(&imp)?; // validate now rather than at the next run
+    decode_bytes(&imp, &bytes)?; // validate now from the same bytes we hashed
     Ok(imp)
 }
 
 pub fn load(imp: &ElevationImport) -> Result<Heightmap, String> {
-    let file = std::fs::File::open(&imp.path).map_err(|e| format!("{}: {e}", imp.path))?;
-    let mut dec = png::Decoder::new(std::io::BufReader::new(file));
+    if !imp.lat_min.is_finite() || !imp.lat_max.is_finite() || imp.lat_min >= imp.lat_max {
+        return Err(format!("{}: invalid latitude range [{}, {}]", imp.path, imp.lat_min, imp.lat_max));
+    }
+    let bytes = std::fs::read(&imp.path).map_err(|e| format!("{}: {e}", imp.path))?;
+    decode_bytes(imp, &bytes)
+}
+
+fn decode_bytes(imp: &ElevationImport, bytes: &[u8]) -> Result<Heightmap, String> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
     dec.set_transformations(png::Transformations::EXPAND);
     let mut reader = dec.read_info().map_err(|e| format!("{}: {e}", imp.path))?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).map_err(|e| format!("{}: {e}", imp.path))?;
     let (w, h) = (info.width as usize, info.height as usize);
+    if w == 0 || h == 0 {
+        return Err(format!("{}: empty heightmap image", imp.path));
+    }
     let channels = info.color_type.samples();
     let sixteen = info.bit_depth == png::BitDepth::Sixteen;
     let bpp = channels * if sixteen { 2 } else { 1 };
@@ -52,7 +68,7 @@ pub fn load(imp: &ElevationImport) -> Result<Heightmap, String> {
                     }
                 }
             };
-            data.push(m as f32);
+            data.push(if m.is_finite() { m as f32 } else { 0.0 });
         }
     }
     Ok(Heightmap { width: w, height: h, data, lat_min: imp.lat_min, lat_max: imp.lat_max })
@@ -61,6 +77,9 @@ pub fn load(imp: &ElevationImport) -> Result<Heightmap, String> {
 impl Heightmap {
     /// Bilinear sample at a latitude/longitude in degrees; None outside the latitude band.
     pub fn sample(&self, lat: f64, lon: f64) -> Option<f32> {
+        if !lat.is_finite() || !lon.is_finite() || self.lat_max <= self.lat_min || self.width == 0 || self.height == 0 {
+            return None;
+        }
         if lat < self.lat_min || lat > self.lat_max {
             return None;
         }

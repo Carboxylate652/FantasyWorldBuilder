@@ -114,7 +114,7 @@ pub fn recentre(g: &Grid, label: &[u32], seeds: &mut [u32], weight: impl Fn(usiz
     let mut sum = vec![Vec3::new(0.0, 0.0, 0.0); k];
     for (i, &l) in label.iter().enumerate() {
         if l != NONE {
-            sum[l as usize] = sum[l as usize] + g.pos[i] * weight(i).max(1e-6);
+            sum[l as usize] += g.pos[i] * weight(i).max(1e-6);
         }
     }
     let mut best = vec![(f64::NEG_INFINITY, NONE); k];
@@ -150,9 +150,11 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 /// renumbered 0.. in order of their smallest old label. Returns the new count.
 pub fn merge_small(g: &Grid, label: &mut [u32], count: usize, area: &[f64], min_area: &[f64], adjacent: impl Fn(usize, usize) -> bool) -> usize {
     let mut a = vec![0.0f64; count];
+    let mut cells = vec![0usize; count];
     for (i, &l) in label.iter().enumerate() {
         if l != NONE {
             a[l as usize] += area[i];
+            cells[l as usize] += 1;
         }
     }
     let mut nb: Vec<BTreeMap<u32, u32>> = vec![BTreeMap::new(); count];
@@ -169,8 +171,8 @@ pub fn merge_small(g: &Grid, label: &mut [u32], count: usize, area: &[f64], min_
         }
     }
     let mut parent: Vec<u32> = (0..count as u32).collect();
-    let mut by_area: Vec<u32> = (0..count as u32).collect();
-    by_area.sort_by(|x, y| a[*x as usize].partial_cmp(&a[*y as usize]).unwrap().then(x.cmp(y)));
+    let mut by_area: Vec<u32> = (0..count as u32).filter(|&l| cells[l as usize] > 0).collect();
+    by_area.sort_by(|x, y| a[*x as usize].total_cmp(&a[*y as usize]).then(x.cmp(y)));
     for s in by_area {
         if find(&mut parent, s) != s || a[s as usize] >= min_area[s as usize] {
             continue;
@@ -186,13 +188,14 @@ pub fn merge_small(g: &Grid, label: &mut [u32], count: usize, area: &[f64], min_
             }
         }
         for (&r, &v) in &merged {
-            if best.map_or(true, |(_, bv)| v > bv) {
+            if best.is_none_or(|(_, bv)| v > bv) {
                 best = Some((r, v));
             }
         }
         let Some((t, _)) = best else { continue };
         parent[s as usize] = t;
         a[t as usize] += a[s as usize];
+        cells[t as usize] += cells[s as usize];
         let moved = std::mem::take(&mut nb[s as usize]);
         for (k, v) in moved {
             let r = find(&mut parent, k);
@@ -205,7 +208,7 @@ pub fn merge_small(g: &Grid, label: &mut [u32], count: usize, area: &[f64], min_
     let mut next = 0u32;
     for l in 0..count as u32 {
         let r = find(&mut parent, l);
-        if new_id[r as usize] == NONE {
+        if cells[r as usize] > 0 && new_id[r as usize] == NONE {
             new_id[r as usize] = next;
             next += 1;
         }
@@ -264,4 +267,26 @@ pub fn absorb_fragments(g: &Grid, label: &mut [u32], area: &[f64], adjacent: imp
         }
     }
     moved
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_small_omits_zero_cell_ghost_labels() {
+        let g = Grid::new(3);
+        let area = vec![1.0; g.len()];
+        // Label 1 intentionally has zero cells.
+        let mut label = vec![0u32; g.len()];
+        label[0] = 2;
+        let min_area = vec![10.0, 10.0, 0.5];
+        let count = merge_small(&g, &mut label, 3, &area, &min_area, |_, _| true);
+        let mut counts = vec![0usize; count];
+        for &l in &label {
+            assert!((l as usize) < count, "label {l} >= count {count}");
+            counts[l as usize] += 1;
+        }
+        assert!(counts.iter().all(|&c| c > 0), "ghost 0-cell label found: {counts:?}");
+    }
 }

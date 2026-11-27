@@ -58,15 +58,17 @@ impl Line {
 
 /// Cheapest travel cost from `src` to every reachable province.
 ///
+pub type LandAdj<'a> = &'a dyn Fn(usize, &mut dyn FnMut(usize, f64));
+
 /// - `land(p, emit)` calls `emit(q, cost)` for each border p can cross;
-/// - `lines`: open lines, with `usable(p)` telling which stations may be used
-///   (e.g. those on the traveller's own land) and `seg_km(a, b)` the length
-///   between two neighbouring provinces on a line;
+/// - `lines`: open lines, with `usable(p)` telling which stations and tracks
+///   may be used (e.g. those on the traveller's own land) and `seg_km(a, b)`
+///   the length between two neighbouring provinces on a line;
 /// - `links`: extra two-way links (sea passages, flights) as (a, b, cost).
 #[allow(clippy::too_many_arguments)]
 pub fn travel_costs(
     src: usize,
-    land: &dyn Fn(usize, &mut dyn FnMut(usize, f64)),
+    land: LandAdj<'_>,
     lines: &[&Line],
     usable: &dyn Fn(usize) -> bool,
     seg_km: &dyn Fn(usize, usize) -> f64,
@@ -79,19 +81,25 @@ pub fn travel_costs(
         Prov(usize),
         OnLine(usize, usize),
     }
-    // Stations per province, and the next station along each line.
+    // Stations per province, and contiguous usable segments along each line.
     let mut at: HashMap<usize, Vec<(usize, usize)>> = HashMap::new(); // province -> (line, station index)
-    let mut stops: Vec<Vec<(usize, f64)>> = Vec::with_capacity(lines.len()); // per line: (province, km from start)
+    let mut stops: Vec<Vec<(usize, f64, usize)>> = Vec::with_capacity(lines.len()); // per line: (province, km, segment)
     for (li, l) in lines.iter().enumerate() {
         let mut acc = 0.0;
+        let mut seg = 0usize;
         let mut v = Vec::new();
         for (k, &p) in l.path.iter().enumerate() {
             if k > 0 {
                 acc += seg_km(l.path[k - 1], p);
             }
-            if l.station[k] && usable(p) {
+            if !usable(p) {
+                // Unusable track/station breaks the line so trains cannot teleport across it.
+                seg += 1;
+                continue;
+            }
+            if l.station[k] {
                 at.entry(p).or_default().push((li, v.len()));
-                v.push((p, acc));
+                v.push((p, acc, seg));
             }
         }
         stops.push(v);
@@ -106,12 +114,13 @@ pub fn travel_costs(
     dist.insert(Node::Prov(src), 0.0);
     heap.push(Reverse((0u64, Node::Prov(src))));
     let half = 0.5 * transfer_km.max(0.0);
+    let mut next: Vec<(Node, f64)> = Vec::new();
     while let Some(Reverse((bits, node))) = heap.pop() {
         let d = f64::from_bits(bits);
         if d > dist[&node] {
             continue;
         }
-        let mut next: Vec<(Node, f64)> = Vec::new();
+        next.clear();
         match node {
             Node::Prov(p) => {
                 land(p, &mut |q, c| next.push((Node::Prov(q), c)));
@@ -125,17 +134,17 @@ pub fn travel_costs(
             Node::OnLine(li, k) => {
                 let s = &stops[li];
                 next.push((Node::Prov(s[k].0), half));
-                if k + 1 < s.len() {
+                if k + 1 < s.len() && s[k + 1].2 == s[k].2 {
                     next.push((Node::OnLine(li, k + 1), (s[k + 1].1 - s[k].1) * RAIL_FACTOR));
                 }
-                if k > 0 {
+                if k > 0 && s[k - 1].2 == s[k].2 {
                     next.push((Node::OnLine(li, k - 1), (s[k].1 - s[k - 1].1) * RAIL_FACTOR));
                 }
             }
         }
-        for (m, c) in next {
-            let nd = d + c;
-            if dist.get(&m).map_or(true, |&x| nd < x) {
+        for &(m, c) in &next {
+            let nd = d + c.max(0.0);
+            if dist.get(&m).is_none_or(|&x| nd < x) {
                 dist.insert(m, nd);
                 heap.push(Reverse((nd.to_bits(), m)));
             }
@@ -178,6 +187,10 @@ mod tests {
         // Stations that can't be used (another nation's) break the line.
         let d3 = travel_costs(0, &land, &[&a], &|p| p != 5, &seg, 150.0, &[]);
         assert!((d3[&5] - (400.0 * RAIL_FACTOR + 150.0 + 100.0)).abs() < 1e-9, "{}", d3[&5]);
+        // Blocking an intermediate province splits the line so trains cannot teleport across it.
+        let d_mid = travel_costs(0, &land, &[&a], &|p| p != 2, &seg, 150.0, &[]);
+        // Best route: foot 0->1->2->3 (300) + rail 3->5 (200*0.12 + 150 = 174) = 474 vs foot 500.
+        assert!((d_mid[&5] - (300.0 + 200.0 * RAIL_FACTOR + 150.0)).abs() < 1e-9, "{}", d_mid[&5]);
         // A flight link.
         let d4 = travel_costs(0, &land, &[], &|_| true, &seg, 150.0, &[(0, 5, 80.0)]);
         assert_eq!(d4[&5], 80.0);

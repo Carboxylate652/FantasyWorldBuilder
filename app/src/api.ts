@@ -6,6 +6,14 @@ export const isTauri = '__TAURI_INTERNALS__' in window;
 const httpBase: string =
   (import.meta.env.VITE_API as string | undefined) ?? (location.port === '5173' ? 'http://127.0.0.1:8765' : '');
 
+class ApiError extends Error {
+  status?: number;
+  constructor(message: string, status?: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function raw(cmd: string, args: unknown = {}): Promise<ArrayBuffer> {
   if (isTauri) {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -13,7 +21,7 @@ async function raw(cmd: string, args: unknown = {}): Promise<ArrayBuffer> {
     return res instanceof ArrayBuffer ? res : new Uint8Array(res).buffer;
   }
   const r = await fetch(`${httpBase}/api/${cmd}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
-  if (!r.ok) throw new Error(await r.text());
+  if (!r.ok) throw new ApiError(await r.text(), r.status);
   return r.arrayBuffer();
 }
 
@@ -30,23 +38,35 @@ export type FieldData = {
   step: number;
 };
 
+function isMissingFieldError(err: unknown): boolean {
+  if (err instanceof ApiError && err.status === 404) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /not available|not computed yet|no such field/i.test(msg);
+}
+
 export async function field(name: string, month?: number): Promise<FieldData | null> {
   try {
     const b = await raw('field', { name, month: month ?? null });
+    if (b.byteLength < 8) throw new Error(`field "${name}" payload truncated (${b.byteLength} bytes)`);
     const dv = new DataView(b);
     const code = dv.getUint8(0);
     const stale = dv.getUint8(1) === 1;
     const step = dv.getUint16(2, true);
     const count = dv.getUint32(4, true);
-    const body = b.slice(8);
+    const elemSize = code === 1 ? 1 : code === 2 ? 2 : code === 0 || code === 3 || code === 4 ? 4 : 0;
+    if (!elemSize) throw new Error(`field "${name}" has unknown type code ${code}`);
+    if (b.byteLength < 8 + count * elemSize) {
+      throw new Error(`field "${name}" payload too short (${b.byteLength} < ${8 + count * elemSize})`);
+    }
     const values =
-      code === 0 ? new Float32Array(body, 0, count)
-      : code === 1 ? new Uint8Array(body, 0, count)
-      : code === 2 ? new Uint16Array(body, 0, count)
-      : code === 3 ? new Uint32Array(body, 0, count)
-      : new Int32Array(body, 0, count);
+      code === 0 ? new Float32Array(b, 8, count)
+      : code === 1 ? new Uint8Array(b, 8, count)
+      : code === 2 ? new Uint16Array(b, 8, count)
+      : code === 3 ? new Uint32Array(b, 8, count)
+      : new Int32Array(b, 8, count);
     return { values, stale, step };
-  } catch {
+  } catch (err) {
+    if (!isMissingFieldError(err)) console.error(`Failed to load field "${name}":`, err);
     return null;
   }
 }

@@ -51,10 +51,12 @@ pub struct Gradient {
     inv: Vec<[f64; 4]>,
 }
 
+type GradientRow = (Vec3, Vec3, Vec<(f64, f64)>, [f64; 4]);
+
 impl Gradient {
     pub fn new(g: &Grid, radius_m: f64) -> Gradient {
         let n = g.len();
-        let rows: Vec<(Vec3, Vec3, Vec<(f64, f64)>, [f64; 4])> = (0..n)
+        let rows: Vec<GradientRow> = (0..n)
             .into_par_iter()
             .map(|i| {
                 let p = g.pos[i];

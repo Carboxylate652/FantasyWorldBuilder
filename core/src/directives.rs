@@ -46,6 +46,7 @@ impl Directive {
     }
 }
 
+#[derive(Clone)]
 pub struct ActionSpec {
     pub stage: &'static str,
     pub name: &'static str,
@@ -302,9 +303,15 @@ pub fn actions() -> Vec<ActionSpec> {
     ]
 }
 
+/// Cached directive specifications so validation does not rebuild JSON schemas on every call.
+fn cached_actions() -> &'static [ActionSpec] {
+    static CACHE: std::sync::OnceLock<Vec<ActionSpec>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(actions)
+}
+
 /// Actions available in a stage.
 pub fn actions_for(stage: &str) -> Vec<ActionSpec> {
-    actions().into_iter().filter(|a| a.stage == stage || a.stage == "both").collect()
+    cached_actions().iter().filter(|a| a.stage == stage || a.stage == "both").cloned().collect()
 }
 
 /// Check a directive's stage, action and arguments against its schema (types,
@@ -316,7 +323,10 @@ pub fn validate(d: &Directive) -> Result<(), String> {
     if d.month > 12 {
         return Err(format!("month {} should be 1–12", d.month));
     }
-    let spec = actions_for(&d.stage).into_iter().find(|a| a.name == d.action).ok_or_else(|| format!("unknown {} action `{}`", d.stage, d.action))?;
+    let spec = cached_actions()
+        .iter()
+        .find(|a| (a.stage == d.stage || a.stage == "both") && a.name == d.action)
+        .ok_or_else(|| format!("unknown {} action `{}`", d.stage, d.action))?;
     let args = d.args.as_object().ok_or("arguments must be an object")?;
     let props = spec.schema["properties"].as_object().unwrap();
     for k in args.keys() {
@@ -333,11 +343,11 @@ pub fn validate(d: &Directive) -> Result<(), String> {
         };
         let ok = types.iter().any(|t| match *t {
             "null" => v.is_null(),
-            "integer" => v.as_i64().is_some() || v.as_f64().is_some_and(|x| x.fract() == 0.0),
-            "number" => v.is_number(),
+            "integer" => v.as_i64().is_some() || v.as_f64().is_some_and(|x| x.is_finite() && x.fract() == 0.0),
+            "number" => v.as_f64().is_some_and(|x| x.is_finite()),
             "string" => v.is_string(),
             "boolean" => v.is_boolean(),
-            "array" => v.as_array().is_some_and(|a| a.iter().all(|x| x.as_i64().is_some() || x.as_f64().is_some_and(|f| f.fract() == 0.0))),
+            "array" => v.as_array().is_some_and(|a| a.iter().all(|x| x.as_i64().is_some() || x.as_f64().is_some_and(|f| f.is_finite() && f.fract() == 0.0))),
             _ => false,
         });
         if !ok {
@@ -361,20 +371,40 @@ pub fn validate(d: &Directive) -> Result<(), String> {
             }
         }
     }
+    if d.action == "tag" {
+        let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+        let tag = args.get("tag").and_then(|v| v.as_str()).unwrap_or("");
+        let has_id = args.get("id").is_some_and(|v| !v.is_null());
+        let valid_tag = match scope {
+            "nation" => matches!(tag, "isolationist" | "expansionist" | "merchant_republic" | "eternal"),
+            "state" => matches!(tag, "holy_land" | "free_state" | "institution_cradle"),
+            "world" => matches!(tag, "no_overseas_colonies" | "slow_institutions" | "fast_institutions" | "frequent_wars" | "stable_realms"),
+            _ => false,
+        };
+        if !valid_tag {
+            return Err(format!("tag: `{tag}` is not valid for scope `{scope}`"));
+        }
+        if scope != "world" && !has_id {
+            return Err(format!("tag: scope `{scope}` requires a non-null `id`"));
+        }
+    }
     Ok(())
 }
 
 /// Integer list argument (missing or null = empty).
 pub fn arg_ids(args: &Value, key: &str) -> Vec<u64> {
-    args[key].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().or_else(|| x.as_f64().map(|f| f as u64))).collect()).unwrap_or_default()
+    args[key]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_u64().or_else(|| x.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64))).collect())
+        .unwrap_or_default()
 }
 
 pub fn arg_u64(args: &Value, key: &str) -> Option<u64> {
-    args[key].as_u64().or_else(|| args[key].as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+    args[key].as_u64().or_else(|| args[key].as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64))
 }
 
 pub fn arg_f64(args: &Value, key: &str, default: f64) -> f64 {
-    args[key].as_f64().unwrap_or(default)
+    args[key].as_f64().filter(|x| x.is_finite()).unwrap_or(default)
 }
 
 /// Directives of one stage in the order they apply (by time, then as issued).

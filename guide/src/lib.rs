@@ -85,17 +85,68 @@ pub fn load_config() -> GuideConfig {
 }
 
 pub fn save_config(c: &GuideConfig) -> Result<(), String> {
+    use std::io::Write;
     let p = config_path();
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    std::fs::write(&p, serde_json::to_string_pretty(c).unwrap()).map_err(|e| format!("{}: {e}", p.display()))?;
+    let data = serde_json::to_string_pretty(c).unwrap();
+    let tmp = p.with_extension(format!("json.tmp.{}", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
+    f.write_all(data.as_bytes()).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", tmp.display())
+    })?;
+    drop(f);
+    std::fs::rename(&tmp, &p).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", p.display())
+    })?;
     Ok(())
+}
+
+/// Extract the lowercased host (preserving `[...]` around IPv6 literals) from a URL.
+fn url_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let after_scheme = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host_port.starts_with('[') {
+        let end = host_port.find(']')?;
+        return Some(host_port[..=end].to_ascii_lowercase());
+    }
+    let host = host_port.split_once(':').map_or(host_port, |(h, _)| h);
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+fn host_matches(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn key_env_vars(c: &GuideConfig) -> &'static [&'static str] {
+    if c.provider == "anthropic" {
+        return &["ANTHROPIC_API_KEY"];
+    }
+    let host = url_host(&c.base_url);
+    if host.as_deref().is_some_and(|h| host_matches(h, "ai-gateway.vercel.sh")) {
+        &["AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"]
+    } else if host.as_deref().is_some_and(|h| host_matches(h, "openrouter.ai")) {
+        &["OPENROUTER_API_KEY"]
+    } else {
+        &["OPENAI_API_KEY"]
+    }
 }
 
 /// The key to use: the saved one, else the provider's usual environment variable.
@@ -103,16 +154,7 @@ fn api_key(c: &GuideConfig) -> (String, &'static str) {
     if !c.api_key.is_empty() {
         return (c.api_key.clone(), "settings");
     }
-    let vars: &[&'static str] = if c.provider == "anthropic" {
-        &["ANTHROPIC_API_KEY"]
-    } else if c.base_url.contains("ai-gateway.vercel.sh") {
-        &["AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"]
-    } else if c.base_url.contains("openrouter.ai") {
-        &["OPENROUTER_API_KEY"]
-    } else {
-        &["OPENAI_API_KEY"]
-    };
-    for v in vars {
+    for v in key_env_vars(c) {
         if let Ok(k) = std::env::var(v) {
             if !k.is_empty() {
                 return (k, v);
@@ -125,10 +167,16 @@ fn api_key(c: &GuideConfig) -> (String, &'static str) {
 /// Settings as shown to the UI: never the key itself.
 fn public_config(c: &GuideConfig) -> Value {
     let (key, source) = api_key(c);
+    let key_hint = if key.chars().count() > 8 {
+        let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("…{tail}")
+    } else {
+        String::new()
+    };
     json!({
         "provider": c.provider, "base_url": c.base_url, "model": c.model, "effort": c.effort,
         "has_key": !key.is_empty(), "key_source": source,
-        "key_hint": if key.len() > 8 { format!("…{}", &key[key.len() - 4..]) } else { String::new() },
+        "key_hint": key_hint,
         "path": config_path().display().to_string(),
     })
 }
@@ -152,10 +200,19 @@ pub struct Answer {
     pub output_tokens: u64,
 }
 
+fn is_local_host(base: &str) -> bool {
+    let Some(host) = url_host(base) else {
+        return false;
+    };
+    if matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]" | "::1") {
+        return true;
+    }
+    host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// HTTP client; the environment's proxy is used except for local servers.
 fn agent(base: &str) -> ureq::Agent {
-    let host = base.split("://").nth(1).unwrap_or(base).split(['/', ':']).next().unwrap_or("");
-    let local = matches!(host, "localhost" | "127.0.0.1" | "[") || host.starts_with("127.") || base.contains("://[::1]");
+    let local = is_local_host(base);
     ureq::AgentBuilder::new().try_proxy_from_env(!local).timeout_connect(Duration::from_secs(15)).timeout_read(Duration::from_secs(600)).build()
 }
 
@@ -237,6 +294,7 @@ pub fn complete(c: &GuideConfig, system: &str, user: &str, tools: &[Tool], max_t
     } else {
         let body = json!({
             "model": c.model,
+            "max_tokens": max_tokens,
             "messages": [{ "role": "system", "content": system }, { "role": "user", "content": user }],
             "tools": tools.iter().map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.schema } })).collect::<Vec<_>>(),
             "tool_choice": "auto",
@@ -246,6 +304,10 @@ pub fn complete(c: &GuideConfig, system: &str, user: &str, tools: &[Tool], max_t
             req = req.set("authorization", &format!("Bearer {key}"));
         }
         let v: Value = req.send_json(body).map_err(http_error)?.into_json().map_err(|e| format!("unreadable answer: {e}"))?;
+        if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+            let msg = err["message"].as_str().or_else(|| err.as_str()).map(str::to_string).unwrap_or_else(|| err.to_string());
+            return Err(format!("provider error: {msg}"));
+        }
         let m = &v["choices"][0]["message"];
         let mut a = Answer {
             text: m["content"].as_str().unwrap_or("").to_string(),
@@ -257,11 +319,13 @@ pub fn complete(c: &GuideConfig, system: &str, user: &str, tools: &[Tool], max_t
         };
         for tc in m["tool_calls"].as_array().into_iter().flatten() {
             let f = &tc["function"];
+            let name = f["name"].as_str().unwrap_or("");
             let args = match &f["arguments"] {
-                Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+                Value::String(s) => serde_json::from_str(s)
+                    .map_err(|e| format!("malformed tool arguments for `{name}`: {e}"))?,
                 other => other.clone(),
             };
-            a.calls.push((f["name"].as_str().unwrap_or("").into(), args));
+            a.calls.push((name.into(), args));
         }
         Ok(a)
     }
@@ -348,7 +412,8 @@ pub fn turn(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, goal
     let st = if years > 0.0 { call(session, progress, "sim_step", json!({ "years": years }))? } else { call(session, progress, "sim_state", json!({}))? };
     let sim = &st["sim"];
     if sim["done"] == true {
-        return Ok(json!({ "done": true, "position": sim["position"], "narration": "", "actions": [] }));
+        let position = sim["position"].clone();
+        return Ok(json!({ "done": true, "position": position, "narration": "", "actions": [], "status": st }));
     }
     let stage = sim["stage"].as_str().unwrap_or("cultures").to_string();
     let when = if stage == "nations" { format!("year {}, month {}, of {}–{}", sim["year"], sim["month"], sim["start_year"], sim["end_year"]) } else { format!("generation {} of {} (year {})", sim["tick"], sim["ticks"], sim["year"]) };
@@ -366,11 +431,17 @@ pub fn turn(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, goal
         p.running = false;
     }
     let answer = answer?;
+    let limit = max_actions.max(1);
     let mut actions = Vec::new();
     let mut pace = None;
-    for (name, input) in answer.calls.iter().take(max_actions.max(1)) {
+    for (name, input) in &answer.calls {
         if name == "set_pace" {
-            pace = input["years"].as_f64();
+            if let Some(y) = input["years"].as_f64().filter(|y| y.is_finite()) {
+                pace = Some(y.clamp(5.0, 1000.0));
+            }
+            continue;
+        }
+        if actions.len() >= limit {
             continue;
         }
         let r = call(session, progress, "sim_directive", json!({ "action": name, "args": input, "by": "guide" }));
@@ -448,5 +519,34 @@ mod tests {
         assert!(!p.to_string().contains("sk-test"));
         assert_eq!(p["key_hint"], "…abcd");
         assert!(takes_fallback("claude-opus-5-5") && !takes_fallback("claude-haiku-5-5"));
+    }
+
+    #[test]
+    fn utf8_key_hint_never_panics() {
+        let c = GuideConfig { api_key: "sk-日本語テスト🔑🚀✨🎉".into(), ..Default::default() };
+        let p = public_config(&c);
+        assert_eq!(p["key_hint"], "…🔑🚀✨🎉");
+
+        let short = GuideConfig { api_key: "🔑🚀✨🎉".into(), ..Default::default() };
+        assert_eq!(public_config(&short)["key_hint"], "");
+    }
+
+    #[test]
+    fn host_matching_and_local_detection() {
+        let openai = |url: &str| GuideConfig { provider: "openai".into(), base_url: url.into(), ..Default::default() };
+        assert_eq!(key_env_vars(&openai("https://openrouter.ai/api/v1")), &["OPENROUTER_API_KEY"]);
+        assert_eq!(key_env_vars(&openai("https://api.openrouter.ai/v1")), &["OPENROUTER_API_KEY"]);
+        assert_eq!(key_env_vars(&openai("https://evil.com/openrouter.ai/v1")), &["OPENAI_API_KEY"]);
+        assert_eq!(key_env_vars(&openai("https://openrouter.ai.evil.com/v1")), &["OPENAI_API_KEY"]);
+        assert_eq!(key_env_vars(&openai("https://openrouter.ai@evil.com/v1")), &["OPENAI_API_KEY"]);
+        assert_eq!(key_env_vars(&openai("https://ai-gateway.vercel.sh/v1")), &["AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"]);
+        assert_eq!(key_env_vars(&openai("https://evil.com/?u=ai-gateway.vercel.sh")), &["OPENAI_API_KEY"]);
+
+        assert!(is_local_host("http://localhost:11434/v1"));
+        assert!(is_local_host("http://127.0.0.1:8080/v1"));
+        assert!(is_local_host("http://[::1]:11434/v1"));
+        assert!(!is_local_host("http://[2001:db8::1]:11434/v1"));
+        assert!(!is_local_host("https://127.evil.com/v1"));
+        assert!(!is_local_host("https://api.openai.com/v1"));
     }
 }

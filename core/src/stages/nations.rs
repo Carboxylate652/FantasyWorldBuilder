@@ -1019,11 +1019,21 @@ impl NationSim {
                     let x = &mut self.nations[nat as usize - 1];
                     x.treasury += tr;
                     x.tech = x.tech.max(te);
+                    // Mark target as united before moving provinces so take() does not emit a bogus conquest/capital event.
+                    let k = target as usize - 1;
+                    self.nations[k].ended = Some(self.year);
+                    self.nations[k].fate = "united".into();
+                    self.nations[k].other = nat;
                     for p in list {
                         self.take(p, nat);
                     }
-                    let k = target as usize - 1;
-                    self.nations[k].fate = "united".into();
+                    // Transfer feudal vassals of target to nat and update nat's era if tech advanced.
+                    for x in self.nations.iter_mut() {
+                        if x.liege == target {
+                            x.liege = nat;
+                        }
+                    }
+                    self.set_era(nat);
                     self.event("union", nat, target, None, format!("{bn} unites with {an}"));
                 }
                 "transfer" if self.alive(nat) => {
@@ -1232,7 +1242,7 @@ impl NationSim {
                 if let Some(t) = toward {
                     s *= 3.0 / (1.0 + self.km(q, t) / 800.0);
                 }
-                if best.map_or(true, |b| s > b.0) {
+                if best.is_none_or(|b| s > b.0) {
                     best = Some((s, q));
                 }
             }
@@ -1254,7 +1264,7 @@ impl NationSim {
                     let q = self.coastal_land[self.rng.below(self.coastal_land.len())];
                     let o = self.owner[q];
                     // Free land, or land of a much weaker nation (colonial conquest).
-                    if o == n || self.free(q) || (o > 0 && (self.at_peace(n, o) || self.same_realm(n, o) || self.realm_pop(o) > 0.25 * own_pop)) {
+                    if o == n || self.free(q) || (self.cap[q] < 1.0 && self.pop[q] < 1.0) || (o > 0 && (self.at_peace(n, o) || self.same_realm(n, o) || self.realm_pop(o) > 0.25 * own_pop)) {
                         continue;
                     }
                     let d = ports.iter().map(|&p| self.km(p, q)).fold(f64::INFINITY, f64::min);
@@ -1268,7 +1278,7 @@ impl NationSim {
                     if let Some(t) = toward {
                         s *= 3.0 / (1.0 + self.km(q, t) / 800.0);
                     }
-                    if best.map_or(true, |b| s > b.0) {
+                    if best.is_none_or(|b| s > b.0) {
                         best = Some((s, q));
                     }
                 }
@@ -1339,7 +1349,7 @@ impl NationSim {
     /// Travel cost over a border (km on foot): longer across barriers and
     /// impassable land, divided by the road's speed; a strait is a crossing.
     fn edge_cost(&self, p: usize, e: &Edge) -> f64 {
-        let b = 1.0 + self.np.barrier_weight * e.barrier;
+        let b = 1.0 + self.np.barrier_weight.max(0.0) * e.barrier;
         match e.ty {
             edge::LAND => e.km * b / ROAD_SPEED[self.road_q(p, e.to as usize) as usize],
             edge::IMPASSABLE => 3.0 * e.km * b / ROAD_SPEED[self.road_q(p, e.to as usize) as usize],
@@ -1349,7 +1359,7 @@ impl NationSim {
 
     /// Construction length of a border (km, longer across barriers and twice over impassable land).
     fn build_km(&self, e: &Edge) -> f64 {
-        e.km * (1.0 + self.np.barrier_weight * e.barrier) * if e.ty == edge::IMPASSABLE { 2.0 } else { 1.0 }
+        e.km * (1.0 + self.np.barrier_weight.max(0.0) * e.barrier) * if e.ty == edge::IMPASSABLE { 2.0 } else { 1.0 }
     }
 
     /// How far a province is from nation n's capital for expansion and war:
@@ -1430,7 +1440,7 @@ impl NationSim {
                     continue;
                 }
                 let nd = d + w(p, e);
-                if dist.get(&q).map_or(true, |&x| nd < x) {
+                if dist.get(&q).is_none_or(|&x| nd < x) {
                     dist.insert(q, nd);
                     prev.insert(q, p);
                     heap.push(Reverse((nd.to_bits(), q)));
@@ -1622,16 +1632,15 @@ impl NationSim {
         })
     }
 
-    /// Build or upgrade a road of quality q from a to b over nation n's land.
-    /// With `afford`, only if the treasury holds the cost.
-    fn build_road(&mut self, n: u32, a: usize, b: usize, q: u8, afford: bool) -> bool {
-        let Some(path) = self.road_route(n, a, b, q) else { return false };
-        let cost = self.road_cost_of(n, &path, q);
+    /// Build or upgrade a road of quality q along an already-computed path on nation n's land.
+    /// With `afford`, only if the treasury holds the cost and upkeep stays affordable.
+    fn build_road_path(&mut self, n: u32, path: &[usize], q: u8, afford: bool) -> bool {
+        let cost = self.road_cost_of(n, path, q);
+        // Every border on `path` has both endpoints owned by `n`, so `economy` charges both halves (full upkeep).
         let more: f64 = path
             .windows(2)
             .map(|w| self.km(w[0], w[1]) * (ROAD_UPKEEP[q as usize] - ROAD_UPKEEP[self.road_q(w[0], w[1]) as usize]).max(0.0))
             .sum::<f64>()
-            * 0.5
             * self.np.road_cost.max(0.0)
             * self.prod(n);
         if afford && (cost <= 0.0 || self.nation(n).treasury < cost || !self.can_keep(n, more)) {
@@ -1645,8 +1654,15 @@ impl NationSim {
                 *e = (q, self.year);
             }
         }
-        self.touch(&path);
+        self.touch(path);
         true
+    }
+
+    /// Build or upgrade a road of quality q from a to b over nation n's land.
+    /// With `afford`, only if the treasury holds the cost.
+    fn build_road(&mut self, n: u32, a: usize, b: usize, q: u8, afford: bool) -> bool {
+        let Some(path) = self.road_route(n, a, b, q) else { return false };
+        self.build_road_path(n, &path, q, afford)
     }
 
     /// A nation's road project: the first of its largest cities whose road to
@@ -1660,7 +1676,7 @@ impl NationSim {
         }
         let cap = self.nation(n).capital;
         let mut cities: Vec<usize> = members.iter().copied().filter(|&p| p != cap && self.pop[p] >= 0.5 * self.np.found_population).collect();
-        cities.sort_by(|&a, &b| self.pop[b].partial_cmp(&self.pop[a]).unwrap().then(a.cmp(&b)));
+        cities.sort_by(|&a, &b| self.pop[b].total_cmp(&self.pop[a]).then(a.cmp(&b)));
         cities.truncate(self.np.railway_cities.max(2) as usize + 4);
         let motor = self.nation(n).era >= era::MOTOR;
         let industrial = self.nation(n).era >= era::IND;
@@ -1681,7 +1697,7 @@ impl NationSim {
                     break;
                 }
                 let first = q == 3 && !self.roads.values().any(|r| r.0 == 3);
-                if cost <= treasury && self.build_road(n, c, cap, q, true) {
+                if cost <= treasury && self.build_road_path(n, &path, q, true) {
                     if first {
                         let (a, b) = (self.nation(n).name.clone(), self.provs[c].name.clone());
                         self.event("highway", n, 0, Some(c), format!("{a} opens the world's first highway, to {b}"));
@@ -1894,14 +1910,25 @@ impl NationSim {
             if over <= 0.0 {
                 break;
             }
-            // The newest line through its land, else its costliest road.
-            let line = (0..self.lines.len()).filter(|&i| self.lines[i].is_open() && self.lines[i].path.iter().any(|&p| self.owner[p] == n)).max_by_key(|&i| (self.lines[i].opened, i));
+            // The newest line this nation owns or holds a majority of, else its costliest road, else an airport.
+            let line = (0..self.lines.len())
+                .filter(|&i| {
+                    let l = &self.lines[i];
+                    l.is_open() && (l.owner == n || l.path.iter().filter(|&&p| self.owner[p] == n).count() * 2 >= l.path.len().max(1))
+                })
+                .max_by_key(|&i| (self.lines[i].opened, i));
             let road = self
                 .roads
                 .iter()
                 .filter(|(&(a, b), _)| self.owner[a] == n || self.owner[b] == n)
                 .map(|(&key, &(q, _))| (key, q, (ROAD_UPKEEP[q as usize] - ROAD_UPKEEP[q as usize - 1]) * self.km(key.0, key.1) * 0.5 * (u8::from(self.owner[key.0] == n) + u8::from(self.owner[key.1] == n)) as f64 * rc))
-                .max_by(|x, y| x.2.partial_cmp(&y.2).unwrap().then(y.0.cmp(&x.0)));
+                .max_by(|x, y| x.2.total_cmp(&y.2).then(y.0.cmp(&x.0)));
+            let airport = self
+                .airports
+                .iter()
+                .filter(|&(&p, _)| self.owner[p] == n)
+                .max_by_key(|&(&p, &opened)| (opened, p))
+                .map(|(&p, _)| p);
             if let Some(i) = line.filter(|_| lines < 3) {
                 let l = &self.lines[i];
                 let mine = l.path.iter().filter(|&&p| self.owner[p] == n).count() as f64 / l.path.len().max(1) as f64;
@@ -1921,6 +1948,10 @@ impl NationSim {
                 }
                 touched.extend([key.0, key.1]);
                 roads += 1;
+            } else if let Some(p) = airport {
+                over -= AIRPORT_UPKEEP * lc;
+                self.airports.remove(&p);
+                touched.push(p);
             } else {
                 break;
             }
@@ -1966,7 +1997,7 @@ impl NationSim {
         let n = self.provs.len();
         // City pins that have run their time.
         let t = self.t;
-        self.pins.retain(|x| x.until.map_or(true, |u| t < u));
+        self.pins.retain(|x| x.until.is_none_or(|u| t < u));
         // Institutions are born and spread; eras follow them. Then access and
         // integration, the treasury, tribute, ports and reforms.
         self.births();
@@ -2121,25 +2152,39 @@ impl NationSim {
                 let sh = &mut self.shares[p];
                 let s0 = sh.iter().find(|x| x.0 == prim).map_or(0.0, |x| x.1);
                 let fixed: f64 = sh.iter().filter(|x| locked.contains(&x.0)).map(|x| x.1).sum();
-                let others = 1.0 - s0 - fixed;
+                let others = (1.0 - s0 - fixed).max(0.0);
                 if others <= 1e-12 {
                     continue;
                 }
                 let s1 = s0 + a * others;
+                let mut has_prim = false;
                 for x in sh.iter_mut() {
-                    x.1 = if x.0 == prim {
-                        s1
-                    } else if locked.contains(&x.0) {
-                        x.1
-                    } else {
-                        x.1 * (1.0 - a)
-                    };
+                    if x.0 == prim {
+                        x.1 = s1;
+                        has_prim = true;
+                    } else if !locked.contains(&x.0) {
+                        x.1 *= 1.0 - a;
+                    }
                 }
-                if s0 == 0.0 {
+                if !has_prim {
                     sh.push((prim, s1));
                 }
-                sh.retain(|x| x.1 >= 0.005 || locked.contains(&x.0));
-                self.major[p] = sh.iter().max_by(|x, y| x.1.partial_cmp(&y.1).unwrap().then(y.0.cmp(&x.0))).map_or(0, |x| x.0);
+                // Keep the assimilating primary culture even while small (< 0.005), and fold
+                // pruned vanishing non-locked shares into `prim` so total shares stay normalised.
+                let mut pruned = 0.0;
+                sh.retain(|x| {
+                    let keep = x.0 == prim || x.1 >= 0.005 || locked.contains(&x.0);
+                    if !keep {
+                        pruned += x.1;
+                    }
+                    keep
+                });
+                if pruned > 0.0 {
+                    if let Some(x) = sh.iter_mut().find(|x| x.0 == prim) {
+                        x.1 += pruned;
+                    }
+                }
+                self.major[p] = sh.iter().max_by(|x, y| x.1.total_cmp(&y.1).then(y.0.cmp(&x.0))).map_or(0, |x| x.0);
             }
         }
         // 6. building: roads, railways (industry) and airports (air age), each
