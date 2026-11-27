@@ -13,7 +13,8 @@
 //!    continental places; a land-fraction-weighted run gives the annual mean.
 //! 3. Local temperature: continentality from maritime air carried along each
 //!    half-year's wind (and held back by mountains), sea ice that makes a
-//!    frozen sea continental, warm/cold coastal currents carried downwind,
+//!    frozen sea continental, ocean currents (warm gyre currents carried
+//!    downwind; cold water where the wind drives upwelling on open coasts),
 //!    colder interiors and shallow winter radiative inversions at high
 //!    latitudes, temperature carried downwind, and three lapse rates (free air
 //!    on peaks, a gentler one on broad plateaus, a steeper one on ice sheets).
@@ -124,6 +125,10 @@ struct SeaAir {
     mar: Vec<f64>,
     cur: Vec<f64>,
     cbar: [f64; NB],
+    /// Current offset of each sea cell (°C).
+    ocean: Vec<f64>,
+    /// Sea-ice cover of each sea cell, per month.
+    ice: Vec<Vec<f64>>,
 }
 
 struct ClimateGrid {
@@ -655,11 +660,18 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
 
     // ---- coastal currents (ocean cells)
     ctx.progress(0.25, "Routing ocean currents");
-    let raw_current_c: Vec<f64> = (0..nc)
+    let grad = super::wind::Gradient::new(coarse, r_km * 1000.0);
+    // Gyre currents, from where each sea cell lies in its basin (`s`: −1 at
+    // the basin's west side, +1 at its east side). Western-boundary currents
+    // carry warm water poleward along the subtropical coasts on the west side;
+    // the subpolar drift spreads warmth across the high-latitude ocean, most
+    // on its eastern side; a narrow cold current comes down subpolar west
+    // coasts. (The subtropical cold side is wind-driven upwelling, below.)
+    let gyre: Vec<(f64, f64)> = (0..nc)
         .into_par_iter()
         .map(|i| {
             if !ocean_c[i] {
-                return 0.0;
+                return (0.0, 0.0);
             }
             let lat = coarse.lat[i];
             let coslat = lat.cos().max(0.05);
@@ -680,31 +692,99 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
             let de = march(1.0);
             let dw = march(-1.0);
             if !de.is_finite() && !dw.is_finite() {
-                return 0.0;
+                return (0.0, 0.0);
             }
             let (de2, dw2) = (de.min(6000.0), dw.min(6000.0));
             let s = (dw2 - de2) / (dw2 + de2);
-            // Cold eastern-boundary currents hug the subtropical coast; the warm
-            // drift of the high latitudes spreads over much of the basin.
-            let near = de.min(dw);
             let a = lat.to_degrees().abs();
-            // The upwelling cold side is stronger than the warm side across the basin.
-            let subtropical = -gauss(a, 24.0, 16.0) * (-near / 1200.0).exp() * if s > 0.0 { 1.4 } else { 0.9 };
-            let subpolar = (if s > 0.0 { 1.75 } else { 1.3 }) * gauss(a, 60.0, 13.0) * (-near / 2800.0).exp();
-            cp.ocean_current_c * s * (subtropical + subpolar)
+            let western_boundary = WBC_WARM * gauss(a, 30.0, 14.0) * (-dw / 1200.0).exp() * (-s).max(0.0);
+            let drift = SUBPOLAR_WARM * gauss(a, 60.0, 13.0) * (0.1 + 0.9 * (0.5 + 0.5 * s));
+            let west_cold = SUBPOLAR_COLD * gauss(a, 50.0, 12.0) * (-dw / 600.0).exp();
+            (cp.ocean_current_c * (western_boundary + drift - west_cold), s)
         })
         .collect();
-    // Carry current anomalies downwind along annual-mean winds over sea cells,
-    // so warm subpolar drifts flow poleward past islands into high-latitude seas.
-    let current_c: Vec<f64> = {
-        let ann_wind: Vec<Vec3> = (0..nc)
-            .map(|i| wind_zonal.iter().fold(Vec3::ZERO, |s, w| s + w[i]) * (1.0 / 12.0))
-            .collect();
+    let warm_current_c: Vec<f64> = gyre.iter().map(|g| g.0).collect();
+    // A coarser grid of the same family, for features that span hundreds of
+    // km (travelling storms, the size of ocean basins).
+    let storm_grid = Grid::new(cl.saturating_sub(2).max(3));
+    let storm_xfer = GridTransfer::new(coarse, &storm_grid);
+    // How much of the surroundings (~1,500 km) is sea: an ocean coast is open,
+    // an enclosed sea is not.
+    let sea_wide: Vec<f64> = {
+        let ns = storm_grid.len();
+        let (mut sum, mut area) = (vec![0.0f64; ns], vec![0.0f64; ns]);
+        for ((&k, &f), &a) in storm_xfer.nearest.iter().zip(&sea_frac).zip(&coarse.area) {
+            sum[k as usize] += f * a;
+            area[k as usize] += a;
+        }
+        let mut v: Vec<f64> = (0..ns).map(|k| if area[k] > 0.0 { sum[k] / area[k] } else { 0.0 }).collect();
+        let passes = (OCEAN_WIDE_KM / (storm_grid.spacing * r_km)).powi(2).ceil().clamp(1.0, 60.0) as usize;
+        for _ in 0..passes {
+            v = smooth(&storm_grid, &v);
+        }
+        (0..nc)
+            .map(|i| {
+                let (t, w) = (storm_xfer.tri[i], storm_xfer.w[i]);
+                (0..3).map(|k| w[k] as f64 * v[t[k] as usize]).sum()
+            })
+            .collect()
+    };
+    // Distance of each sea cell from the nearest land (km), and the direction
+    // away from the coast.
+    let coast_km: Vec<f64> = {
+        let mut d = vec![f64::INFINITY; nc];
+        let mut front: Vec<usize> = (0..nc).filter(|&i| !ocean_c[i]).collect();
+        for &i in &front {
+            d[i] = 0.0;
+        }
+        let mut k = 0.0;
+        while !front.is_empty() {
+            k += spacing_km;
+            let mut next = Vec::new();
+            for &i in &front {
+                for &nb in coarse.neighbors(i) {
+                    let j = nb as usize;
+                    if d[j].is_infinite() {
+                        d[j] = k;
+                        next.push(j);
+                    }
+                }
+            }
+            front = next;
+        }
+        d
+    };
+    let offshore: Vec<Vec3> = {
+        let passes = (UPWELL_KM / spacing_km).powi(2).ceil().clamp(2.0, 40.0) as usize;
+        let mut v = sea_frac.clone();
+        for _ in 0..passes {
+            v = smooth(coarse, &v);
+        }
+        (0..nc)
+            .map(|i| {
+                if !ocean_c[i] {
+                    return Vec3::ZERO;
+                }
+                let (gx, gy) = grad.at(coarse, i, |j| v[j]);
+                let (e, n) = coarse.pos[i].east_north();
+                let g = e * gx + n * gy;
+                if g.len() > 1e-12 { g.normalized() } else { Vec3::ZERO }
+            })
+            .collect()
+    };
+    // Cold water: where the wind drives the surface water away from a coast
+    // (Ekman transport, to the right of the wind in the north and to the left
+    // in the south), cold water wells up from below. Trade winds blowing toward
+    // the equator along the west coasts of continents make the cold currents of
+    // the subtropics; a monsoon blowing along a coast makes it seasonally.
+    // Then every anomaly drifts downwind with the annual-mean wind.
+    let currents = |winds: &[Vec<Vec3>]| -> Vec<f64> {
+        let ann_wind: Vec<Vec3> = (0..nc).map(|i| winds.iter().fold(Vec3::ZERO, |s, w| s + w[i]) * (1.0 / winds.len() as f64)).collect();
         let reach_km = 1400.0;
         let passes = ((3.0 * reach_km / spacing_km).ceil() as usize).clamp(8, 50);
-        let mut cur = raw_current_c.clone();
+        let mut warm = warm_current_c.clone();
         for _ in 0..passes {
-            cur = (0..nc)
+            warm = (0..nc)
                 .into_par_iter()
                 .map(|i| {
                     if !ocean_c[i] {
@@ -719,18 +799,45 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                         }
                         let a = ann_wind[j].dot((coarse.pos[i] - coarse.pos[j]).normalized()).max(0.0);
                         wsum += a;
-                        csum += a * cur[j];
+                        csum += a * warm[j];
                     }
                     if wsum <= 0.0 {
-                        return raw_current_c[i];
+                        return warm_current_c[i];
                     }
                     let kappa = reach_km * ann_wind[i].len().min(1.5) / spacing_km;
-                    (raw_current_c[i] + kappa * (csum / wsum)) / (1.0 + kappa)
+                    (warm_current_c[i] + kappa * (csum / wsum)) / (1.0 + kappa)
                 })
                 .collect();
         }
-        cur
+        let cold: Vec<f64> = (0..nc)
+            .map(|i| {
+                if !ocean_c[i] {
+                    return 0.0;
+                }
+                let lat = coarse.lat[i];
+                let coriolis = smoothstep(1.0, 5.0, lat.to_degrees().abs());
+                let drive: f64 = winds
+                    .iter()
+                    .map(|w| (w[i].cross(coarse.pos[i]) * lat.signum()).dot(offshore[i]).max(0.0) * w[i].len())
+                    .sum::<f64>()
+                    / winds.len() as f64;
+                // Upwelling needs an ocean behind the coast, and belongs to the
+                // trade-wind and subtropical coasts (poleward of them the water
+                // is mixed deep by storms, and cold anyway).
+                let open = smoothstep(UPWELL_OPEN.0, UPWELL_OPEN.1, sea_wide[i]);
+                let zone = 1.0 - smoothstep(38.0, 50.0, lat.to_degrees().abs());
+                // Under the deep, warm western-boundary currents of the
+                // subtropical gyres the wind brings up little cold water.
+                let zone = zone * (1.0 - 0.85 * (-gyre[i].1).max(0.0) * smoothstep(12.0, 22.0, lat.to_degrees().abs()));
+                (UPWELL_GAIN * drive * coriolis).min(UPWELL_MAX) * open * zone * (-coast_km[i] / UPWELL_KM).exp()
+            })
+            .collect();
+        // Upwelled water spreads a little along the coast and out to sea.
+        let cold = smooth(coarse, &cold);
+        (0..nc).map(|i| if ocean_c[i] { warm[i] - cp.ocean_current_c * cold[i] } else { 0.0 }).collect()
     };
+    // First guess from the belt winds (sea ice is set from it).
+    let current_c = currents(&wind_zonal);
 
     // ---- maritime influence along the wind, then sea-level temperatures.
     // Run twice: with the belt winds, then with the thermally driven winds.
@@ -757,28 +864,26 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     // Sea ice per month and per half-year: frozen seas in winter (Arctic, Hudson
     // Bay, Sea of Okhotsk) are continental in winter even if they thaw in summer.
     // Enclosed seas have slightly less thermal inertia than open ocean.
-    let ice_m: Vec<Vec<f64>> = (0..12)
-        .map(|m| {
-            (0..nc)
-                .map(|i| {
-                    if !ocean_c[i] {
-                        return 0.0;
-                    }
-                    let lat = coarse.lat[i];
-                    let ann = band_interp(&mix_ann, lat) + current_c[i];
-                    let ao = band_interp(&anom_o[m], lat);
-                    let al = band_interp(&anom_l[m], lat);
-                    let sea_anom = ao * (0.90 + 0.10 * open_sea[i]) + al * 0.10 * (1.0 - open_sea[i]);
-                    1.0 - smoothstep(SEA_ICE_FULL_C, SEA_FREEZE_C, ann + sea_anom)
-                })
-                .collect()
-        })
-        .collect();
-    let ice_half = |months: [usize; 4]| -> Vec<f64> {
-        (0..nc).map(|i| months.iter().map(|&m| ice_m[m][i]).sum::<f64>() / 4.0).collect()
+    // (Computed from each set of currents, in `sea_air`.)
+    let sea_ice = |current_c: &[f64]| -> Vec<Vec<f64>> {
+        (0..12)
+            .map(|m| {
+                (0..nc)
+                    .map(|i| {
+                        if !ocean_c[i] {
+                            return 0.0;
+                        }
+                        let lat = coarse.lat[i];
+                        let ann = band_interp(&mix_ann, lat) + current_c[i];
+                        let ao = band_interp(&anom_o[m], lat);
+                        let al = band_interp(&anom_l[m], lat);
+                        let sea_anom = ao * (0.90 + 0.10 * open_sea[i]) + al * 0.10 * (1.0 - open_sea[i]);
+                        1.0 - smoothstep(SEA_ICE_FULL_C, SEA_FREEZE_C, ann + sea_anom)
+                    })
+                    .collect()
+            })
+            .collect()
     };
-    let ice_a = ice_half([11, 0, 1, 2]);
-    let ice_b = ice_half([5, 6, 7, 8]);
     // Unit direction from each neighbour toward the cell, aligned with the
     // grid's neighbour lists (used by everything the wind carries).
     let (nbr_off, nbr_idx) = coarse.neighbor_csr();
@@ -830,8 +935,6 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     };
     // A coarser grid of the same family, on which travelling storms spread
     // moisture over hundreds of km at a time.
-    let storm_grid = Grid::new(cl.saturating_sub(2).max(3));
-    let storm_xfer = GridTransfer::new(coarse, &storm_grid);
     let wide_area: Vec<f64> = {
         let mut a = vec![0.0f64; storm_grid.len()];
         for i in 0..nc {
@@ -840,7 +943,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
         a
     };
     // Maritime air (and the offset of the current it crossed) carried inland by one wind field.
-    let maritime = |wind: &[Vec3], ice_half: &[f64]| -> (Vec<f64>, Vec<f64>) {
+    let maritime = |wind: &[Vec3], ice_half: &[f64], current_c: &[f64]| -> (Vec<f64>, Vec<f64>) {
         let reach = cp.maritime_reach_km.max(50.0);
         let decay_adv = (-spacing_km / reach).exp();
         let decay_iso = (-spacing_km / (reach * 0.22)).exp();
@@ -857,7 +960,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
         // Maritime air that reaches a place from any side (sea breezes, passing
         // storms): fades with distance from the sea alone, whatever the wind.
         let mut near_sea = source.clone();
-        let mut cur: Vec<f64> = current_c.clone();
+        let mut cur: Vec<f64> = current_c.to_vec();
         let passes = ((reach * 2.5) / spacing_km).ceil() as usize + 4;
         for _ in 0..passes {
             let next: Vec<(f64, f64, f64)> = (0..nc)
@@ -906,9 +1009,12 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     // Where the wind turns with the seasons (monsoon coasts), a place can be
     // continental in one half of the year and maritime in the other: one field
     // for the months around January, one for those around July.
-    let sea_air = |winds: &[Vec<Vec3>]| -> SeaAir {
+    let sea_air = |winds: &[Vec<Vec3>], ocean: Vec<f64>| -> SeaAir {
         let half_year = |months: [usize; 6]| -> Vec<Vec3> { (0..nc).map(|i| months.iter().fold(Vec3::ZERO, |s, &m| s + winds[m][i]) * (1.0 / 6.0)).collect() };
-        let ((mar_a, cur_a), (mar_b, cur_b)) = rayon::join(|| maritime(&half_year([10, 11, 0, 1, 2, 3]), &ice_a), || maritime(&half_year([4, 5, 6, 7, 8, 9]), &ice_b));
+        let ice = sea_ice(&ocean);
+        let ice_half = |months: [usize; 4]| -> Vec<f64> { (0..nc).map(|i| months.iter().map(|&m| ice[m][i]).sum::<f64>() / 4.0).collect() };
+        let (ice_a, ice_b) = (ice_half([11, 0, 1, 2]), ice_half([5, 6, 7, 8]));
+        let ((mar_a, cur_a), (mar_b, cur_b)) = rayon::join(|| maritime(&half_year([10, 11, 0, 1, 2, 3]), &ice_a, &ocean), || maritime(&half_year([4, 5, 6, 7, 8, 9]), &ice_b, &ocean));
         let mar: Vec<f64> = (0..nc).map(|i| 0.5 * (mar_a[i] + mar_b[i])).collect();
         let cur: Vec<f64> = (0..nc).map(|i| if mar[i] > 0.0 { 0.5 * (cur_a[i] * mar_a[i] + cur_b[i] * mar_b[i]) / mar[i] } else { 0.0 }).collect();
         // Zonal mean continentality: at high latitudes sea-facing places are
@@ -926,7 +1032,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
             let (a, b) = (k.saturating_sub(3), (k + 3).min(NB - 1));
             cbar_raw[a..=b].iter().sum::<f64>() / (b - a + 1) as f64
         });
-        SeaAir { mar_a, cur_a, mar_b, cur_b, mar, cur, cbar }
+        SeaAir { mar_a, cur_a, mar_b, cur_b, mar, cur, cbar, ocean, ice }
     };
     // Largest seasonal swing of the continental profile, per band.
     let swing_l: [f64; NB] = std::array::from_fn(|k| anom_l.iter().map(|a| a[k].abs()).fold(0.0, f64::max));
@@ -950,13 +1056,13 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                         let land = 1.0 - water_frac[i];
                         // Even a land-locked unfrozen sea swings far less than land;
                         // frozen sea ice insulates the water and swings like land.
-                        let open_w = water_frac[i] * (1.0 - ice_m[m][i]);
+                        let open_w = water_frac[i] * (1.0 - sea.ice[m][i]);
                         let cont = cont.min(1.0 - (1.0 - SEA_SWING_MAX) * open_w);
                         let cont_m = cont + (1.0 - cont) * LAND_SUMMER * land * smoothstep(-3.0, 3.0, al);
                         let sheet_v = sheet.map_or(0.0, |s| s[i]);
                         let al_eff = if al > 0.0 { al * (1.0 - 0.40 * sheet_v) } else { al };
                         let a = ao * (1.0 - cont_m) + al_eff * cont_m;
-                        let off = if ocean_c[i] { current_c[i] } else { wa * sea.cur_a[i] * sea.mar_a[i] + (1.0 - wa) * sea.cur_b[i] * sea.mar_b[i] };
+                        let off = if ocean_c[i] { sea.ocean[i] } else { wa * sea.cur_a[i] * sea.mar_a[i] + (1.0 - wa) * sea.cur_b[i] * sea.mar_b[i] };
                         let sw = band_interp(&swing_l, lat) + 1.0;
                         let winter_w = (-al / sw).clamp(0.0, 1.0);
                         // High-latitude continental cooling is concentrated in winter
@@ -990,7 +1096,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                         if ocean_c[i] {
                             // Open water does not cool below freezing; ice lets the
                             // air above it get colder, and holds summers near 0 °C.
-                            let ice = ice_m[m][i];
+                            let ice = sea.ice[m][i];
                             t = t.max(SEA_FREEZE_C - 60.0 * ice).min(SEA_FREEZE_C + 2.0 + 30.0 * (1.0 - ice).powi(2));
                         }
                         t as f32
@@ -1001,7 +1107,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     };
     ctx.progress(0.3, "Spreading maritime air");
     // First guess: zonal belts, no carrying.
-    let sea0 = sea_air(&wind_zonal);
+    let sea0 = sea_air(&wind_zonal, current_c.clone());
     let t0 = temperatures(&sea0, None, None, None);
 
     // ---- height: broad highlands warm the air above them, so they are less
@@ -1039,7 +1145,6 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     // ---- winds: the convergence line follows the heat, the belts follow the
     // line, and thermal pressure systems add to them.
     ctx.progress(0.34, "Building pressure systems");
-    let grad = super::wind::Gradient::new(coarse, r_km * 1000.0);
     let h_smooth = smooth(coarse, &h_c);
     let h_oro: Vec<f64> = (0..nc).map(|i| 0.65 * h_c[i] + 0.35 * h_smooth[i]).collect();
     type WindSet = (Vec<Vec<f32>>, Vec<Vec<Vec3>>, Vec<Vec<Vec3>>, Vec<Vec<Vec3>>);
@@ -1246,7 +1351,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                     // Open water (ocean and lakes) moistens the air toward
                     // saturation, faster in wind; narrow enclosed seas moisten
                     // only a shallower boundary layer than the open ocean.
-                    evap[i] = wf * (0.35 + 0.65 * open_sea[i]) * EVAPORATION_RATE * (0.4 + 0.6 * wind[i].len().min(2.0));
+                    evap[i] = wf * (0.35 + 0.65 * smoothstep(UPWELL_OPEN.0 - 0.15, UPWELL_OPEN.0 + 0.05, sea_wide[i])) * EVAPORATION_RATE * (0.4 + 0.6 * wind[i].len().min(2.0));
                     // Land gives back part of its rain, more where it is warm
                     // and vegetated (never all: the rest runs off, so rain
                     // inland needs moisture from the sea; parched deserts have
@@ -1416,7 +1521,8 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
         (0..12).map(|m| (0..nc).map(|i| 0.5 * yearly[i] + 0.25 * monthly[m][i] + 0.15 * monthly[(m + 11) % 12][i] + 0.1 * monthly[(m + 10) % 12][i]).collect()).collect()
     };
     ctx.progress(0.44, "Re-solving temperatures with the new winds");
-    let sea = sea_air(&unit0);
+    let ocean1 = currents(&unit0);
+    let sea = sea_air(&unit0, ocean1);
     let t1 = temperatures(&sea, Some(&unit0), Some(&dry0), Some(&sheet_c));
     let t1_air = temperatures(&sea, Some(&unit0), None, Some(&sheet_c));
     let (itcz_c, wind_ms, wind_syn, wind_m) = winds_for(&t1, &t1_air);
@@ -1507,7 +1613,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     // wettest month. A soft limit (−3% at 1,500 mm) keeps monsoon summits below it.
     precip.par_iter_mut().for_each(|p| *p /= (1.0 + (*p / RAIN_MONTH_MAX_MM).powi(4)).powf(0.25));
     let mar_f = up(&mar.iter().map(|&x| x as f32).collect::<Vec<_>>());
-    let cur_f = up(&(0..nc).map(|i| (if ocean_c[i] { current_c[i] } else { cur[i] * mar[i] }) as f32).collect::<Vec<_>>());
+    let cur_f = up(&(0..nc).map(|i| (if ocean_c[i] { sea.ocean[i] } else { cur[i] * mar[i] }) as f32).collect::<Vec<_>>());
     let mut f = Fields::default();
     let (t_mean, t_warm, t_cold, p_ann) = summaries(&temp, &precip, n);
     f.put("t_mean", Field::F32(t_mean));
@@ -1559,6 +1665,21 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
 
 /// Share of its vapour that saturated air rains out per transport pass,
 /// before the local factors (rising or sinking air, slopes, convection).
+/// Wind-driven upwelling: cooling (in units of *Coastal currents*) per unit
+/// of offshore Ekman drive (wind speed² in belt-wind units, yearly mean), its
+/// cap, and the distance from the coast over which it fades (km).
+const UPWELL_GAIN: f64 = 3.0;
+const UPWELL_MAX: f64 = 1.5;
+const UPWELL_KM: f64 = 500.0;
+/// Share of sea within ~OCEAN_WIDE_KM below which a coast has no upwelling, and above which it has it in full.
+const UPWELL_OPEN: (f64, f64) = (0.35, 0.55);
+const OCEAN_WIDE_KM: f64 = 1500.0;
+/// Gyre currents, in units of *Coastal currents*: the warm western-boundary
+/// current (Gulf Stream, Kuroshio), the warm subpolar drift and the cold
+/// current down subpolar west coasts (Labrador, Oyashio).
+const WBC_WARM: f64 = 1.2;
+const SUBPOLAR_WARM: f64 = 1.5;
+const SUBPOLAR_COLD: f64 = 1.2;
 const RAIN_RATE: f64 = 0.05;
 /// Share of a typical cell's water that a wind of `W_REF` carries on per pass.
 const TRANSPORT_STEP: f64 = 0.6;
