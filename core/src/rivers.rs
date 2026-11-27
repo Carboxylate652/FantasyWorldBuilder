@@ -23,11 +23,15 @@ impl RiverEdges {
     /// `value[t]` belongs to the segment from corner `t` to `to[t]`.
     pub fn new(g: &Grid, to: &[i32], value: &[f32]) -> RiverEdges {
         let mut v = vec![0.0f32; g.neighbor_csr().1.len()];
-        for t in 0..to.len().min(value.len()) {
-            if to[t] < 0 || value[t] == 0.0 {
+        let nt = g.tris.len();
+        for t in 0..to.len().min(value.len()).min(nt) {
+            let u = to[t];
+            if u < 0 || (u as usize) >= nt || value[t] == 0.0 {
                 continue;
             }
-            let (a, b) = g.corner_edge_cells(t, to[t] as usize);
+            let Some((a, b)) = g.try_corner_edge_cells(t, u as usize) else {
+                continue;
+            };
             for (x, y) in [(a, b), (b, a)] {
                 if let Some(e) = g.edge_index(x, y) {
                     v[e] = v[e].max(value[t]);
@@ -55,11 +59,15 @@ impl RiverEdges {
 /// its boundary.
 pub fn bank_max<T: Copy + PartialOrd + Default>(g: &Grid, to: &[i32], value: &[T]) -> Vec<T> {
     let mut out = vec![T::default(); g.len()];
-    for t in 0..to.len() {
-        if to[t] < 0 {
+    let nt = g.tris.len();
+    for t in 0..to.len().min(value.len()).min(nt) {
+        let u = to[t];
+        if u < 0 || (u as usize) >= nt {
             continue;
         }
-        let (a, b) = g.corner_edge_cells(t, to[t] as usize);
+        let Some((a, b)) = g.try_corner_edge_cells(t, u as usize) else {
+            continue;
+        };
         for c in [a, b] {
             if value[t] > out[c] {
                 out[c] = value[t];

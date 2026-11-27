@@ -211,6 +211,9 @@ pub enum CultureEdit {
 pub fn prepare_culture_edit(w: &mut World, mut st: Stroke) -> Result<CultureEdit, String> {
     use crate::edits::Tool;
     use crate::vec3::Vec3;
+    if st.points.is_empty() {
+        return Err("empty stroke".into());
+    }
     let g = w.grid();
     let fresh = w.is_fresh(Step::Cultures);
     let cell = |ll: [f64; 2]| g.nearest(Vec3::from_lat_lon_deg(ll[0], ll[1]), None);
@@ -295,6 +298,20 @@ impl Session {
         Session { world: World::new(params), path: None, undo: VecDeque::new(), redo: VecDeque::new(), dirty: false, live: None }
     }
 
+    /// Drop any live simulation whose upstream inputs or own inputs changed.
+    fn sync_live(&mut self) {
+        let drop_live = match &self.live {
+            Some(l) => {
+                let k = l.step.index();
+                self.world.expected_hashes()[k - 1] != l.upstream_hash || live_inputs(&self.world, l.step) != l.inputs
+            }
+            None => false,
+        };
+        if drop_live {
+            self.live = None;
+        }
+    }
+
     fn remember(&mut self, state: EditHistory) {
         self.undo.push_back(state);
         if self.undo.len() > 500 {
@@ -360,12 +377,13 @@ pub fn overrides_report(w: &World) -> Value {
         .iter()
         .map(|&l| json!({ "layer": l.key(), "title": l.title(), "step": l.step().key(), "edits": w.edits.count(l) }))
         .collect();
+    let hashes = w.expected_hashes();
     let mut unapplied = Vec::new();
     for st in [Step::States, Step::Provinces, Step::Cultures] {
         if let Some(m) = w.meta(st) {
             if let Some(a) = m["unapplied_edits"].as_array() {
                 // Indices refer to the run's edits: drop entries the layer no longer has.
-                let fresh = w.is_fresh(st);
+                let fresh = w.is_fresh_with(st, &hashes);
                 unapplied.extend(a.iter().filter(|_| fresh).cloned());
             }
         }
@@ -465,6 +483,13 @@ fn field_bytes(f: &Field, stale: bool, step: Step, month: Option<usize>, n: usiz
     b
 }
 
+struct ProgressGuard<'a>(&'a Arc<Mutex<ProgressState>>);
+impl Drop for ProgressGuard<'_> {
+    fn drop(&mut self) {
+        set_progress(self.0, |p| p.running = false);
+    }
+}
+
 pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cmd: &str, args: Value) -> Result<Reply, String> {
     if cmd == "progress" {
         let p = progress.lock().map_err(|e| e.to_string())?.clone();
@@ -483,20 +508,26 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 // Monthly/annual temperature including the hydrology lapse-rate correction.
                 let Some((Field::F32(t), step, stale)) = s.world.field("temp") else { return Err("temperature not computed yet".into()) };
                 let adj = match s.world.field("temp_adjust") {
-                    Some((Field::F32(a), _, false)) => Some(a.clone()),
+                    Some((Field::F32(a), _, false)) if a.len() == n => Some(a.clone()),
                     _ => None,
                 };
-                let mut v = match month {
-                    Some(m) => t[m * n..(m + 1) * n].to_vec(),
-                    None => {
-                        let mut a = vec![0f32; n];
-                        for m in 0..12 {
-                            for i in 0..n {
-                                a[i] += t[m * n + i] / 12.0;
+                let mut v = if t.len() == 12 * n {
+                    match month {
+                        Some(m) => t[m * n..(m + 1) * n].to_vec(),
+                        None => {
+                            let mut a = vec![0f32; n];
+                            for m in 0..12 {
+                                for i in 0..n {
+                                    a[i] += t[m * n + i] / 12.0;
+                                }
                             }
+                            a
                         }
-                        a
                     }
+                } else if t.len() == n {
+                    t.clone()
+                } else {
+                    return Err("temperature field size mismatch".into());
                 };
                 if let Some(a) = adj {
                     v.iter_mut().zip(&a).for_each(|(x, d)| *x += d);
@@ -506,7 +537,9 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             if let Some(live) = s.live.as_mut() {
                 let step = live.step;
                 if let Some(f) = live.snapshot().1.get(&name) {
-                    return Ok(Reply::Bytes(field_bytes(f, false, step, month, n)));
+                    if f.len() == n || f.len() == 12 * n || f.len() == s.world.grid().tris.len() {
+                        return Ok(Reply::Bytes(field_bytes(f, false, step, month, n)));
+                    }
                 }
             }
             match s.world.field(&name) {
@@ -516,22 +549,26 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
         }
         "wind" => {
             let month: usize = arg::<i64>(&args, "month").unwrap_or(0).clamp(0, 11) as usize;
+            let limit: Option<usize> = arg::<Option<usize>>(&args, "limit").ok().flatten();
             // Interleaved (east, north) m/s per cell: the climate step's winds when
             // computed, otherwise the zonal belts alone.
             let g = s.world.grid();
             let n = g.len();
-            let mut b = Vec::with_capacity(n * 8);
+            let count = limit.map_or(n, |l| l.min(n));
+            let mut b = Vec::with_capacity(count * 8);
             if let (Some((Field::F32(u), _, _)), Some((Field::F32(v), _, _))) = (s.world.field("wind_u"), s.world.field("wind_v")) {
-                for i in 0..n {
-                    b.extend_from_slice(&u[month * n + i].to_le_bytes());
-                    b.extend_from_slice(&v[month * n + i].to_le_bytes());
+                if u.len() == 12 * n && v.len() == 12 * n {
+                    for i in 0..count {
+                        b.extend_from_slice(&u[month * n + i].to_le_bytes());
+                        b.extend_from_slice(&v[month * n + i].to_le_bytes());
+                    }
+                    return Ok(Reply::Bytes(b));
                 }
-            } else {
-                for i in 0..n {
-                    let (u, v) = climate::wind_at(&s.world.params, g.lat[i], month);
-                    b.extend_from_slice(&((u * crate::stages::wind::W_REF) as f32).to_le_bytes());
-                    b.extend_from_slice(&((v * crate::stages::wind::W_REF) as f32).to_le_bytes());
-                }
+            }
+            for &lat in g.lat.iter().take(count) {
+                let (u, v) = climate::wind_at(&s.world.params, lat, month);
+                b.extend_from_slice(&((u * crate::stages::wind::W_REF) as f32).to_le_bytes());
+                b.extend_from_slice(&((v * crate::stages::wind::W_REF) as f32).to_le_bytes());
             }
             Ok(Reply::Bytes(b))
         }
@@ -592,6 +629,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             if p != s.world.params {
                 s.world.params = p;
                 s.dirty = true;
+                s.sync_live();
             }
             Ok(Reply::Json(s.status()))
         }
@@ -609,18 +647,21 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                     s.world.edits.remove_strokes(EditLayer::Cultures, &idx);
                 }
             }
+            s.sync_live();
             Ok(Reply::Json(s.status()))
         }
         "add_pin" => {
             let p: PlatePin = arg(&args, "pin")?;
             s.remember(EditHistory::Pins(s.world.edits.sketch.pins.clone()));
             s.world.edits.sketch.pins.push(p);
+            s.sync_live();
             Ok(Reply::Json(s.status()))
         }
         "add_arrow" => {
             let a: MotionArrow = arg(&args, "arrow")?;
             s.remember(EditHistory::Arrows(s.world.edits.sketch.arrows.clone()));
             s.world.edits.sketch.arrows.push(a);
+            s.sync_live();
             Ok(Reply::Json(s.status()))
         }
         "remove_pin" | "remove_arrow" => {
@@ -628,9 +669,11 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             if cmd == "remove_pin" && i < s.world.edits.sketch.pins.len() {
                 s.remember(EditHistory::Pins(s.world.edits.sketch.pins.clone()));
                 s.world.edits.sketch.pins.remove(i);
+                s.sync_live();
             } else if cmd == "remove_arrow" && i < s.world.edits.sketch.arrows.len() {
                 s.remember(EditHistory::Arrows(s.world.edits.sketch.arrows.clone()));
                 s.world.edits.sketch.arrows.remove(i);
+                s.sync_live();
             }
             Ok(Reply::Json(s.status()))
         }
@@ -639,6 +682,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             if s.world.edits.count(layer) > 0 {
                 s.snapshot_layers(&[layer]);
                 s.world.edits.clear_layer(layer);
+                s.sync_live();
             }
             Ok(Reply::Json(s.status()))
         }
@@ -650,7 +694,9 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             let len = if layer == EditLayer::Directives { s.world.edits.overrides.directives.len() } else { s.world.edits.strokes(layer).len() };
             let removed = if idx.iter().any(|&i| i < len) {
                 s.snapshot_layers(&[layer]);
-                s.world.edits.remove_strokes(layer, &idx)
+                let n = s.world.edits.remove_strokes(layer, &idx);
+                s.sync_live();
+                n
             } else { 0 };
             let mut st = s.status();
             st["removed"] = json!(removed);
@@ -677,6 +723,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             if !taken.is_empty() {
                 s.snapshot_layers(&taken.iter().map(|x| x.0).collect::<Vec<_>>());
                 s.world.edits = edits;
+                s.sync_live();
             }
             let mut st = s.status();
             st["imported"] = json!(taken.iter().map(|(l, n)| json!({ "layer": l.key(), "edits": n })).collect::<Vec<_>>());
@@ -694,6 +741,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             if b != sk.base() {
                 s.remember(EditHistory::AutoBase(sk.auto_base, sk.from_drawing));
                 s.world.edits.sketch.set_base(b);
+                s.sync_live();
             }
             Ok(Reply::Json(s.status()))
         }
@@ -713,6 +761,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             };
             s.remember(EditHistory::Imports(s.world.edits.imports.clone()));
             s.world.edits.imports.elevation = imp;
+            s.sync_live();
             Ok(Reply::Json(s.status()))
         }
         "import_provinces" => {
@@ -732,6 +781,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             };
             s.remember(EditHistory::Imports(s.world.edits.imports.clone()));
             s.world.edits.imports.provinces = imp;
+            s.sync_live();
             let mut st = s.status();
             st["report"] = report;
             Ok(Reply::Json(st))
@@ -751,16 +801,17 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             // States, regions, continents, provinces and straits of the latest run
             // (provinces when computed, else states only).
             // With up-to-date cultures: their names, and the culture tables.
+            let hashes = s.world.expected_hashes();
             let pick = |st: Step| s.world.meta(st).map(|m| m["table"].clone()).filter(|t| !t.is_null());
             let mut t = pick(Step::Provinces).or_else(|| pick(Step::States)).unwrap_or(Value::Null);
-            if s.world.is_fresh(Step::Cultures) && !t.is_null() {
+            if s.world.is_fresh_with(Step::Cultures, &hashes) && !t.is_null() {
                 if let Some(c) = pick(Step::Cultures) {
                     crate::stages::cultures::apply_names(&mut t, &c);
                     t["cultures"] = c["cultures"].clone();
                     t["culture_groups"] = c["groups"].clone();
                     t["culture_events"] = c["events"].clone();
                 }
-                if s.world.is_fresh(Step::Nations) {
+                if s.world.is_fresh_with(Step::Nations, &hashes) {
                     if let Some(nm) = pick(Step::Nations) {
                         t["nations"] = nm["nations"].clone();
                         t["nation_events"] = nm["events"].clone();
@@ -773,10 +824,10 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             Ok(Reply::Json(t))
         }
         "undo" | "redo" => {
-            // A live run cannot take back what it already simulated: undo ends it.
-            s.live = None;
             let entry = if cmd == "undo" { s.undo.pop_back() } else { s.redo.pop_back() };
             if let Some(entry) = entry {
+                // A live run cannot take back what it already simulated: undo ends it.
+                s.live = None;
                 let inverse = entry.swap(&mut s.world.edits);
                 if cmd == "undo" { s.redo.push_back(inverse); } else { s.undo.push_back(inverse); }
                 s.dirty = true;
@@ -787,6 +838,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             let to: String = arg(&args, "to")?;
             let step = Step::from_key(&to).ok_or_else(|| format!("unknown step `{to}`"))?;
             set_progress(progress, |p| *p = ProgressState { running: true, task: "run".into(), ..Default::default() });
+            let _guard = ProgressGuard(progress);
             let pr = progress.clone();
             let ran = s.world.run_to(step, &move |st: Step, f: f32, m: &str| {
                 set_progress(&pr, |p| {
@@ -797,8 +849,10 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             });
             if !ran.is_empty() {
                 s.dirty = true;
+                if s.live.as_ref().is_some_and(|l| ran.iter().any(|r| r.index() <= l.step.index())) {
+                    s.live = None;
+                }
             }
-            set_progress(progress, |p| p.running = false);
             let mut st = s.status();
             st["ran"] = json!(ran.iter().map(|r| r.key()).collect::<Vec<_>>());
             Ok(Reply::Json(st))
@@ -834,6 +888,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 None => s.path.as_ref().map(|p| p.join("export")).ok_or("save the project first or choose an export folder")?,
             };
             set_progress(progress, |p| *p = ProgressState { running: true, task: "export".into(), step: "export".into(), ..Default::default() });
+            let _guard = ProgressGuard(progress);
             let pr = progress.clone();
             let res = export(&mut s.world, &dir, &opts, &move |f: f32, m: &str| {
                 set_progress(&pr, |p| {
@@ -841,7 +896,6 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                     p.msg = m.into();
                 })
             });
-            set_progress(progress, |p| p.running = false);
             Ok(Reply::Json(serde_json::to_value(res?).unwrap()))
         }
         "fingerprint" => Ok(Reply::Json(json!(s.world.fingerprint()))),
@@ -859,7 +913,9 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 _ => return Err(format!("`{stage}` has no step-by-step simulation (cultures, nations)")),
             };
             set_progress(progress, |p| *p = ProgressState { running: true, task: "sim".into(), ..Default::default() });
+            let _guard = ProgressGuard(progress);
             let pr = progress.clone();
+            let upstream_was_fresh = s.world.is_fresh(STEPS[step.index() - 1]);
             let sim = s.world.with_ctx(step, &move |st: Step, f: f32, m: &str| set_progress(&pr, |p| {
                 p.step = st.key().into();
                 p.frac = f;
@@ -868,7 +924,9 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 Step::Cultures => CultureSim::new(ctx).map(|c| LiveSim::Cultures(Box::new(c))),
                 _ => NationSim::new(ctx).map(|n| LiveSim::Nations(Box::new(n))),
             });
-            set_progress(progress, |p| p.running = false);
+            if !upstream_was_fresh {
+                s.dirty = true;
+            }
             let sim = sim.ok_or("nothing to simulate: no land can hold people")?;
             let k = step.index();
             s.live = Some(Live { sim, step, upstream_hash: s.world.expected_hashes()[k - 1], inputs: live_inputs(&s.world, step), millis: 0, cache: None });
@@ -884,21 +942,28 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             let years: Option<f64> = arg(&args, "years")?;
             let months: Option<i64> = arg(&args, "months")?;
             let to: Option<String> = arg(&args, "to")?;
+            if let Some(ref mode) = to {
+                if mode != "end" && mode != "era" {
+                    return Err(format!("unknown `to` target `{mode}` (expected `era` or `end`)"));
+                }
+            }
             let stop_at_choice = arg::<Option<bool>>(&args, "stop_at_choice")?.unwrap_or(false);
             let mut steps: u64 = arg::<Option<u64>>(&args, "steps")?.unwrap_or(1);
             // Stage 4 steps vary in length: step until the month is reached.
             let mut target: Option<i64> = None;
             if years.is_some() || months.is_some() {
-                let m = months.unwrap_or(0) + years.map_or(0, |y| (y * 12.0).round() as i64);
+                let ym = years.filter(|y| y.is_finite()).map_or(0i64, |y| (y * 12.0).round().clamp(-1e12, 1e12) as i64);
+                let m = months.unwrap_or(0).saturating_add(ym);
                 match &live.sim {
-                    LiveSim::Cultures(c) => steps = (m as f64 / 12.0 / c.years_per_tick().max(1e-9)).ceil().max(1.0) as u64,
+                    LiveSim::Cultures(c) => steps = (m as f64 / 12.0 / c.years_per_tick().max(1e-9)).ceil().clamp(1.0, 1e9) as u64,
                     LiveSim::Nations(n) => {
-                        target = Some(n.time() + m.max(1));
+                        target = Some(n.time().saturating_add(m.max(1)));
                         steps = u64::MAX;
                     }
                 }
             }
             set_progress(progress, |p| *p = ProgressState { running: true, task: "sim".into(), step: live.stage().into(), ..Default::default() });
+            let _guard = ProgressGuard(progress);
             let era0 = live.era();
             let mut k = 0u64;
             let pr = progress.clone();
@@ -917,7 +982,7 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                 }
                 live.step_once(&report);
                 k += 1;
-                if k % 5 == 0 {
+                if k.is_multiple_of(5) {
                     let pos = live.position();
                     set_progress(progress, |p| {
                         p.frac = 0.0;
@@ -925,7 +990,6 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                     });
                 }
             }
-            set_progress(progress, |p| p.running = false);
             sim_state(s)
         }
         "sim_state" => sim_state(s),
@@ -961,17 +1025,10 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             // Run to the end and keep the result as the step's output.
             let mut live = s.live.take().ok_or("no live simulation")?;
             set_progress(progress, |p| *p = ProgressState { running: true, task: "sim".into(), step: live.stage().into(), ..Default::default() });
-            let pr = progress.clone();
-            let report = move |f: f32, m: &str| set_progress(&pr, |p| {
-                p.frac = f;
-                p.msg = m.into();
-            });
-            while !live.done() {
-                live.step_once(&report);
-            }
+            let _guard = ProgressGuard(progress);
             let step = live.step;
             let k = step.index();
-            // Same inputs as a fresh run (upstream, parameters, edits, directives)? Then keep the result.
+            // Check whether inputs still match a fresh run before running the live sim to completion.
             let fresh_dirs: Vec<crate::directives::Directive> = crate::directives::of_stage(&s.world.edits.overrides.directives, step.key()).into_iter().cloned().collect();
             let sim_dirs = match &live.sim {
                 LiveSim::Cultures(c) => c.directives().to_vec(),
@@ -979,6 +1036,14 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
             };
             let same = s.world.expected_hashes()[k - 1] == live.upstream_hash && live_inputs(&s.world, step) == live.inputs && fresh_dirs == sim_dirs;
             if same {
+                let pr = progress.clone();
+                let report = move |f: f32, m: &str| set_progress(&pr, |p| {
+                    p.frac = f;
+                    p.msg = m.into();
+                });
+                while !live.done() {
+                    live.step_once(&report);
+                }
                 let millis = live.millis;
                 let out = match live.sim {
                     LiveSim::Cultures(c) => c.finish(&report),
@@ -993,7 +1058,6 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                     p.msg = m.into();
                 }));
             }
-            set_progress(progress, |p| p.running = false);
             s.dirty = true;
             let mut st = s.status();
             st["committed"] = json!(step.key());
@@ -1013,7 +1077,8 @@ pub fn handle(session: &Mutex<Session>, progress: &Arc<Mutex<ProgressState>>, cm
                     s.world.clear_from(step)
                 }
                 None => {
-                    let fresh: Vec<bool> = STEPS.iter().map(|&st| s.world.is_fresh(st)).collect();
+                    let hashes = s.world.expected_hashes();
+                    let fresh: Vec<bool> = STEPS.iter().map(|&st| s.world.is_fresh_with(st, &hashes)).collect();
                     if s.live.as_ref().is_some_and(|l| !fresh[l.step.index() - 1]) {
                         s.live = None;
                     }

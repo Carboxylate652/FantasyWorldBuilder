@@ -1,7 +1,6 @@
 // Map layers: which fields each layer needs and how cells are coloured.
 
 import type { Grid } from './grid';
-import { eastNorth } from './grid';
 
 export type RGB = [number, number, number];
 
@@ -119,23 +118,43 @@ function hsl(h: number, s: number, l: number): RGB {
 
 /** Per-cell hillshade factor (≈0.55–1.45) from elevation, lit from the north-west. */
 export function hillshade(g: Grid, elev: ArrayLike<number>, radiusKm: number, strength = 1): Float32Array {
-  const out = new Float32Array(g.n);
+  const n = g.n;
+  const out = new Float32Array(n);
+  const pos = g.pos;
+  const off = g.off;
+  const nbr = g.nbr;
   const spacingM = g.spacing * radiusKm * 1000;
-  for (let i = 0; i < g.n; i++) {
-    const p = g.p(i);
-    const [e, n] = eastNorth(p);
-    const L = [(-e[0] + n[0]) * Math.SQRT1_2, (-e[1] + n[1]) * Math.SQRT1_2, (-e[2] + n[2]) * Math.SQRT1_2];
+  const invSqrt2 = Math.SQRT1_2;
+  for (let i = 0; i < n; i++) {
+    const i3 = i * 3;
+    const px = pos[i3], py = pos[i3 + 1], pz = pos[i3 + 2];
+    const el = Math.hypot(pz, px);
+    let ex: number, ez: number;
+    if (el < 1e-9) { ex = 1; ez = 0; }
+    else { ex = pz / el; ez = -px / el; }
+    const nx = py * ez;
+    const ny = pz * ex - px * ez;
+    const nz = -py * ex;
+    const lx = (-ex + nx) * invSqrt2;
+    const ly = ny * invSqrt2;
+    const lz = (-ez + nz) * invSqrt2;
     let num = 0;
     let den = 0;
-    const ei = Math.max(0, elev[i]);
-    for (let k = g.off[i]; k < g.off[i + 1]; k++) {
-      const j = g.nbr[k];
-      const q = g.p(j);
-      const d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
-      const dl = Math.hypot(d[0], d[1], d[2]);
-      const c = (d[0] * L[0] + d[1] * L[1] + d[2] * L[2]) / dl;
-      num += c * (Math.max(0, elev[j]) - ei);
-      den += c * c;
+    const ei = elev[i] > 0 ? elev[i] : 0;
+    const kEnd = off[i + 1];
+    for (let k = off[i]; k < kEnd; k++) {
+      const j = nbr[k];
+      const j3 = j * 3;
+      const dx = pos[j3] - px;
+      const dy = pos[j3 + 1] - py;
+      const dz = pos[j3 + 2] - pz;
+      const dl = Math.hypot(dx, dy, dz);
+      if (dl > 0) {
+        const c = (dx * lx + dy * ly + dz * lz) / dl;
+        const ej = elev[j] > 0 ? elev[j] : 0;
+        num += c * (ej - ei);
+        den += c * c;
+      }
     }
     const slope = den > 0 ? num / den / spacingM : 0; // rise toward the light per metre
     out[i] = 1 + Math.max(-0.45, Math.min(0.45, slope * 14 * strength));
@@ -340,7 +359,8 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       const b = f['boundary'];
       for (let i = 0; i < n; i++) {
         const k = b ? b[i] : 0;
-        put(i, k ? BOUNDARY[k][1] : grey(i), k ? 1 : sh(i));
+        const entry = k > 0 && k < BOUNDARY.length ? BOUNDARY[k] : null;
+        put(i, entry ? entry[1] : grey(i), entry ? 1 : sh(i));
       }
       legend = { title: 'Boundary type', items: BOUNDARY.slice(1).map(([l, c]) => ({ color: c, label: l })) };
       break;
@@ -376,7 +396,7 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
     case 'temperature': {
       const t = f['temp'];
       for (let i = 0; i < n; i++) put(i, ramp(RAMPS.temp, t ? t[i] : 0), elev && elev[i] > 0 ? sh(i) : 1);
-      legend = { title: month === null ? 'Annual mean temperature' : `Temperature, ${MONTHS[month]}`, gradient: { stops: RAMPS.temp, unit: '°C' } };
+      legend = { title: month === null ? 'Annual mean temperature' : `Temperature, ${MONTHS[month] ?? ''}`, gradient: { stops: RAMPS.temp, unit: '°C' } };
       break;
     }
     case 'precipitation': {
@@ -384,13 +404,13 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       // Both the monthly field and the annual mean of months are per month;
       // show them at an annual rate so one scale fits both.
       for (let i = 0; i < n; i++) put(i, ramp(RAMPS.precip, p ? p[i] * 12 : 0), elev && elev[i] > 0 ? sh(i) : 1);
-      legend = { title: month === null ? 'Annual precipitation' : `Precipitation, ${MONTHS[month]} (×12)`, gradient: { stops: RAMPS.precip, unit: 'mm/yr' } };
+      legend = { title: month === null ? 'Annual precipitation' : `Precipitation, ${MONTHS[month] ?? ''} (×12)`, gradient: { stops: RAMPS.precip, unit: 'mm/yr' } };
       break;
     }
     case 'wind': {
       const u = f['wind_u'], v = f['wind_v'];
       for (let i = 0; i < n; i++) put(i, ramp(RAMPS.wind, u && v ? Math.hypot(u[i], v[i]) : 0), elev && elev[i] > 0 ? 0.75 + 0.25 * sh(i) : 1);
-      legend = { title: month === null ? 'Wind speed (annual mean vector)' : `Wind speed, ${MONTHS[month]}`, gradient: { stops: RAMPS.wind, unit: 'm/s' } };
+      legend = { title: month === null ? 'Wind speed (annual mean vector)' : `Wind speed, ${MONTHS[month] ?? ''}`, gradient: { stops: RAMPS.wind, unit: 'm/s' } };
       break;
     }
     case 'continentality': {
@@ -441,22 +461,24 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       const k = f['koppen'];
       const seen = new Set<number>();
       for (let i = 0; i < n; i++) {
-        const c = k ? k[i] : 0;
+        const raw = k ? k[i] : 0;
+        const c = raw >= 0 && raw < KOPPEN.length ? raw : 0;
         seen.add(c);
         put(i, KOPPEN[c][1], c === 0 ? 1 : 0.85 + 0.15 * sh(i));
       }
-      legend = { title: 'Köppen–Geiger', items: [...seen].sort((a, b) => a - b).filter((c) => c > 0).map((c) => ({ color: KOPPEN[c][1], label: `${KOPPEN[c][0]} ${KOPPEN[c][2]}` })) };
+      legend = { title: 'Köppen–Geiger', items: [...seen].sort((a, b) => a - b).filter((c) => c > 0 && c < KOPPEN.length).map((c) => ({ color: KOPPEN[c][1], label: `${KOPPEN[c][0]} ${KOPPEN[c][2]}` })) };
       break;
     }
     case 'terrain': {
       const t = f['terrain'];
       const seen = new Set<number>();
       for (let i = 0; i < n; i++) {
-        const c = t ? t[i] : 0;
+        const raw = t ? t[i] : 0;
+        const c = raw >= 0 && raw < TERRAIN.length ? raw : 0;
         seen.add(c);
         put(i, TERRAIN[c][1], c <= 1 ? 1 : sh(i));
       }
-      legend = { title: 'Game terrain', items: [...seen].sort((a, b) => a - b).map((c) => ({ color: TERRAIN[c][1], label: TERRAIN[c][0] })) };
+      legend = { title: 'Game terrain', items: [...seen].sort((a, b) => a - b).filter((c) => c >= 0 && c < TERRAIN.length).map((c) => ({ color: TERRAIN[c][1], label: TERRAIN[c][0] })) };
       break;
     }
     case 'habitability': {
@@ -575,7 +597,6 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       // them; stations, junctions, ports and airports are icons over the map
       // (drawn as an overlay).
       const ow = f['owner'], rd = f['road'], rw = f['railway'], pt = f['port'], pk = f['province_kind'];
-      const pos = g.pos;
       // Stripes about three cells apart, whatever the grid resolution.
       const period = 3 * Math.sqrt(41253 / n);
       for (let i = 0; i < n; i++) {
@@ -589,9 +610,8 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
         else if (q === 1) c = mix(c, [180, 150, 110], 0.7);
         if (pt && pt[i] === 1) c = mix(c, [90, 150, 200], 0.25);
         if (rw && rw[i] > 0) {
-          // Diagonal stripes in geographic coordinates.
-          const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
-          const lat = Math.asin(Math.max(-1, Math.min(1, z))) * 57.2958, lon = Math.atan2(y, x) * 57.2958;
+          // Diagonal stripes in geographic coordinates (+Y is north pole in Grid).
+          const lat = g.lat[i] * 57.2958, lon = g.lon[i] * 57.2958;
           if (((Math.floor((lat + lon) / (period / 2)) % 2) + 2) % 2 === 0) c = [95, 95, 100];
         }
         put(i, c, 0.88 + 0.12 * sh(i));
@@ -604,23 +624,23 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
       break;
     }
     case 'institutions': {
-      // Institutions embraced in order (each era's idea), with the newest
+      // Highest embraced institution (each opens an era), with the newest
       // born institution's presence brightening the frontier.
       const im = f['institutions'], pr = f['institution'], pk = f['province_kind'];
-      let newest = 0;
-      if (im) for (let i = 0; i < n; i++) newest = Math.max(newest, im[i]);
       for (let i = 0; i < n; i++) {
         const k = pk ? pk[i] : isSea(i) ? 3 : 0;
         if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
         const m = im ? im[i] : 0;
-        let cnt = 0;
-        while (cnt < 6 && (m >> cnt) & 1) cnt++;
-        let c: RGB = cnt ? ERA_COLORS[cnt] : [150, 146, 138];
+        let hi = 0;
+        for (let b = 0; b < INSTITUTION_NAMES.length; b++) {
+          if ((m >> b) & 1) hi = b + 1;
+        }
+        let c: RGB = hi > 0 && hi < ERA_COLORS.length ? ERA_COLORS[hi] : [150, 146, 138];
         const p = pr ? pr[i] : 0;
         if (p > 0.05 && p < 0.9) c = mix(c, [255, 240, 150], 0.25 + 0.5 * p);
         put(i, c, 0.88 + 0.12 * sh(i));
       }
-      legend = { title: 'Institutions embraced (each opens an era); light: the newest spreading', items: [
+      legend = { title: 'Highest institution embraced (each opens an era); light: the newest spreading', items: [
         ...INSTITUTION_NAMES.map((name, k) => ({ color: ERA_COLORS[k + 1], label: name })), { color: [255, 240, 150] as RGB, label: 'Newest, spreading' }, { color: [150, 146, 138] as RGB, label: 'None yet' },
       ] };
       break;
@@ -646,7 +666,7 @@ export function colorize(id: LayerId, g: Grid, f: F, shade: Float32Array | null,
         const k = pk ? pk[i] : isSea(i) ? 3 : 0;
         if (k >= 2) { put(i, k === 2 ? [110, 160, 215] : [40, 70, 120]); continue; }
         const e = er ? er[i] : 0;
-        put(i, e ? ERA_COLORS[e - 1] : [150, 146, 138], 0.88 + 0.12 * sh(i));
+        put(i, e > 0 && e <= ERA_COLORS.length ? ERA_COLORS[e - 1] : [150, 146, 138], 0.88 + 0.12 * sh(i));
       }
       legend = { title: 'Era of each nation (its own technology)', items: [...ERA_NAMES.map((name, k) => ({ color: ERA_COLORS[k], label: name })), { color: [150, 146, 138] as RGB, label: 'No ruler' }] };
       break;

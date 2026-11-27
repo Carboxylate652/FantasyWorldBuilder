@@ -47,15 +47,15 @@ pub mod scope {
 
 impl NationSim {
     pub(super) fn has_nation_tag(&self, n: u32, tag: &str) -> bool {
-        n > 0 && self.tags.iter().any(|(s, id, t)| *s == scope::NATION && *id == n && t == tag)
+        n > 0 && !self.tags.is_empty() && self.tags.range((scope::NATION, n, String::new())..).take_while(|(s, id, _)| *s == scope::NATION && *id == n).any(|(_, _, t)| t == tag)
     }
 
     pub(super) fn has_state_tag(&self, state: u32, tag: &str) -> bool {
-        state > 0 && self.tags.iter().any(|(s, id, t)| *s == scope::STATE && *id == state && t == tag)
+        state > 0 && !self.tags.is_empty() && self.tags.range((scope::STATE, state, String::new())..).take_while(|(s, id, _)| *s == scope::STATE && *id == state).any(|(_, _, t)| t == tag)
     }
 
     pub(super) fn world_tag(&self, tag: &str) -> bool {
-        self.tags.iter().any(|(s, _, t)| *s == scope::WORLD && t == tag)
+        !self.tags.is_empty() && self.tags.range((scope::WORLD, 0, String::new())..).take_while(|(s, id, _)| *s == scope::WORLD && *id == 0).any(|(_, _, t)| t == tag)
     }
 
     pub(super) fn set_tag(&mut self, sc: &str, id: u32, tag: &str, on: bool) -> bool {
@@ -69,9 +69,13 @@ impl NationSim {
         if s == scope::NATION && !self.alive(id) {
             return false;
         }
+        if s == scope::STATE && id == 0 {
+            return false;
+        }
         let key = (s, id, tag.to_string());
         if on {
-            self.tags.insert(key)
+            self.tags.insert(key);
+            true
         } else {
             self.tags.remove(&key)
         }
@@ -167,6 +171,8 @@ impl NationSim {
             self.empires[k].territory.extend(mine);
             return true;
         }
+        // Detach from any former liege so this nation is the sovereign head of its own empire.
+        self.nations[n as usize - 1].liege = 0;
         let cap = self.nation(n).capital;
         let (cap_region, cap_state) = (self.provs[cap].region, self.provs[cap].state);
         let mut regions: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
@@ -229,6 +235,8 @@ impl NationSim {
     }
 
     /// If an emperor's nation has fallen, the largest member is elected emperor.
+    /// Any living vassal whose direct liege (e.g. a king) has fallen is promoted
+    /// to the nearest living ancestor in the liege chain.
     pub(super) fn imperial_succession(&mut self) {
         for k in 0..self.empires.len() {
             if self.empires[k].dissolved.is_some() || self.alive(self.empires[k].emperor) {
@@ -245,9 +253,10 @@ impl NationSim {
                 self.empires[k].dissolved = Some(self.year);
                 continue;
             };
-            for m in &members {
-                if self.nation(*m).liege == old {
-                    self.nations[*m as usize - 1].liege = heir;
+            // Repoint both living and dead intermediate nodes whose liege was `old` to `heir`.
+            for x in self.nations.iter_mut() {
+                if x.liege == old {
+                    x.liege = heir;
                 }
             }
             let x = &mut self.nations[heir as usize - 1];
@@ -256,6 +265,23 @@ impl NationSim {
             self.empires[k].emperor = heir;
             let (a, name) = (self.nation(heir).name.clone(), self.empires[k].name.clone());
             self.event("emperor", heir, old, None, format!("{a} is elected emperor of the {name}"));
+        }
+        // Promote living vassals whose direct liege (e.g. a fallen king) no longer exists.
+        for m in 1..=self.nations.len() as u32 {
+            if !self.alive(m) {
+                continue;
+            }
+            let mut l = self.nation(m).liege;
+            if l == 0 || self.alive(l) {
+                continue;
+            }
+            for _ in 0..8 {
+                if l == 0 || self.alive(l) {
+                    break;
+                }
+                l = self.nation(l).liege;
+            }
+            self.nations[m as usize - 1].liege = if l != m && self.alive(l) { l } else { 0 };
         }
     }
 

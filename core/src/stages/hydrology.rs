@@ -227,7 +227,7 @@ struct CornerRivers {
 /// shared among its corners, and an overflowing lake's outflow enters at the
 /// lowest corner of the cell it drains into.
 #[allow(clippy::too_many_arguments)]
-fn corner_rivers(g: &Grid, adj: &[[u32; 3]], h: &[f64], lakes: &Lakes, ocean: &[bool], q_cell: &[f64], bud: &Budget, area_km2: &[f64], hp: &HydroParams, r_km: f64, thr: f64) -> CornerRivers {
+fn corner_rivers(g: &Grid, adj: &[[u32; 3]], h: &[f64], lakes: &Lakes, ocean: &[bool], q_cell: &[f64], drainage_cell: &[f64], bud: &Budget, area_km2: &[f64], hp: &HydroParams, r_km: f64, thr: f64) -> CornerRivers {
     let nt = g.tris.len();
     let land = |c: usize| !ocean[c] && lakes.water[c] == water::LAND;
     let cpos: Vec<crate::vec3::Vec3> = (0..nt).map(|t| g.corner_pos(t)).collect();
@@ -304,16 +304,17 @@ fn corner_rivers(g: &Grid, adj: &[[u32; 3]], h: &[f64], lakes: &Lakes, ocean: &[
             area[t as usize] += a * k;
         }
     }
-    // Overflowing lakes: the outflow enters at the lowest open corner of the
-    // cell the lake drains into.
+    // Overflowing lakes: the outflow and upstream basin area enter at the lowest
+    // open corner of the cell the lake drains into.
     for (c, &out) in q_cell.iter().enumerate() {
         let r = lakes.receiver[c];
         if lakes.water[c] != water::LAKE || r < 0 || !land(r as usize) {
             continue;
         }
-        let entry = g.incident_tris(r as usize).iter().map(|&t| t as usize).filter(|&t| !sink[t]).min_by(|&a, &b| filled[a].partial_cmp(&filled[b]).unwrap());
+        let entry = g.incident_tris(r as usize).iter().map(|&t| t as usize).filter(|&t| !sink[t]).min_by(|&a, &b| filled[a].total_cmp(&filled[b]));
         if let Some(t) = entry {
             local[t] += out;
+            area[t] += drainage_cell[c];
         }
     }
     let loss: Vec<f64> = (0..nt)
@@ -440,9 +441,12 @@ fn solve_lakes(g: &Grid, h: &[f64], flow: &Flow, ocean: &[bool], b: &Budget, are
 
         // Fill from the bottom until evaporation balances supply.
         let mut all_bed: Vec<usize> = cells.iter().map(|&c| c as usize).collect();
-        all_bed.sort_by(|&a, &b| h[a].partial_cmp(&h[b]).unwrap().then(a.cmp(&b)));
+        all_bed.sort_by(|&a, &b| h[a].total_cmp(&h[b]).then(a.cmp(&b)));
         // Cells that can be under water at the (incised) spill level.
         let by_bed: Vec<usize> = all_bed.iter().copied().filter(|&c| h[c] < cap).collect();
+        if by_bed.is_empty() {
+            continue;
+        }
         let mut land_rest = own_runoff;
         let mut gain = 0.0; // rain on the lake minus open-water evaporation
         let mut k_lake = by_bed.len();
@@ -477,10 +481,9 @@ fn solve_lakes(g: &Grid, h: &[f64], flow: &Flow, ocean: &[bool], b: &Budget, are
         let mut heap = BinaryHeap::new();
         heap.push(Item(h[root], root as u32));
         flood.insert(root as u32, h[root]);
-        let member: std::collections::HashSet<u32> = cells.iter().copied().collect();
         while let Some(Item(lv, c)) = heap.pop() {
             for &nb in g.neighbors(c as usize) {
-                if member.contains(&nb) && !flood.contains_key(&nb) {
+                if inside(nb as usize) && !flood.contains_key(&nb) {
                     let l = h[nb as usize].max(lv + EPS);
                     flood.insert(nb, l);
                     heap.push(Item(l, nb));
@@ -657,13 +660,14 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     let flow = route(g, &h_route, &ocean);
     let mut lakes = solve_lakes(g, &h_route, &flow, &ocean, &bud, &area_km2, hp);
     let mut climate_out: Option<StepOutput> = None;
+    let mut prev_water: Vec<u8> = (0..n).map(|i| if elev0[i] <= 0.0 { water::OCEAN } else { water::LAND }).collect();
     for it in 0..hp.lake_climate_feedback {
-        // Only needed where the open-water map differs from what the climate step
-        // assumed (sea level = water): lakes, and inland seas that shrank.
-        let differs = (0..n).any(|i| (lakes.water[i] != water::LAND) != (elev0[i] <= 0.0));
+        // Only needed where the open-water map differs from the previous climate solve.
+        let differs = (0..n).any(|i| (lakes.water[i] != water::LAND) != (prev_water[i] != water::LAND));
         if !differs {
             break;
         }
+        prev_water.copy_from_slice(&lakes.water);
         let iters = hp.lake_climate_feedback.max(1) as f32;
         let pf = |fr: f32, m: &str| ctx.progress(0.55 + 0.3 * (it as f32 + fr) / iters, &format!("Lake feedback: {m}"));
         let sub = Ctx { grid: ctx.grid, params: ctx.params, edits: ctx.edits, input: Upstream { steps: ctx.input.steps.clone() }, progress_fn: &pf };
@@ -703,7 +707,7 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     // ---- Rivers along cell edges: the line is routed over the cell corners.
     ctx.progress(0.9, "Tracing rivers along cell edges");
     let adj = g.corner_adjacency();
-    let cr = corner_rivers(g, &adj, &h_route, &lakes, &ocean, &q, &bud, &area_km2, hp, r_km, thr / TO_M3S);
+    let cr = corner_rivers(g, &adj, &h_route, &lakes, &ocean, &q, &drainage, &bud, &area_km2, hp, r_km, thr / TO_M3S);
     let nt = g.tris.len();
     let cpos: Vec<crate::vec3::Vec3> = (0..nt).map(|t| g.corner_pos(t)).collect();
     let seg_km = |t: usize, u: usize| cpos[t].angle_to(cpos[u]) * r_km;

@@ -7,7 +7,7 @@ bin=${1:?Pass the built worldgen binary as the first argument}
 bin=$(realpath "$bin")
 level=${2:-5}
 command -v jq >/dev/null
-command -v rg >/dev/null
+command -v grep >/dev/null
 test -x "$bin"
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/fwb-cli-smoke.XXXXXX")
 project="$scratch/world"
@@ -28,8 +28,8 @@ run() {
 
 run version version
 run check check --seed 7 --level "$level"
-rg -q 'determinism: PASS' "$scratch/check.stdout"
-rg -q 'save/load round trip: PASS' "$scratch/check.stdout"
+grep -q 'determinism: PASS' "$scratch/check.stdout"
+grep -q 'save/load round trip: PASS' "$scratch/check.stdout"
 run new new "$project" --seed 7 --level "$level"
 run generate-stages run "$project"
 run info info "$project" --json
@@ -72,6 +72,6 @@ if "$bin" info "$project" >"$scratch/corrupt.stdout" 2>"$scratch/corrupt.stderr"
     printf 'FAIL: corrupt project was accepted\n'
     exit 1
 fi
-rg -q 'barriers.json' "$scratch/corrupt.stderr"
+grep -q 'barriers.json' "$scratch/corrupt.stderr"
 cp "$scratch/barriers-before.json" "$project/overrides/barriers.json"
 printf 'PASS: CLI smoke tests; artifacts retained in %s\n' "$scratch"

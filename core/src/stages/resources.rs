@@ -121,9 +121,9 @@ pub fn cash_crop(seed: u64, id: u32, dominant: u8, s: &Signals) -> Option<&'stat
     let farmland = matches!(dominant, PLAINS | FLOODPLAINS | SAVANNA | FOREST | JUNGLE | HILLS | MEDITERRANEAN | WETLANDS);
     let candidates: [(&'static str, bool, f64); 7] = [
         ("rubber", dominant == JUNGLE && t > 23.0 && p > 1800.0, 0.5),
-        ("coffee", farmland | matches!(dominant, HIGHLANDS) && (16.0..25.0).contains(&t) && p > 1100.0 && (350.0..2400.0).contains(&e), 0.6),
+        ("coffee", (farmland || matches!(dominant, HIGHLANDS)) && (16.0..25.0).contains(&t) && p > 1100.0 && (350.0..2400.0).contains(&e), 0.6),
         ("sugar", matches!(dominant, JUNGLE | SAVANNA | PLAINS | FLOODPLAINS | WETLANDS) && t > 21.0 && p > 1000.0 && lowland, 0.4),
-        ("tea", farmland | matches!(dominant, HIGHLANDS) && (11.0..22.0).contains(&t) && p > 1150.0 && e > 150.0, 0.5),
+        ("tea", (farmland || matches!(dominant, HIGHLANDS)) && (11.0..22.0).contains(&t) && p > 1150.0 && e > 150.0, 0.5),
         ("cotton", matches!(dominant, PLAINS | FLOODPLAINS | SAVANNA | DRYLANDS) && t > 17.0 && lowland && (450.0..1300.0).contains(&p), 0.35),
         ("silk", matches!(dominant, PLAINS | FLOODPLAINS | HILLS | FOREST | MEDITERRANEAN) && (12.0..22.0).contains(&t) && p > 800.0, 0.3),
         ("tobacco", farmland && (14.0..24.0).contains(&t) && (750.0..1600.0).contains(&p) && lowland, 0.2),

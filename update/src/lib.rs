@@ -23,7 +23,7 @@ pub const REPO: &str = "Carboxylate652/FantasyWorldBuilder";
 /// Version of the running build, without a leading `v`.
 pub fn current_version() -> String {
     match option_env!("FWM_RELEASE_TAG") {
-        Some(t) if !t.is_empty() => t.trim_start_matches('v').to_string(),
+        Some(t) if !t.is_empty() => t.strip_prefix('v').unwrap_or(t).to_string(),
         _ => format!("{}-dev", env!("CARGO_PKG_VERSION")),
     }
 }
@@ -40,18 +40,33 @@ pub struct Version {
 
 impl Version {
     pub fn parse(s: &str) -> Option<Version> {
-        let s = s.trim().trim_start_matches('v');
+        let s = s.trim();
+        let s = s.strip_prefix('v').unwrap_or(s);
         let s = s.split('+').next()?; // build metadata does not count
         let (core, pre) = match s.split_once('-') {
-            Some((c, p)) => (c, p.split('.').map(str::to_string).collect()),
+            Some((c, p)) => {
+                if p.is_empty() {
+                    return None;
+                }
+                let parts: Vec<String> = p.split('.').map(str::to_string).collect();
+                if parts.iter().any(|x| x.is_empty()) {
+                    return None;
+                }
+                (c, parts)
+            }
             None => (s, vec![]),
         };
         let mut it = core.split('.').map(|x| x.parse::<u64>());
-        let v = [it.next()?.ok()?, it.next().unwrap_or(Ok(0)).ok()?, it.next().unwrap_or(Ok(0)).ok()?];
+        let major = it.next()?.ok()?;
+        let minor = it.next()?.ok()?;
+        let patch = match it.next() {
+            Some(r) => r.ok()?,
+            None => 0,
+        };
         if it.next().is_some() {
             return None;
         }
-        Some(Version { core: v, pre })
+        Some(Version { core: [major, minor, patch], pre })
     }
 
     pub fn is_prerelease(&self) -> bool {
@@ -160,7 +175,7 @@ pub fn parse_releases(json: &str) -> Result<Vec<Release>, String> {
         .filter_map(|r| {
             let v = Version::parse(&r.tag_name)?;
             Some(Release {
-                version: r.tag_name.trim_start_matches('v').to_string(),
+                version: r.tag_name.strip_prefix('v').unwrap_or(&r.tag_name).to_string(),
                 name: r.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| r.tag_name.clone()),
                 url: r.html_url.clone(),
                 prerelease: r.prerelease || v.is_prerelease(),
@@ -196,7 +211,7 @@ fn user_agent() -> String {
 
 /// Recent releases of the repository, from the GitHub API.
 pub fn fetch_releases() -> Result<Vec<Release>, String> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=20");
+    let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=100");
     let resp = agent()
         .get(&url)
         .set("User-Agent", &user_agent())
@@ -241,48 +256,127 @@ pub fn check(include_prereleases: Option<bool>) -> Result<Check, String> {
 
 // ---------------------------------------------------------------- download
 
-/// Download an asset into `dir`, checking its size and SHA-256 digest.
-/// `progress(done, total)` is called as bytes arrive.
-pub fn download(asset: &Asset, dir: &Path, progress: &dyn Fn(u64, u64)) -> Result<PathBuf, String> {
-    if !asset.url.starts_with("https://github.com/") && !asset.url.starts_with("https://objects.githubusercontent.com/") {
-        return Err(format!("refusing to download from {}", asset.url));
+const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_REDIRECTS: usize = 5;
+
+fn is_allowed_download_url(url: &str) -> bool {
+    if url.contains("..") || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
     }
+    let repo_prefix = format!("https://github.com/{REPO}/releases/download/");
+    url.starts_with(&repo_prefix)
+        || url.starts_with("https://objects.githubusercontent.com/")
+        || url.starts_with("https://release-assets.githubusercontent.com/")
+}
+
+fn validate_sha256(sha256: Option<&str>) -> Result<String, String> {
+    let want = sha256
+        .map(str::trim)
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| "refusing to download unverified asset: missing or invalid SHA-256 digest".to_string())?;
+    Ok(want.to_ascii_lowercase())
+}
+
+fn download_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .try_proxy_from_env(true)
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(60))
+        .build()
+}
+
+fn download_from_reader(reader: &mut dyn Read, asset: &Asset, dir: &Path, progress: &dyn Fn(u64, u64)) -> Result<PathBuf, String> {
+    let want = validate_sha256(asset.sha256.as_deref())?;
     let name = Path::new(&asset.name).file_name().ok_or("bad asset name")?.to_owned();
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(&name);
     let part = dir.join(format!("{}.part", name.to_string_lossy()));
-    let resp = agent().get(&asset.url).set("User-Agent", &user_agent()).call().map_err(|e| format!("download failed: {e}"))?;
-    let mut reader = resp.into_reader();
+    let max_bytes = if asset.size > 0 { asset.size } else { DEFAULT_MAX_DOWNLOAD_BYTES };
     let mut file = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut done = 0u64;
-    loop {
-        let k = reader.read(&mut buf).map_err(|e| format!("download interrupted: {e}"))?;
-        if k == 0 {
-            break;
-        }
-        hasher.update(&buf[..k]);
-        file.write_all(&buf[..k]).map_err(|e| format!("{}: {e}", part.display()))?;
-        done += k as u64;
-        progress(done, asset.size);
-    }
-    drop(file);
     let fail = |msg: String| {
         let _ = std::fs::remove_file(&part);
         Err(msg)
     };
+    loop {
+        let k = match reader.read(&mut buf) {
+            Ok(k) => k,
+            Err(e) => {
+                drop(file);
+                return fail(format!("download interrupted: {e}"));
+            }
+        };
+        if k == 0 {
+            break;
+        }
+        done = done.saturating_add(k as u64);
+        if done > max_bytes {
+            drop(file);
+            return fail(format!("download exceeded limit of {max_bytes} bytes"));
+        }
+        hasher.update(&buf[..k]);
+        if let Err(e) = file.write_all(&buf[..k]) {
+            drop(file);
+            return fail(format!("{}: {e}", part.display()));
+        }
+        progress(done, asset.size);
+    }
+    drop(file);
     if asset.size > 0 && done != asset.size {
         return fail(format!("download incomplete: {done} of {} bytes", asset.size));
     }
     let got: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    if let Some(want) = &asset.sha256 {
-        if *want != got {
-            return fail(format!("download corrupted: SHA-256 {got}, expected {want}"));
-        }
+    if want != got {
+        return fail(format!("download corrupted: SHA-256 {got}, expected {want}"));
     }
-    std::fs::rename(&part, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    std::fs::rename(&part, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        format!("{}: {e}", path.display())
+    })?;
     Ok(path)
+}
+
+/// Download an asset into `dir`, checking its size and SHA-256 digest.
+/// `progress(done, total)` is called as bytes arrive.
+pub fn download(asset: &Asset, dir: &Path, progress: &dyn Fn(u64, u64)) -> Result<PathBuf, String> {
+    if !is_allowed_download_url(&asset.url) {
+        return Err(format!("refusing to download from {}", asset.url));
+    }
+    // Fail fast before opening any network connection if no valid digest was provided.
+    validate_sha256(asset.sha256.as_deref())?;
+    let client = download_agent();
+    let mut current_url = asset.url.clone();
+    let resp = {
+        let mut hops = 0usize;
+        loop {
+            if !is_allowed_download_url(&current_url) {
+                return Err(format!("refusing to follow redirect to {current_url}"));
+            }
+            let r = client
+                .get(&current_url)
+                .set("User-Agent", &user_agent())
+                .call()
+                .map_err(|e| format!("download failed: {e}"))?;
+            if matches!(r.status(), 301 | 302 | 303 | 307 | 308) {
+                if hops >= MAX_REDIRECTS {
+                    return Err("download failed: too many redirects".into());
+                }
+                let loc = r.header("location").ok_or("download failed: redirect missing Location header")?;
+                current_url = loc.to_string();
+                hops += 1;
+                continue;
+            }
+            if r.status() != 200 {
+                return Err(format!("download failed: unexpected status {}", r.status()));
+            }
+            break r;
+        }
+    };
+    let mut reader = resp.into_reader();
+    download_from_reader(&mut reader, asset, dir, progress)
 }
 
 /// Folder for downloaded installers.
@@ -309,7 +403,14 @@ pub fn is_installed_copy() -> bool {
 /// Open a GitHub page of this project in the default browser.
 pub fn open_page(url: &str) -> Result<(), String> {
     let allowed = format!("https://github.com/{REPO}/");
-    if !url.starts_with(&allowed) || url.chars().any(|c| c.is_whitespace() || c == '"' || c == '&' || c == '^' || c == '|') {
+    if !url.starts_with(&allowed)
+        || url.contains("..")
+        || url.chars().any(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || matches!(c, '"' | '&' | '^' | '|' | '%' | '<' | '>' | '\\' | '`')
+        })
+    {
         return Err(format!("refusing to open {url}"));
     }
     let r = if cfg!(windows) {
@@ -345,6 +446,10 @@ mod tests {
         Version::parse(s).unwrap()
     }
 
+    fn sha256_hex(data: &[u8]) -> String {
+        Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     #[test]
     fn versions_order_like_semver() {
         assert!(v("0.1.0-beta.2") < v("0.1.0-beta.10"));
@@ -354,9 +459,15 @@ mod tests {
         assert!(v("v0.2.0") > v("0.1.9"));
         assert!(v("0.1.0-beta") < v("0.1.0-beta.1"));
         assert_eq!(v("0.1.0+build5"), v("0.1.0"));
+        assert_eq!(v("1.2"), v("1.2.0"));
         assert!(v("0.1.0-dev") > v("0.1.0-beta.2"), "a dev build is not offered older betas");
         assert!(Version::parse("latest").is_none());
         assert!(Version::parse("1.2.3.4").is_none());
+        assert!(Version::parse("vv1.0.0").is_none(), "strip at most one leading v");
+        assert!(Version::parse("1").is_none(), "require at least major.minor");
+        assert!(Version::parse("1.0.0-").is_none(), "reject empty prerelease");
+        assert!(Version::parse("1.0.0-beta.").is_none(), "reject empty prerelease identifier");
+        assert!(Version::parse("1.0.0-beta..1").is_none(), "reject empty prerelease identifier");
     }
 
     const SAMPLE: &str = r#"[
@@ -383,9 +494,59 @@ mod tests {
 
     #[test]
     fn download_checks_the_digest_and_source() {
-        let bad = Asset { name: "x.exe".into(), url: "https://example.com/x.exe".into(), size: 1, sha256: None };
-        assert!(download(&bad, &std::env::temp_dir(), &|_, _| {}).unwrap_err().contains("refusing"));
+        let valid_url = format!("https://github.com/{REPO}/releases/download/v0.1.0/x.exe");
+        let valid_digest = sha256_hex(b"payload");
+
+        let bad_host = Asset { name: "x.exe".into(), url: "https://example.com/x.exe".into(), size: 7, sha256: Some(valid_digest.clone()) };
+        assert!(download(&bad_host, &std::env::temp_dir(), &|_, _| {}).unwrap_err().contains("refusing"));
+
+        let other_repo = Asset { name: "x.exe".into(), url: "https://github.com/other/repo/releases/download/v1/x.exe".into(), size: 7, sha256: Some(valid_digest.clone()) };
+        assert!(download(&other_repo, &std::env::temp_dir(), &|_, _| {}).unwrap_err().contains("refusing"));
+
+        let missing_sha = Asset { name: "x.exe".into(), url: valid_url.clone(), size: 7, sha256: None };
+        assert!(download(&missing_sha, &std::env::temp_dir(), &|_, _| {}).unwrap_err().contains("SHA-256"));
+
+        let short_sha = Asset { name: "x.exe".into(), url: valid_url, size: 7, sha256: Some("abcdef".into()) };
+        assert!(download(&short_sha, &std::env::temp_dir(), &|_, _| {}).unwrap_err().contains("SHA-256"));
+
         assert!(open_page("https://example.com/").is_err());
         assert!(open_page("https://github.com/Carboxylate652/FantasyWorldBuilder/releases/tag/v1 & calc").is_err());
+        assert!(open_page("https://github.com/Carboxylate652/FantasyWorldBuilder/releases/../evil").is_err());
+        assert!(open_page("https://github.com/Carboxylate652/FantasyWorldBuilder/releases/%2e%2e").is_err());
+        assert!(open_page("https://github.com/Carboxylate652/FantasyWorldBuilder/releases/<script>").is_err());
+        assert!(open_page("https://github.com/Carboxylate652/FantasyWorldBuilder/releases/v1\nfoo").is_err());
+    }
+
+    #[test]
+    fn download_stream_enforces_sha256_and_byte_cap() {
+        let dir = std::env::temp_dir().join(format!("fwm-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = b"hello verified update";
+        let digest = sha256_hex(data);
+        let asset = Asset {
+            name: "installer.exe".into(),
+            url: format!("https://github.com/{REPO}/releases/download/v0.1.0/installer.exe"),
+            size: data.len() as u64,
+            sha256: Some(digest),
+        };
+
+        // Valid download succeeds.
+        let mut cursor = std::io::Cursor::new(data.to_vec());
+        let out = download_from_reader(&mut cursor, &asset, &dir, &|_, _| {}).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), data);
+
+        // Corrupted payload fails and cleans up .part.
+        let mut bad_cursor = std::io::Cursor::new(b"hello tampered update".to_vec());
+        let err = download_from_reader(&mut bad_cursor, &asset, &dir, &|_, _| {}).unwrap_err();
+        assert!(err.contains("corrupted"), "got: {err}");
+        assert!(!dir.join("installer.exe.part").exists());
+
+        // Oversized stream is aborted by streaming byte cap.
+        let mut oversized = std::io::Cursor::new(vec![b'A'; data.len() + 1024]);
+        let err = download_from_reader(&mut oversized, &asset, &dir, &|_, _| {}).unwrap_err();
+        assert!(err.contains("exceeded limit"), "got: {err}");
+        assert!(!dir.join("installer.exe.part").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

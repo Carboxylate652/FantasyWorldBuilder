@@ -4,25 +4,28 @@
 //!
 //! 1. Daily-mean insolation by latitude for every day of the year.
 //! 2. A 1-D Budyko–Sellers energy balance in x = sin(lat), integrated through
-//!    the year until periodic. The tropics mix their heat (Hadley cells) and
-//!    transport weakens toward the poles. Sea ice forms where the sea freezes;
+//!    the year until periodic (with zero-annual-mean seasonal damping for
+//!    realistic solstice phase lags). The tropics mix their heat (Hadley cells)
+//!    and transport weakens toward the poles. Sea ice forms where the sea freezes;
 //!    ice sheets last on land whose summer stays below freezing, build their
 //!    own height and cool the latitudes around them. Three runs: ocean-like
 //!    and land-like heat capacity give the seasonal swing for maritime and
 //!    continental places; a land-fraction-weighted run gives the annual mean.
 //! 3. Local temperature: continentality from maritime air carried along each
 //!    half-year's wind (and held back by mountains), sea ice that makes a
-//!    frozen sea continental, warm/cold coastal currents, colder interiors at
-//!    high latitudes, temperature carried downwind, and three lapse rates
-//!    (free air on peaks, a gentler one on broad plateaus, a steeper one on
-//!    ice sheets). Dry ground swings further with the seasons.
-//! 4. Winds: three belts whose convergence line follows the heat in each
-//!    longitude sector (monsoons: trades that cross the equator turn into
-//!    westerlies), blended so they never break, plus thermal winds (wind.rs).
-//! 5. Moisture: humidity carried along the wind as fluxes across cell edges
-//!    (conserving water), evaporation from the sea and, as a share of the
-//!    rain, from land; showery and layered rain from relative humidity, wide
-//!    mixing by storms, orographic cloud and rain shadows.
+//!    frozen sea continental, warm/cold coastal currents carried downwind,
+//!    colder interiors and shallow winter radiative inversions at high
+//!    latitudes, temperature carried downwind, and three lapse rates (free air
+//!    on peaks, a gentler one on broad plateaus, a steeper one on ice sheets).
+//!    Dry ground swings further with the seasons.
+//! 4. Winds: three belts whose convergence line follows free-air heat and
+//!    summer plateau heating in each longitude sector (monsoons: trades that
+//!    cross the equator turn into westerlies), blended so they never break,
+//!    plus thermal and subtropical oceanic high winds (wind.rs).
+//! 5. Moisture: specific humidity and cloud carried along the wind as mixing
+//!    ratios across cell edges, evaporation from the sea and, as a share of
+//!    the rain, from land; showery and layered rain from relative humidity,
+//!    wide mixing by storms, stability-gated orographic cloud and rain shadows.
 //! 6. Foehn: air that rained out climbing a range warms the land below the
 //!    lee slope.
 //!
@@ -45,11 +48,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 const NB: usize = 90; // EBM bands, uniform in x = sin(lat)
 const A_OLR: f64 = 192.4;
 const B_OLR: f64 = 2.09;
-const C_OCEAN: f64 = 1.0e8; // ~25 m mixed layer, J/m²/K
-const C_LAND: f64 = 2.5e7; // land + the atmosphere column mixing over it
+const C_OCEAN: f64 = 1.2e8; // ~28 m mixed layer, J/m²/K
+const C_LAND: f64 = 1.3e7; // atmosphere column + top soil, J/m²/K
 const C_ICE: f64 = 3.0e7; // sea ice shuts the mixed layer off from the air
-/// Planetary albedo of sea ice and of an ice sheet (snow on land ice is
-/// brighter and does not open into leads).
+/// Extra seasonal damping (W/m²/K) toward each band's annual mean (zero annual
+/// net flux): radiative-convective & latent-heat buffering give land a ~26-day
+/// lag and ocean a ~68-day lag behind the solstices without changing the annual
+/// energy balance or inflating polar summer swings.
+const B_SEAS_LAND: f64 = 3.2;
+const B_SEAS_OCEAN: f64 = 7.0;
+/// Planetary albedo of sea ice and of land ice sheets.
 const ALBEDO_SEA_ICE: f64 = 0.62;
 const ALBEDO_ICE_SHEET: f64 = 0.80;
 /// Heat an ice sheet loses beyond the albedo effect, W/m² per °C that its
@@ -97,9 +105,11 @@ const SEA_SWING_MAX: f64 = 0.4;
 const LAND_SUMMER: f64 = 0.5;
 /// Sea water freezes at this sea-level air temperature, and is fully ice-covered at the second.
 const SEA_FREEZE_C: f64 = -1.8;
-const SEA_ICE_FULL_C: f64 = -7.0;
+const SEA_ICE_FULL_C: f64 = -5.5;
 /// How continental the air over full sea ice is (1 = like land).
-const SEA_ICE_CONTINENTAL: f64 = 0.8;
+const SEA_ICE_CONTINENTAL: f64 = 0.93;
+/// Extra winter radiative-inversion cooling (°C) in deep high-latitude continental interiors.
+const WINTER_INVERSION_C: f64 = 18.0;
 /// Fraction of the year at which the northern spring equinox falls (Earth: ~20 March).
 const EQUINOX_FRAC: f64 = 79.5 / 365.25;
 
@@ -265,10 +275,12 @@ fn run_ebm(p: &WorldParams, bands: &Bands) -> Ebm {
         .collect();
 
     let mut t = [12.0f64; NB];
-    // Warmest day of the previous year and of this one so far.
+    // Warmest day and annual mean of the previous year, and running accumulators.
     let mut t_summer_prev = [12.0f64; NB];
     let mut t_summer = [f64::MIN; NB];
-    let years = 40;
+    let mut t_ann_prev = [12.0f64; NB];
+    let mut t_ann_sum = [0.0f64; NB];
+    let years = 45;
     let mut month_sum = vec![[0.0f64; NB]; 12];
     let mut month_cnt = [0usize; 12];
     let (mut a, mut b, mut c, mut r) = ([0.0; NB], [0.0; NB], [0.0; NB], [0.0; NB]);
@@ -289,7 +301,8 @@ fn run_ebm(p: &WorldParams, bands: &Bands) -> Ebm {
     let mut land_drop = bands.land_drop;
     let dome_drop = p.climate.lapse_rate_c_per_km * ICE_DOME_M / 1000.0;
     for year in 0..years {
-        for day in 0..days {
+        let seas_on = year >= 8;
+        for (day, q_day) in q.iter().enumerate() {
             if has_sheet {
                 sink = [0.0; NB];
                 for j in 0..NB {
@@ -315,15 +328,21 @@ fn run_ebm(p: &WorldParams, bands: &Bands) -> Ebm {
             }
             for k in 0..NB {
                 let lf = bands.land[k];
-                let cdt = (lf * C_LAND + (1.0 - lf) * (C_OCEAN + (C_ICE - C_OCEAN) * sea_ice(t[k]))) / DAY_S;
+                let ice = sea_ice(t[k]);
+                let cdt = (lf * C_LAND + (1.0 - lf) * (C_OCEAN + (C_ICE - C_OCEAN) * ice)) / DAY_S;
+                let b_seas = if seas_on {
+                    lf * B_SEAS_LAND + (1.0 - lf) * (B_SEAS_OCEAN + (B_SEAS_LAND - B_SEAS_OCEAN) * ice)
+                } else {
+                    0.0
+                };
                 let (alb, _, _) = albedo(t[k], band_x(k), t_summer_prev[k], lf, land_drop[k]);
-                let asr = q[day][k] * (1.0 - alb) - sink[k];
+                let asr = q_day[k] * (1.0 - alb) - sink[k];
                 let kl = d * edge[k] / (dx * dx);
                 let kr = d * edge[k + 1] / (dx * dx);
                 a[k] = if k > 0 { -kl } else { 0.0 };
                 c[k] = if k + 1 < NB { -kr } else { 0.0 };
-                b[k] = cdt + B_OLR - a[k] - c[k];
-                r[k] = cdt * t[k] + asr - A_OLR + forcing;
+                b[k] = cdt + B_OLR + b_seas - a[k] - c[k];
+                r[k] = cdt * t[k] + b_seas * t_ann_prev[k] + asr - A_OLR + forcing;
             }
             // Thomas algorithm.
             for k in 1..NB {
@@ -337,6 +356,7 @@ fn run_ebm(p: &WorldParams, bands: &Bands) -> Ebm {
             }
             for k in 0..NB {
                 t_summer[k] = t_summer[k].max(t[k]);
+                t_ann_sum[k] += t[k];
             }
             if year == years - 1 {
                 let m = ((day * 12) / days).min(11);
@@ -348,6 +368,10 @@ fn run_ebm(p: &WorldParams, bands: &Bands) -> Ebm {
         }
         t_summer_prev = t_summer;
         t_summer = [f64::MIN; NB];
+        for k in 0..NB {
+            t_ann_prev[k] = t_ann_sum[k] / days as f64;
+        }
+        t_ann_sum = [0.0; NB];
     }
     let month = (0..12)
         .map(|m| std::array::from_fn(|k| month_sum[m][k] / month_cnt[m].max(1) as f64))
@@ -375,7 +399,7 @@ pub struct WindBelts {
 pub fn wind_belts(p: &WorldParams) -> WindBelts {
     let rot = (p.planet.day_length_h / 24.0).clamp(0.05, 50.0);
     let hadley = (30.0 * rot.powf(0.35)).clamp(12.0, 50.0);
-    let ferrel = (hadley + 30.0 * rot.powf(0.2)).clamp(hadley + 10.0, 82.0);
+    let ferrel = (hadley + 38.0 * rot.powf(0.2)).clamp(hadley + 12.0, 84.0);
     WindBelts { hadley, ferrel }
 }
 
@@ -396,13 +420,22 @@ pub fn wind_at(p: &WorldParams, lat_rad: f64, month: usize) -> (f64, f64) {
 
 /// Position inside the belts: degrees from the convergence line, stretched so
 /// that the trade-wind belts always end at the Hadley edges (`cz` ± hadley)
-/// wherever the local line `c` is; beyond the edges, degrees from `cz`.
-/// Also the side (+1 north of the line, −1 south of it).
+/// wherever the local line `c` is, and the polar front shifts less with the
+/// seasons than the ITCZ (keeping winter westerlies up to ~62°).
+/// Also returns the side (+1 north of the line, −1 south of it).
 fn belt_coord(belts: &WindBelts, lat: f64, c: f64, cz: f64) -> (f64, f64) {
-    let h = belts.hadley;
+    let (h, f) = (belts.hadley, belts.ferrel);
     let (north, south) = (cz + h, cz - h);
     if lat >= north || lat <= south {
-        ((lat - cz).abs(), if lat >= cz { 1.0 } else { -1.0 })
+        let s = if lat >= cz { 1.0 } else { -1.0 };
+        let edge = if s > 0.0 { north } else { south };
+        let pf = (s * f + 0.35 * cz).clamp(-88.0, 88.0);
+        if (s > 0.0 && lat <= pf) || (s < 0.0 && lat >= pf) {
+            let frac = (lat - edge).abs() / (pf - edge).abs().max(1.0);
+            (h + frac * (f - h), s)
+        } else {
+            (f + (lat - pf).abs(), s)
+        }
     } else if lat >= c {
         ((lat - c) / (north - c).max(1.0) * h, 1.0)
     } else {
@@ -443,23 +476,30 @@ pub fn belt_wind(belts: &WindBelts, lat: f64, c: f64, cz: f64) -> (f64, f64) {
 }
 
 /// How far the rain band follows the convergence line away from its zonal-mean latitude.
-const RAIN_BAND_FOLLOW: f64 = 0.3;
+const RAIN_BAND_FOLLOW: f64 = 0.45;
 /// Share by which the westerlies strengthen in midwinter and slacken in midsummer.
 const WESTERLY_SEASON: f64 = 0.3;
 /// How far from the equator the convergence line can sit, as degrees short of the Hadley edge.
 const ITCZ_EDGE_GAP: f64 = 5.0;
 
 /// Latitude (degrees) of the tropical convergence line at every cell, for each
-/// month. It follows the heat: over a continent that heats up in summer it
-/// moves far into the summer hemisphere and the winds on its equator side
-/// turn onshore (a monsoon); over the open ocean it stays near the equator.
+/// month. It follows the free-air warmth plus elevated-plateau summer heating
+/// (without dry-desert surface sensible heat): over a warm continent or plateau
+/// in summer it moves into the summer hemisphere and the winds on its equator
+/// side turn onshore (a monsoon); over the open ocean it stays near the equator.
 /// `follow` = 0 keeps the zonal-mean line everywhere.
-fn local_itcz(p: &WorldParams, g: &Grid, t_sl: &[Vec<f32>], follow: f64) -> Vec<Vec<f32>> {
+fn local_itcz(p: &WorldParams, g: &Grid, t_sl: &[Vec<f32>], h_c: &[f64], water_frac: &[f64], follow: f64) -> Vec<Vec<f32>> {
     const NS: usize = 72;
     let belts = wind_belts(p);
     let limit = (belts.hadley + 5.0).min(45.0);
     let reach = (belts.hadley - ITCZ_EDGE_GAP).max(2.0);
     let sector = |lon: f64| (((lon + PI) / TAU * NS as f64) as usize).min(NS - 1);
+    let heat = |m: usize, i: usize| -> f64 {
+        let t = t_sl[m][i] as f64;
+        // Elevated warm plateaus (e.g. Tibet, Mexico) heat the mid-troposphere
+        // in summer and anchor monsoon troughs poleward.
+        t + 1.4 * (h_c[i] / 1000.0) * (1.0 - water_frac[i]) * smoothstep(14.0, 26.0, t)
+    };
     // Soft arg-max of temperature over the tropics of each longitude sector.
     let raw: Vec<[f64; NS]> = (0..12)
         .map(|m| {
@@ -467,7 +507,7 @@ fn local_itcz(p: &WorldParams, g: &Grid, t_sl: &[Vec<f32>], follow: f64) -> Vec<
             for i in 0..g.len() {
                 if g.lat[i].to_degrees().abs() <= limit {
                     let k = sector(g.lon[i]);
-                    tmax[k] = tmax[k].max(t_sl[m][i] as f64);
+                    tmax[k] = tmax[k].max(heat(m, i));
                 }
             }
             let (mut sw, mut sl) = ([0.0f64; NS], [0.0f64; NS]);
@@ -475,7 +515,7 @@ fn local_itcz(p: &WorldParams, g: &Grid, t_sl: &[Vec<f32>], follow: f64) -> Vec<
                 let lat = g.lat[i].to_degrees();
                 if lat.abs() <= limit {
                     let k = sector(g.lon[i]);
-                    let w = g.area[i] * ((t_sl[m][i] as f64 - tmax[k]) / 1.5).exp();
+                    let w = g.area[i] * ((heat(m, i) - tmax[k]) / 1.5).exp();
                     sw[k] += w;
                     sl[k] += w * lat;
                 }
@@ -615,7 +655,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
 
     // ---- coastal currents (ocean cells)
     ctx.progress(0.25, "Routing ocean currents");
-    let current_c: Vec<f64> = (0..nc)
+    let raw_current_c: Vec<f64> = (0..nc)
         .into_par_iter()
         .map(|i| {
             if !ocean_c[i] {
@@ -650,10 +690,47 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
             let a = lat.to_degrees().abs();
             // The upwelling cold side is stronger than the warm side across the basin.
             let subtropical = -gauss(a, 24.0, 16.0) * (-near / 1200.0).exp() * if s > 0.0 { 1.4 } else { 0.9 };
-            let subpolar = 1.4 * gauss(a, 58.0, 12.0) * (-near / 2500.0).exp();
+            let subpolar = (if s > 0.0 { 1.75 } else { 1.3 }) * gauss(a, 60.0, 13.0) * (-near / 2800.0).exp();
             cp.ocean_current_c * s * (subtropical + subpolar)
         })
         .collect();
+    // Carry current anomalies downwind along annual-mean winds over sea cells,
+    // so warm subpolar drifts flow poleward past islands into high-latitude seas.
+    let current_c: Vec<f64> = {
+        let ann_wind: Vec<Vec3> = (0..nc)
+            .map(|i| wind_zonal.iter().fold(Vec3::ZERO, |s, w| s + w[i]) * (1.0 / 12.0))
+            .collect();
+        let reach_km = 1400.0;
+        let passes = ((3.0 * reach_km / spacing_km).ceil() as usize).clamp(8, 50);
+        let mut cur = raw_current_c.clone();
+        for _ in 0..passes {
+            cur = (0..nc)
+                .into_par_iter()
+                .map(|i| {
+                    if !ocean_c[i] {
+                        return 0.0;
+                    }
+                    let mut wsum = 0.0;
+                    let mut csum = 0.0;
+                    for &nb in coarse.neighbors(i) {
+                        let j = nb as usize;
+                        if !ocean_c[j] {
+                            continue;
+                        }
+                        let a = ann_wind[j].dot((coarse.pos[i] - coarse.pos[j]).normalized()).max(0.0);
+                        wsum += a;
+                        csum += a * cur[j];
+                    }
+                    if wsum <= 0.0 {
+                        return raw_current_c[i];
+                    }
+                    let kappa = reach_km * ann_wind[i].len().min(1.5) / spacing_km;
+                    (raw_current_c[i] + kappa * (csum / wsum)) / (1.0 + kappa)
+                })
+                .collect();
+        }
+        cur
+    };
 
     // ---- maritime influence along the wind, then sea-level temperatures.
     // Run twice: with the belt winds, then with the thermally driven winds.
@@ -665,27 +742,43 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     let block_k = cp.sea_air_blocking.max(0.0) * std::f64::consts::LN_2 / 2000.0;
     // How open the sea is around each cell (0 in a lake or narrow sea, 1 well
     // offshore): small waters moderate the air much less than an ocean.
-    let open_sea: Vec<f64> = {
+    let sea_smooth: Vec<f64> = {
         let passes = (OPEN_SEA_KM / spacing_km).powi(2).ceil().clamp(2.0, 60.0) as usize;
         let mut v = sea_frac.clone();
         for _ in 0..passes {
             v = smooth(coarse, &v);
         }
-        v.into_iter().map(|x| smoothstep(0.45, 0.9, x)).collect()
+        v
     };
-    // Sea ice: how much of the year each sea cell is frozen over, from the
-    // open-water temperature. Ice-covered sea is no source of mild air, and
-    // the air over it swings almost as on land.
-    let ice_c: Vec<f64> = (0..nc)
-        .map(|i| {
-            if !ocean_c[i] {
-                return 0.0;
-            }
-            let lat = coarse.lat[i];
-            let ann = band_interp(&mix_ann, lat) + current_c[i];
-            (0..12).map(|m| 1.0 - smoothstep(SEA_ICE_FULL_C, SEA_FREEZE_C, ann + band_interp(&anom_o[m], lat))).sum::<f64>() / 12.0
+    let open_sea: Vec<f64> = sea_smooth.iter().map(|&x| smoothstep(0.45, 0.9, x)).collect();
+    // Proximity to ocean (even seasonally frozen ocean): coastal islands and
+    // ocean margins do not build deep continental winter inversions.
+    let coast_ocean: Vec<f64> = sea_smooth.iter().map(|&x| smoothstep(0.15, 0.45, x)).collect();
+    // Sea ice per month and per half-year: frozen seas in winter (Arctic, Hudson
+    // Bay, Sea of Okhotsk) are continental in winter even if they thaw in summer.
+    // Enclosed seas have slightly less thermal inertia than open ocean.
+    let ice_m: Vec<Vec<f64>> = (0..12)
+        .map(|m| {
+            (0..nc)
+                .map(|i| {
+                    if !ocean_c[i] {
+                        return 0.0;
+                    }
+                    let lat = coarse.lat[i];
+                    let ann = band_interp(&mix_ann, lat) + current_c[i];
+                    let ao = band_interp(&anom_o[m], lat);
+                    let al = band_interp(&anom_l[m], lat);
+                    let sea_anom = ao * (0.90 + 0.10 * open_sea[i]) + al * 0.10 * (1.0 - open_sea[i]);
+                    1.0 - smoothstep(SEA_ICE_FULL_C, SEA_FREEZE_C, ann + sea_anom)
+                })
+                .collect()
         })
         .collect();
+    let ice_half = |months: [usize; 4]| -> Vec<f64> {
+        (0..nc).map(|i| months.iter().map(|&m| ice_m[m][i]).sum::<f64>() / 4.0).collect()
+    };
+    let ice_a = ice_half([11, 0, 1, 2]);
+    let ice_b = ice_half([5, 6, 7, 8]);
     // Unit direction from each neighbour toward the cell, aligned with the
     // grid's neighbour lists (used by everything the wind carries).
     let (nbr_off, nbr_idx) = coarse.neighbor_csr();
@@ -747,12 +840,12 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
         a
     };
     // Maritime air (and the offset of the current it crossed) carried inland by one wind field.
-    let maritime = |wind: &[Vec3]| -> (Vec<f64>, Vec<f64>) {
+    let maritime = |wind: &[Vec3], ice_half: &[f64]| -> (Vec<f64>, Vec<f64>) {
         let reach = cp.maritime_reach_km.max(50.0);
         let decay_adv = (-spacing_km / reach).exp();
         let decay_iso = (-spacing_km / (reach * 0.22)).exp();
         // Lakes are weaker maritime sources than the ocean (smaller, freeze, no currents).
-        let source: Vec<f64> = (0..nc).map(|i| if ocean_c[i] { open_sea[i] * (1.0 - SEA_ICE_CONTINENTAL * ice_c[i]) } else { 0.6 * lake_frac[i] }).collect();
+        let source: Vec<f64> = (0..nc).map(|i| if ocean_c[i] { open_sea[i] * (1.0 - SEA_ICE_CONTINENTAL * ice_half[i]) } else { 0.6 * lake_frac[i] }).collect();
         // Per edge: how much of the neighbour's air the wind brings, and how
         // much of its maritime air survives the descent from it.
         let inflow: Vec<f64> = (0..nbr_idx.len()).into_par_iter().map(|e| wind[nbr_idx[e] as usize].dot(dir_in[e]).max(0.0)).collect();
@@ -815,7 +908,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     // for the months around January, one for those around July.
     let sea_air = |winds: &[Vec<Vec3>]| -> SeaAir {
         let half_year = |months: [usize; 6]| -> Vec<Vec3> { (0..nc).map(|i| months.iter().fold(Vec3::ZERO, |s, &m| s + winds[m][i]) * (1.0 / 6.0)).collect() };
-        let ((mar_a, cur_a), (mar_b, cur_b)) = rayon::join(|| maritime(&half_year([10, 11, 0, 1, 2, 3])), || maritime(&half_year([4, 5, 6, 7, 8, 9])));
+        let ((mar_a, cur_a), (mar_b, cur_b)) = rayon::join(|| maritime(&half_year([10, 11, 0, 1, 2, 3]), &ice_a), || maritime(&half_year([4, 5, 6, 7, 8, 9]), &ice_b));
         let mar: Vec<f64> = (0..nc).map(|i| 0.5 * (mar_a[i] + mar_b[i])).collect();
         let cur: Vec<f64> = (0..nc).map(|i| if mar[i] > 0.0 { 0.5 * (cur_a[i] * mar_a[i] + cur_b[i] * mar_b[i]) / mar[i] } else { 0.0 }).collect();
         // Zonal mean continentality: at high latitudes sea-facing places are
@@ -839,13 +932,15 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     let swing_l: [f64; NB] = std::array::from_fn(|k| anom_l.iter().map(|a| a[k].abs()).fold(0.0, f64::max));
     // Sea-level temperatures: each cell's own balance (with the heat of dry
     // ground, if known), then carried by the wind (if given).
-    let temperatures = |sea: &SeaAir, winds: Option<&[Vec<Vec3>]>, dry: Option<&[Vec<f32>]>| -> Vec<Vec<f32>> {
+    let temperatures = |sea: &SeaAir, winds: Option<&[Vec<Vec3>]>, dry: Option<&[Vec<f32>]>, sheet: Option<&[f64]>| -> Vec<Vec<f32>> {
         (0..12)
             .into_par_iter()
             .map(|m| {
+                let mut inv = vec![0.0; nc];
                 let local: Vec<f64> = (0..nc)
                     .map(|i| {
                         let lat = coarse.lat[i];
+                        let abs_lat = lat.to_degrees().abs();
                         let wa = 0.5 + 0.5 * (TAU * (m as f64 - 0.5) / 12.0).cos();
                         let mar_m = wa * sea.mar_a[i] + (1.0 - wa) * sea.mar_b[i];
                         let cont = 1.0 - mar_m;
@@ -853,35 +948,49 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                         // brings; in winter sea air stays mild far inland.
                         let (ao, al) = (band_interp(&anom_o[m], lat), band_interp(&anom_l[m], lat));
                         let land = 1.0 - water_frac[i];
-                        // Even a land-locked sea swings far less than land.
-                        let cont = cont.min(1.0 - (1.0 - SEA_SWING_MAX) * water_frac[i]);
+                        // Even a land-locked unfrozen sea swings far less than land;
+                        // frozen sea ice insulates the water and swings like land.
+                        let open_w = water_frac[i] * (1.0 - ice_m[m][i]);
+                        let cont = cont.min(1.0 - (1.0 - SEA_SWING_MAX) * open_w);
                         let cont_m = cont + (1.0 - cont) * LAND_SUMMER * land * smoothstep(-3.0, 3.0, al);
-                        let a = ao * (1.0 - cont_m) + al * cont_m;
+                        let sheet_v = sheet.map_or(0.0, |s| s[i]);
+                        let al_eff = if al > 0.0 { al * (1.0 - 0.40 * sheet_v) } else { al };
+                        let a = ao * (1.0 - cont_m) + al_eff * cont_m;
                         let off = if ocean_c[i] { current_c[i] } else { wa * sea.cur_a[i] * sea.mar_a[i] + (1.0 - wa) * sea.cur_b[i] * sea.mar_b[i] };
-                        let cooling = cp.continental_cooling * smoothstep(30.0, 62.0, lat.to_degrees().abs());
+                        let sw = band_interp(&swing_l, lat) + 1.0;
+                        let winter_w = (-al / sw).clamp(0.0, 1.0);
+                        // High-latitude continental cooling is concentrated in winter
+                        // (snow cover and shallow radiative inversions), not summer;
+                        // deep interiors far from oceans cool much further (ice sheets
+                        // already have their own dome height and steeper lapse rate).
+                        let cooling = cp.continental_cooling * smoothstep(32.0, 62.0, abs_lat);
+                        let cont_shift = cooling * (0.45 + 0.85 * winter_w) * (band_interp(&sea.cbar, lat) - cont);
+                        let not_sheet = 1.0 - sheet_v;
+                        inv[i] = -WINTER_INVERSION_C * (cp.continental_cooling / 12.0).max(0.0) * land * not_sheet * (1.0 - coast_ocean[i]) * smoothstep(50.0, 65.0, abs_lat) * smoothstep(0.74, 0.94, cont) * winter_w;
                         // Dry ground cannot cool by evaporation: hotter, most of all in summer.
                         let heat = dry.map_or(0.0, |d| {
-                            let summer = (0.5 + 0.5 * al / (band_interp(&swing_l, lat) + 1.0)).clamp(0.0, 1.0);
+                            let summer = (0.5 + 0.5 * al / sw).clamp(0.0, 1.0);
                             let dry = d[m][i] as f64;
                             // (Not in the cold: frozen or snow-covered ground does neither.)
                             let thawed = smoothstep(2.0, 14.0, band_interp(&mix_ann, lat) + a);
                             cp.dry_heat * land * thawed * (dry * (DRY_HEAT_MEAN_C + DRY_HEAT_SWING_C * (2.0 * summer - 1.0)) - (1.0 - dry) * WET_LAND_COOL_C)
                         });
-                        band_interp(&mix_ann, lat) + cooling * (band_interp(&sea.cbar, lat) - (1.0 - sea.mar[i])) + a + off + heat
+                        band_interp(&mix_ann, lat) + cont_shift + a + off + heat
                     })
                     .collect();
-                // The wind carries warmth and cold with it.
+                // The wind carries warmth and cold with it; shallow surface
+                // radiative inversions form locally under clear winter skies.
                 let carried = match winds {
                     Some(w) => advect_temperature(coarse, &w[m], &dir_in, &local, &water_frac, spacing_km),
                     None => local,
                 };
                 (0..nc)
                     .map(|i| {
-                        let mut t = carried[i];
+                        let mut t = carried[i] + inv[i];
                         if ocean_c[i] {
                             // Open water does not cool below freezing; ice lets the
                             // air above it get colder, and holds summers near 0 °C.
-                            let ice = ice_c[i];
+                            let ice = ice_m[m][i];
                             t = t.max(SEA_FREEZE_C - 60.0 * ice).min(SEA_FREEZE_C + 2.0 + 30.0 * (1.0 - ice).powi(2));
                         }
                         t as f32
@@ -893,7 +1002,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     ctx.progress(0.3, "Spreading maritime air");
     // First guess: zonal belts, no carrying.
     let sea0 = sea_air(&wind_zonal);
-    let t0 = temperatures(&sea0, None, None);
+    let t0 = temperatures(&sea0, None, None, None);
 
     // ---- height: broad highlands warm the air above them, so they are less
     // cold than a peak of the same height; ice sheets are colder (the air
@@ -931,24 +1040,30 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     // line, and thermal pressure systems add to them.
     ctx.progress(0.34, "Building pressure systems");
     let grad = super::wind::Gradient::new(coarse, r_km * 1000.0);
-    let winds_for = |t_sl: &[Vec<f32>]| -> (Vec<Vec<f32>>, Vec<Vec<Vec3>>, Vec<Vec<Vec3>>) {
-        let line = local_itcz(p, coarse, t_sl, cp.monsoon);
-        let ms = super::wind::dynamic_winds(p, coarse, &grad, &belt_winds(Some(&line)), t_sl, &h_c, &water_frac);
+    let h_smooth = smooth(coarse, &h_c);
+    let h_oro: Vec<f64> = (0..nc).map(|i| 0.65 * h_c[i] + 0.35 * h_smooth[i]).collect();
+    type WindSet = (Vec<Vec<f32>>, Vec<Vec<Vec3>>, Vec<Vec<Vec3>>, Vec<Vec<Vec3>>);
+    let winds_for = |t_sl: &[Vec<f32>], t_itcz: &[Vec<f32>]| -> WindSet {
+        let line = local_itcz(p, coarse, t_itcz, &h_c, &water_frac, cp.monsoon);
+        let (ms, syn) = super::wind::dynamic_winds(p, coarse, &grad, &belt_winds(Some(&line)), t_sl, &h_c, &water_frac);
         let unit = ms.iter().map(|w| w.iter().map(|v| *v * (1.0 / super::wind::W_REF)).collect()).collect();
-        (line, ms, unit)
+        (line, ms, syn, unit)
     };
 
     // ---- moisture and precipitation (coarse, months in parallel): raw rain
     // of the listed months.
-    let moisture = |wind_m: &[Vec<Vec3>], wind_ms: &[Vec<Vec3>], t_sl: &[Vec<f32>], t_air: &[Vec<f32>], line: &[Vec<f32>], sea: &SeaAir, soil_water: Option<&[Vec<f64>]>, dry: Option<&[Vec<f32>]>, months: &[usize], passes: usize| -> Vec<Vec<f64>> {
+    let storm_center = belts.ferrel - 13.0;
+    let moisture = |wind_m: &[Vec<Vec3>], wind_syn: &[Vec<Vec3>], t_sl: &[Vec<f32>], t_air: &[Vec<f32>], line: &[Vec<f32>], sea: &SeaAir, soil_water: Option<&[Vec<f64>]>, dry: Option<&[Vec<f32>]>, months: &[usize], passes: usize| -> Vec<Vec<f64>> {
         months
             .par_iter()
             .map(|&m| {
                 let wind = &wind_m[m];
                 let (mar, cur) = (&sea.mar, &sea.cur);
                 let cz = itcz_lat(p, m);
-                // Low-level convergence (1/s) lifts air and makes rain; divergence suppresses it.
-                let conv: Vec<f64> = (0..nc).map(|i| -grad.divergence(coarse, i, &wind_ms[m])).collect();
+                // Synoptic-scale low-level convergence (before local mountain
+                // blocking, lightly smoothed) lifts air without hill-slope speckle.
+                let conv_raw: Vec<f64> = (0..nc).map(|i| -grad.divergence(coarse, i, &wind_syn[m])).collect();
+                let conv = smooth(coarse, &smooth(coarse, &conv_raw));
                 let temp: Vec<f64> = (0..nc).map(|i| t_sl[m][i] as f64 - drop_c[i]).collect();
                 // Share of each cell's water that leaves through each of its
                 // edges in one pass: the wind's flux through the edge (taken at
@@ -957,7 +1072,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 let mix: Vec<f64> = (0..nc)
                     .map(|i| {
                         let (a, _) = belt_coord(&belts, coarse.lat[i].to_degrees(), line[m][i] as f64, cz);
-                        EDDY_MIX + STORM_MIX * gauss(a, belts.ferrel - 10.0, 15.0)
+                        EDDY_MIX + STORM_MIX * gauss(a, storm_center, 14.0)
                     })
                     .collect();
                 // Vapour travels a little above the surface, where even a light
@@ -966,7 +1081,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 let storms: Vec<f64> = (0..nc)
                     .map(|i| {
                         let (a, _) = belt_coord(&belts, coarse.lat[i].to_degrees(), line[m][i] as f64, cz);
-                        STORM_SPREAD * gauss(a, belts.ferrel - 14.0, 24.0)
+                        STORM_SPREAD * gauss(a, storm_center, 20.0)
                     })
                     .collect();
                 let mut out_w = vec![0.0f64; nbr_idx.len()];
@@ -978,7 +1093,10 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                         let i = nbr_idx[e] as usize;
                         // `edge_in[e]` points into j, so outflow is against it.
                         let flux = (-(carry[j] + carry[i]).dot(edge_in[e]) * 0.5).max(0.0) * step / coarse.area[j];
-                        let eddy = 0.5 * (mix[i] + mix[j]) * edge_mix[e] / coarse.area[j];
+                        // Damp horizontal eddy mixing across steep terrain steps so
+                        // sea-level humidity does not diffuse straight up coastal cliffs.
+                        let dh = (h_c[i] - h_c[j]).abs();
+                        let eddy = 0.5 * (mix[i] + mix[j]) * (-dh / 1200.0).exp() * edge_mix[e] / coarse.area[j];
                         out_w[e] = flux + eddy;
                         sent += out_w[e];
                     }
@@ -996,6 +1114,12 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                     .flat_map(|i| (nbr_off[i] as usize..nbr_off[i + 1] as usize).map(move |e| (i, e)))
                     .map(|(i, e)| out_w[nbr_rev[e] as usize] * coarse.area[nbr_idx[e] as usize] / coarse.area[i])
                     .collect();
+                // Total dimensionless air inflow and mass per cell per pass;
+                // mass > 1 represents horizontal wind convergence.
+                let in_sum: Vec<f64> = (0..nc)
+                    .map(|i| (nbr_off[i] as usize..nbr_off[i + 1] as usize).map(|e| in_w[e]).sum())
+                    .collect();
+                let mass: Vec<f64> = (0..nc).map(|i| stay[i] + in_sum[i]).collect();
                 // Per cell: how much vapour the air can hold, how readily it
                 // rains, how fast open water moistens it and how much of the
                 // rain the land gives back.
@@ -1007,6 +1131,8 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 let mut showery = vec![0.0; nc];
                 let mut lift = vec![0.0; nc];
                 let mut dissolve = vec![0.0; nc];
+                let mut cond_eff = vec![1.0; nc];
+                let mut sub_dry = vec![1.0; nc];
                 for i in 0..nc {
                     let mut up = 0.0;
                     let mut down = 0.0;
@@ -1014,8 +1140,8 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                     for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
                         let j = nbr_idx[e] as usize;
                         let w = out_w[nbr_rev[e] as usize];
-                        up += w * (h_c[i] - h_c[j]).max(0.0);
-                        down += w * (h_c[j] - h_c[i]).max(0.0);
+                        up += w * (h_oro[i] - h_oro[j]).max(0.0);
+                        down += w * (h_oro[j] - h_oro[i]).max(0.0);
                         wsum += w;
                     }
                     if wsum > 0.0 {
@@ -1025,6 +1151,9 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                     let lat = coarse.lat[i].to_degrees();
                     let line = line[m][i] as f64;
                     let (a, _) = belt_coord(&belts, lat, line, cz);
+                    let a_zonal = (lat - cz).abs();
+                    let wf = water_frac[i];
+                    let dry_v = dry.map_or(0.0, |d| d[m][i] as f64);
                     // Rising air along the convergence line and in the storm
                     // belts, sinking air under the subtropical highs.
                     // The rain band lies on the equator side of a line the
@@ -1032,60 +1161,97 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                     // far side of it caps the rain there).
                     let band = cz + RAIN_BAND_FOLLOW * (line - cz);
                     let mut lm = 1.0 + 1.2 * gauss(lat - band, 0.0, 7.0);
-                    lm *= 1.0 + 0.6 * (conv[i] / 3.0e-6).clamp(-0.7, 2.0 - water_frac[i]);
-                    // Under the subtropical highs air sinks where it flows toward
-                    // the equator (their east side: dry west coasts) and rises
-                    // where it flows poleward (their west side: wet east coasts).
-                    let (_, north) = coarse.pos[i].east_north();
+                    // Shallow heat lows over parched deserts converge near the
+                    // surface without making deep moist convection.
+                    let conv_eff = if conv[i] > 0.0 { conv[i] * (1.0 - 0.55 * dry_v * (1.0 - wf)) } else { conv[i] };
+                    lm *= 1.0 + 0.6 * (conv_eff / 3.0e-6).clamp(-0.7, 2.0 - wf);
+                    // Under the planetary Hadley descending branch, air sinks
+                    // where it flows equatorward or zonally (dry west coasts
+                    // and subtropical interiors) and rises where it flows
+                    // poleward on the west flank of oceanic highs (wet east
+                    // sides: humid subtropical fronts and warm conveyor belts).
+                    let (east, north) = coarse.pos[i].east_north();
+                    let u_east = wind[i].dot(east);
                     let poleward = wind[i].dot(north) * lat.signum();
-                    // Warm ground heats the air from below and breaks that
-                    // cap: there the air's own humidity decides (cool sea air
-                    // over hot land is far from saturated: dry summers on
-                    // west coasts; warm sea air is not: wet ones on east coasts).
-                    let uncapped = LAND_BREAKS_CAP * (1.0 - water_frac[i]) * smoothstep(12.0, 24.0, temp[i]);
-                    lm *= 1.0 - 0.8 * gauss(a, belts.hadley, 9.0) * (0.6 - 0.8 * poleward).clamp(0.1, 1.0) * (1.0 - uncapped);
+                    // Tropical monsoon westerlies (cross-equatorial air turning
+                    // east inside the Hadley belt), poleward subtropical flow,
+                    // and moist synoptic convergence in monsoon troughs break
+                    // the sinking-air cap; dry desert heat lows and divergent
+                    // west coasts stay strongly capped.
+                    let wa = 0.5 + 0.5 * (TAU * (m as f64 - 0.5) / 12.0).cos();
+                    let mar_m = wa * sea.mar_a[i] + (1.0 - wa) * sea.mar_b[i];
+                    let moist_gate = match dry {
+                        Some(_) => (1.0 - 0.85 * dry_v * (1.0 - wf)) * (0.35 + 0.65 * smoothstep(0.10, 0.50, mar_m)),
+                        None => smoothstep(0.20, 0.60, mar_m),
+                    };
+                    let moist_conv = if conv[i] > 0.0 && a_zonal < belts.hadley {
+                        (conv[i] / 2.5e-6).clamp(0.0, 1.0) * moist_gate
+                    } else {
+                        0.0
+                    };
+                    let monsoon_w = if a_zonal < belts.hadley {
+                        (u_east / 0.30).clamp(0.0, 1.0) * (1.0 - smoothstep(18.0, 28.0, a_zonal))
+                    } else {
+                        0.0
+                    };
+                    let sub_wind = (0.80 - 3.2 * poleward).clamp(0.0, 1.0) * (1.0 - monsoon_w.max(moist_conv));
+                    let sub_env = (1.15 * gauss(a_zonal, belts.hadley, 10.5)).min(1.0);
+                    let subside = 0.94 * sub_env * sub_wind;
+                    lm *= 1.0 - subside;
+                    lm *= 1.0 + 1.2 * gauss(a_zonal, belts.hadley, 12.0) * (poleward / 0.25).clamp(0.0, 1.0);
                     // The trade-wind belts between the rain band and the highs
-                    // are capped by sinking air too.
-                    if a < belts.hadley {
-                        lm *= 1.0 - TRADE_CAP * smoothstep(6.0, 16.0, (lat - band).abs()) * (1.0 - uncapped);
-                    }
-                    lm *= 1.0 + STORM_RAIN * gauss(a, belts.ferrel - 10.0, 15.0);
-                    // Cold air is wrung out by fronts however little it holds.
-                    lm *= 1.0 + 1.0 * smoothstep(-10.0, 10.0, -temp[i]);
+                    // are capped by sinking air too, except in monsoon westerlies,
+                    // poleward onshore flow, or moist monsoon convergence troughs.
+                    let tsub = if a_zonal < belts.hadley {
+                        let monsoon_flow = (poleward / 0.22).max(u_east / 0.30).max(moist_conv).clamp(0.0, 1.0);
+                        TRADE_CAP * smoothstep(6.0, 14.0, (lat - band).abs()) * (1.0 - monsoon_flow)
+                    } else {
+                        0.0
+                    };
+                    lm *= 1.0 - tsub;
+                    lm *= 1.0 + STORM_RAIN * gauss(a, storm_center, 14.0);
+                    // Cold air is wrung out by fronts, modestly so mid-latitude
+                    // interiors keep summer-peaking rain instead of dry summers.
+                    lm *= 1.0 + 0.35 * smoothstep(-15.0, 5.0, -temp[i]);
                     let cold_coast = (1.0 + 0.2 * cur[i].min(0.0) * mar[i]).clamp(0.15, 1.0);
                     // Air forced up a slope rains more readily; air coming down
-                    // the far side hardly at all.
-                    let slope = 1.0 + cp.orographic.max(0.0) * OROGRAPHIC_GAIN * (1.0 - (-up / OROGRAPHIC_LIFT_M).exp());
+                    // the far side hardly at all. Under strong subsidence or
+                    // cold coastal inversions, coastal hills form marine stratus
+                    // rather than torrential rain.
+                    let oro_stab = (1.0 - 0.85 * subside) * (0.30 + 0.70 * cold_coast) * (1.0 - 0.25 * dry_v * (1.0 - wf));
+                    let slope = 1.0 + cp.orographic.max(0.0) * OROGRAPHIC_GAIN * oro_stab * (1.0 - (-up / OROGRAPHIC_LIFT_M).exp());
                     // And part of the vapour it brings condenses on the climb
-                    // into cloud, which rains out over the slope and the crest.
-                    lift[i] = 1.0 - (-cp.orographic.max(0.0) * up / OROGRAPHIC_CLOUD_M).exp();
+                    // into cloud, gated by stability.
+                    lift[i] = oro_stab * (1.0 - (-cp.orographic.max(0.0) * up / OROGRAPHIC_CLOUD_M).exp());
                     dissolve[i] = 1.0 - (-down / CLOUD_DRY_M).exp();
                     let shadow = (-down / 900.0).exp();
-                    // Summer convection over warm land.
-                    let wf = water_frac[i];
-                    let convect = 1.0 + 0.8 * (1.0 - wf) * smoothstep(8.0, 28.0, temp[i]);
+                    // Summer convection over warm land, strongly capped by subtropical subsidence.
+                    let convect = 1.0 + 1.2 * (1.0 - wf) * (1.0 - subside).powi(2) * smoothstep(4.0, 24.0, temp[i]);
                     // Over parched ground the air is dry far up: showers
                     // evaporate before they land.
-                    let parched = 1.0 - DRY_GROUND_CAP * dry.map_or(0.0, |d| d[m][i] as f64) * (1.0 - wf);
+                    let parched = 1.0 - DRY_GROUND_CAP * dry_v * (1.0 - wf);
                     rain_rate[i] = (RAIN_RATE * lm * slope * shadow * cold_coast * convect * parched).clamp(0.0005, 0.5);
-                    // The air column's capacity follows the air above, not
-                    // the heat of dry ground below it.
-                    sat[i] = qsat(t_air[m][i] as f64 - drop_c[i]);
+                    // Saturation capacity mostly tracks free air, with a modest
+                    // dry-ground surface heating contribution.
+                    sat[i] = qsat(0.25 * t_sl[m][i] as f64 + 0.75 * t_air[m][i] as f64 - drop_c[i]);
                     // Warm air rains in showers at any humidity; cold air only
                     // from layered cloud, once it is nearly saturated.
                     showery[i] = smoothstep(2.0, 20.0, temp[i]);
+                    // Under parched desert heat lows, strong subsidence, or cold
+                    // coastal inversions, shallow excess vapour forms non-precipitating
+                    // coastal stratus/fog or mixes aloft instead of dumping rain.
+                    cond_eff[i] = (1.0 - 0.55 * dry_v * (1.0 - wf)) * (1.0 - subside).powi(2) * cold_coast.powi(3);
+                    // Subsiding subtropical highs entrain drier air from aloft.
+                    sub_dry[i] = 1.0 - 0.012 * subside * (1.0 - wf);
                     // Open water (ocean and lakes) moistens the air toward
-                    // saturation, faster in wind; land gives back part of its
-                    // rain, more where it is warm.
-                    evap[i] = wf * EVAPORATION_RATE * (0.4 + 0.6 * wind[i].len().min(2.0));
+                    // saturation, faster in wind; narrow enclosed seas moisten
+                    // only a shallower boundary layer than the open ocean.
+                    evap[i] = wf * (0.35 + 0.65 * open_sea[i]) * EVAPORATION_RATE * (0.4 + 0.6 * wind[i].len().min(2.0));
                     // Land gives back part of its rain, more where it is warm
-                    // (never all: the rest runs off, so rain inland needs
-                    // moisture from the sea). Half of it follows this month's
-                    // rain, half the soil's store from the rest of the year,
-                    // once that is known (not below freezing).
-                    // (0.35 of it in the cold, 0.9 from 16 °C up, less again
-                    // in great heat, where little grows to draw on the soil.)
-                    let back = (1.0 - wf) * (0.35 + 0.55 * smoothstep(0.0, 16.0, temp[i]) - 0.35 * smoothstep(24.0, 32.0, temp[i]));
+                    // and vegetated (never all: the rest runs off, so rain
+                    // inland needs moisture from the sea; parched deserts have
+                    // little vegetation to draw on the soil).
+                    let back = (1.0 - wf) * (0.45 + 0.50 * smoothstep(0.0, 16.0, temp[i]) - 0.50 * dry_v).max(0.1);
                     match soil_water {
                         Some(store) => {
                             recycle[i] = 0.5 * back;
@@ -1099,56 +1265,60 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 // its moisture does, and one that cannot dries out.
                 let mut w: Vec<f64> = sat.iter().map(|s| START_HUMIDITY * s).collect();
                 let mut cl = vec![0.0f64; nc];
+                let mut w_next = vec![0.0f64; nc];
+                let mut cl_next = vec![0.0f64; nc];
                 let mut acc = vec![0.0f64; nc];
                 let mut last_rain = vec![0.0f64; nc];
                 let mut wide_sum = vec![0.0f64; storm_grid.len()];
                 let warm = passes / 2;
                 for pass in 0..passes {
-                    let next: Vec<(f64, f64, f64)> = (0..nc)
-                        .map(|i| {
-                            let (mut inflow, mut inflow_cl) = (0.0, 0.0);
-                            for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
-                                let (j, wt) = (nbr_idx[e] as usize, in_w[e]);
-                                inflow += w[j] * wt;
-                                inflow_cl += cl[j] * wt;
-                            }
-                            let mut v = w[i] * stay[i] + inflow + recycle[i] * last_rain[i];
-                            // Only humid air that arrives up the slope is
-                            // lifted into cloud, so water lingering in a cell
-                            // is not wrung out again each pass.
-                            let cond = inflow * lift[i] * (v / sat[i]).min(1.0);
-                            v -= cond;
-                            v += evap[i] * (sat[i] - v).max(0.0) + soil[i].min(LAND_EVAPORATION_RATE * (sat[i] - v).max(0.0));
-                            let mut c = cl[i] * stay[i] + inflow_cl + cond;
-                            // Cloud that comes down a lee side evaporates into
-                            // air that has room for it.
-                            let back = dissolve[i] * c.min((sat[i] - v).max(0.0));
-                            c -= back;
-                            v += back;
-                            // Rain grows steeply with relative humidity: hot,
-                            // dry air keeps what little vapour it has.
-                            let humid = (v / sat[i]).min(1.2);
-                            let ready = showery[i] * humid * humid + (1.0 - showery[i]) * smoothstep(0.55, 1.0, humid);
-                            let r = (v * rain_rate[i] * ready).min(0.6 * v);
-                            v -= r;
-                            // Air that cools (climbing, or moving over colder
-                            // ground) condenses what it can no longer hold.
-                            if v > sat[i] {
-                                c += v - sat[i];
-                                v = sat[i];
-                            }
-                            let rc = c * CLOUD_FALLOUT;
-                            (v, c - rc, r + rc)
-                        })
-                        .collect();
-                    for (i, (v, c, r)) in next.into_iter().enumerate() {
-                        w[i] = v;
-                        cl[i] = c;
-                        last_rain[i] = r;
+                    for i in 0..nc {
+                        let (mut inflow, mut inflow_cl) = (0.0, 0.0);
+                        for e in nbr_off[i] as usize..nbr_off[i + 1] as usize {
+                            let (j, wt) = (nbr_idx[e] as usize, in_w[e]);
+                            inflow += w[j] * wt;
+                            inflow_cl += cl[j] * wt;
+                        }
+                        // Advect specific humidity and cloud as mixing ratios
+                        // (normalized by air mass `m`), preventing 2-D wind
+                        // divergence from deleting moisture on east coasts or
+                        // 2-D stagnation from piling dry desert air to saturation.
+                        let m = mass[i].max(1e-6);
+                        let mut v = ((w[i] * stay[i] + inflow) / m) * sub_dry[i] + recycle[i] * last_rain[i];
+                        // Only humid air that arrives up the slope condenses
+                        // into cloud (dry air lifted slightly stays unsaturated).
+                        let cond = ((inflow / m) * lift[i] * smoothstep(0.30, 0.95, v / sat[i])).min(v);
+                        v -= cond;
+                        v += evap[i] * (sat[i] - v).max(0.0) + soil[i].min(LAND_EVAPORATION_RATE * (sat[i] - v).max(0.0));
+                        let mut c = (cl[i] * stay[i] + inflow_cl) / m + cond;
+                        // Cloud that comes down a lee side evaporates into
+                        // air that has room for it.
+                        let back = dissolve[i] * c.min((sat[i] - v).max(0.0));
+                        c -= back;
+                        v += back;
+                        // Rain grows steeply with relative humidity: hot,
+                        // dry air keeps what little vapour it has.
+                        let humid = (v / sat[i]).min(1.2);
+                        let ready = showery[i] * humid * humid + (1.0 - showery[i]) * smoothstep(0.55, 1.0, humid);
+                        let r = (v * rain_rate[i] * ready).min(0.6 * v);
+                        v -= r;
+                        // Air that cools (climbing, or moving over colder
+                        // ground) condenses what it can no longer hold.
+                        if v > sat[i] {
+                            c += (v - sat[i]) * cond_eff[i];
+                            v = sat[i];
+                        }
+                        let rc = c * CLOUD_FALLOUT;
+                        let rain = r + rc;
+                        w_next[i] = v;
+                        cl_next[i] = c - rc;
+                        last_rain[i] = rain;
                         if pass >= warm {
-                            acc[i] += r;
+                            acc[i] += rain;
                         }
                     }
+                    std::mem::swap(&mut w, &mut w_next);
+                    std::mem::swap(&mut cl, &mut cl_next);
                     // Every few passes, storms even out the vapour of the
                     // storm belts over a wide area (the mean wind alone would
                     // leave the land downwind of mountains and far from the
@@ -1222,12 +1392,12 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     };
 
     let passes = cp.moisture_passes.max(10) as usize;
-    let (line0, ms0, unit0) = winds_for(&t0);
+    let (line0, _ms0, syn0, unit0) = winds_for(&t0, &t0);
     ctx.progress(0.38, "Finding the dry lands");
     // A quick rain estimate (four months, fewer passes) tells which lands are
     // dry; their heat then shapes the winds of the full solve.
     let rough_months = [0usize, 3, 6, 9];
-    let rough = moisture(&unit0, &ms0, &t0, &t0, &line0, &sea0, None, None, &rough_months, (passes / 2).max(10));
+    let rough = moisture(&unit0, &syn0, &t0, &t0, &line0, &sea0, None, None, &rough_months, (passes / 2).max(10));
     let dry0 = dryness(&calibrate(&rough, &rough_months, &t0).0, &t0);
     // Water in the soil each month: the rain of that month and the two
     // before it, in the solve's own units.
@@ -1247,15 +1417,15 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
     };
     ctx.progress(0.44, "Re-solving temperatures with the new winds");
     let sea = sea_air(&unit0);
-    let t1 = temperatures(&sea, Some(&unit0), Some(&dry0));
-    let t1_air = temperatures(&sea, Some(&unit0), None);
-    let (itcz_c, wind_ms, wind_m) = winds_for(&t1);
+    let t1 = temperatures(&sea, Some(&unit0), Some(&dry0), Some(&sheet_c));
+    let t1_air = temperatures(&sea, Some(&unit0), None, Some(&sheet_c));
+    let (itcz_c, wind_ms, wind_syn, wind_m) = winds_for(&t1, &t1_air);
     ctx.progress(0.5, "Carrying moisture");
     let all_months: Vec<usize> = (0..12).collect();
-    let precip_raw = moisture(&wind_m, &wind_ms, &t1, &t1_air, &itcz_c, &sea, Some(&soil_water), Some(&dry0), &all_months, passes);
+    let precip_raw = moisture(&wind_m, &wind_syn, &t1, &t1_air, &itcz_c, &sea, Some(&soil_water), Some(&dry0), &all_months, passes);
     ctx.progress(0.8, "Calibrating rainfall");
     let (precip_c, t_glob, target) = calibrate(&precip_raw, &all_months, &t1);
-    let t_sl_c = temperatures(&sea, Some(&wind_m), Some(&dryness(&precip_c, &t1)));
+    let t_sl_c = temperatures(&sea, Some(&wind_m), Some(&dryness(&precip_c, &t1)), Some(&sheet_c));
     let (mar, cur) = (&sea.mar, &sea.cur);
 
     // ---- Foehn: air that rains out on the way up comes down the far side warmer
@@ -1393,7 +1563,7 @@ const RAIN_RATE: f64 = 0.05;
 /// Share of a typical cell's water that a wind of `W_REF` carries on per pass.
 const TRANSPORT_STEP: f64 = 0.6;
 /// Speed at which vapour drifts along a wind too light to measure, as a share of `W_REF`.
-const CARRY_FLOOR: f64 = 0.8;
+const CARRY_FLOOR: f64 = 0.72;
 /// Relative humidity the moisture solve starts from.
 const START_HUMIDITY: f64 = 0.6;
 /// Share of a cell's water mixed into its neighbours per pass everywhere, and
@@ -1401,8 +1571,6 @@ const START_HUMIDITY: f64 = 0.6;
 /// moisture poleward and inland whatever the mean wind).
 const EDDY_MIX: f64 = 0.05;
 const STORM_MIX: f64 = 0.2;
-/// Share of the sinking-air caps that warm land removes.
-const LAND_BREAKS_CAP: f64 = 0.5;
 /// How much less readily the trade-wind belts rain than the same air would elsewhere.
 const TRADE_CAP: f64 = 0.5;
 /// How much more readily air rains in the middle of the storm belts.
@@ -1414,18 +1582,18 @@ const STORM_EVERY: usize = 3;
 const STORM_SPREAD: f64 = 1.0;
 const STORM_REACH: usize = 8;
 /// Share of its readiness to rain that air over parched ground loses.
-const DRY_GROUND_CAP: f64 = 0.4;
+const DRY_GROUND_CAP: f64 = 0.45;
 /// Share of the gap to saturation that open water closes per pass in a wind of
 /// `W_REF`, and the most that moist, warm land closes.
 const EVAPORATION_RATE: f64 = 0.2;
 const LAND_EVAPORATION_RATE: f64 = 0.06;
 /// Air forced up a slope rains up to (1 + GAIN) times as readily, at
 /// `orographic` = 1; 63% of that within LIFT metres of climb per cell.
-const OROGRAPHIC_GAIN: f64 = 1.6;
-const OROGRAPHIC_LIFT_M: f64 = 600.0;
+const OROGRAPHIC_GAIN: f64 = 1.65;
+const OROGRAPHIC_LIFT_M: f64 = 650.0;
 /// Climb (m) over which saturated air condenses 63% of the vapour it brings
 /// into cloud, at `orographic` = 1.
-const OROGRAPHIC_CLOUD_M: f64 = 800.0;
+const OROGRAPHIC_CLOUD_M: f64 = 850.0;
 /// Descent (m) over which sinking air evaporates 63% of the cloud it carries.
 const CLOUD_DRY_M: f64 = 1000.0;
 /// Share of cloud water that rains out per transport pass; the rest drifts on
@@ -1438,9 +1606,9 @@ const RAIN_MONTH_MAX_MM: f32 = 2500.0;
 /// World-grid orographic rain: a slope facing the wind gets up to (1 + GAIN)
 /// times its share, approached at slopes of a few × SLOPE (m of climb per km);
 /// a lee slope keeps e^(−descent/LEE) of it. Climate-cell totals are kept.
-const DOWNSCALE_GAIN: f64 = 3.0;
+const DOWNSCALE_GAIN: f64 = 2.1;
 const DOWNSCALE_SLOPE: f64 = 25.0;
-const DOWNSCALE_LEE: f64 = 40.0;
+const DOWNSCALE_LEE: f64 = 45.0;
 
 /// Redistribute each month's rain inside every climate cell by the world-grid
 /// terrain: more where the wind blows up a slope, less where it comes down.
@@ -1455,7 +1623,7 @@ fn orographic_downscale(fine: &Grid, t: &GridTransfer, nc: usize, elev: &[f32], 
     // Terrain gradient (m per km, as a tangent vector) of lightly smoothed
     // heights, so single-cell noise and grid directions do not streak the rain.
     let h0: Vec<f64> = elev.iter().map(|&e| e.max(0.0) as f64).collect();
-    let hs = smooth(fine, &smooth(fine, &h0));
+    let hs = smooth(fine, &h0);
     let grad: Vec<Vec3> = (0..n)
         .into_par_iter()
         .map(|i| {
@@ -1483,7 +1651,11 @@ fn orographic_downscale(fine: &Grid, t: &GridTransfer, nc: usize, elev: &[f32], 
                 // Slope along the wind (m/km); calm air barely lifts.
                 let s = w.dot(grad[i]) / speed;
                 let calm = (speed / 3.0).min(1.0);
-                calm * if s > 0.0 { (1.0 + DOWNSCALE_GAIN * strength * (1.0 - (-s / DOWNSCALE_SLOPE).exp())).ln() } else { s / DOWNSCALE_LEE }
+                calm * if s > 0.0 {
+                    (1.0 + DOWNSCALE_GAIN * strength * (1.0 - (-s / DOWNSCALE_SLOPE).exp())).ln()
+                } else {
+                    s * strength / DOWNSCALE_LEE
+                }
             })
             .collect();
         let lf = smooth(fine, &lf);
@@ -1562,7 +1734,7 @@ fn foehn_warming(g: &Grid, wind: &[Vec3], h: &[f64], precip: &[f32], strength: f
 
 /// Distance (km) over which air keeps the temperature it came with, at a wind
 /// of `W_REF`, over land and over sea (the sea reshapes the air above it faster).
-const CARRY_LAND_KM: f64 = 500.0;
+const CARRY_LAND_KM: f64 = 700.0;
 const CARRY_SEA_KM: f64 = 300.0;
 
 /// One month's temperatures with the wind's carrying: each cell settles between
