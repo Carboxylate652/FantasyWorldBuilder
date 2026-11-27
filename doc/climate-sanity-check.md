@@ -1,7 +1,7 @@
 # Climate Sanity Check & Earth Diagnostic Report
 
 **Snapshot:** commit `652e5d0` (`climate/earth-refine`, `MODEL_VERSION[Step::Climate] = 8`), compared against baseline `90c2429` (`origin/master-3sczxa`).
-**Test input:** NOAA ETOPO 2022 (`ETOPO_2022_v1_60s_N90W180_surface.tif`) converted to 16-bit equirectangular `Heightmap16` (`4096 × 2048`, `-11000..9000 m → 0..65535`), evaluated with `core/examples/earth_check.rs`.
+**Test input:** [core/examples/earth16.png](../core/examples/earth16.png) — NOAA ETOPO 2022 (`ETOPO_2022_v1_60s_N90W180_surface.tif`) converted to `Heightmap16` (`-11000..9000 m`), received as `1024 × 512` 8-bit RGBA (`487 KB`, decoded by `HeightEncoding::Heightmap16` at ~78 m vertical quantization), evaluated with `core/examples/earth_check.rs`.
 
 This document records the current climate state for sanity checking, diagnoses the remaining regional discrepancies against observed Earth normals, and outlines **general-physics** (planet-agnostic) design changes for the next tuning pass. No simulation code is modified here.
 
