@@ -1,20 +1,27 @@
 //! Longitude-dependent surface winds for the climate step.
 //!
-//! The zonal three-cell belts (climate::wind_at) are the base flow. On top:
+//! The three-cell belts (climate::belt_wind, around the convergence line of
+//! each longitude sector) are the base flow. On top:
 //!
 //! * Thermal pressure: a surface-pressure anomaly p′ = −α·(T − zonal mean T),
 //!   so cold continents in winter become highs and hot ones in summer lows.
+//!   Over land a cold anomaly counts half (COLD_HIGH): winter highs are shallow.
 //!   T is the sea-level temperature, with the land anomaly amplified by height:
 //!   an elevated surface heats or cools the air above it more than the free
 //!   atmosphere at that height, which makes plateaus heat lows in summer.
 //!   Raw surface pressure (P ~ −h) is deliberately *not* used: its slope-induced
 //!   gradients are ~100× larger than real ones and would blow down every slope.
+//!   Subtropical oceanic anticyclones sit near the Hadley edge (stronger in the
+//!   summer hemisphere), steering moist poleward flow onto eastern coasts and
+//!   dry equatorward flow onto western coasts.
 //!   The anomaly is smoothed to synoptic scale (~1,000 km).
 //! * Friction–Coriolis balance: r·v + f·k̂×v = G with G = −∇p′/ρ, solved in
 //!   closed form. Near the equator (f → 0) air flows down the gradient into
 //!   lows (monsoon inflow); at mid-latitudes it runs along the isobars.
 //! * Mountain blocking: part of any upslope component is turned along the
 //!   contours, so air flows around ranges and is channelled through gaps.
+//!   Both the blocked surface wind and the pre-blocking synoptic wind are
+//!   returned (the latter drives large-scale convergence without hill-slope noise).
 //!
 //! Winds are in m/s internally; the moisture model uses them divided by W_REF.
 
@@ -30,7 +37,9 @@ const ALPHA_HPA_PER_C: f64 = 1.0;
 /// Boundary-layer friction (1/s), about a one-day spin-down.
 const FRICTION: f64 = 2.5e-5;
 const RHO_AIR: f64 = 1.2;
-const MAX_THERMAL_MS: f64 = 20.0;
+const MAX_THERMAL_MS: f64 = 13.0;
+/// Pressure effect of a cold anomaly relative to a warm one.
+const COLD_HIGH: f64 = 0.5;
 
 /// Least-squares gradients in each cell's local east/north frame.
 pub struct Gradient {
@@ -42,10 +51,12 @@ pub struct Gradient {
     inv: Vec<[f64; 4]>,
 }
 
+type GradientRow = (Vec3, Vec3, Vec<(f64, f64)>, [f64; 4]);
+
 impl Gradient {
     pub fn new(g: &Grid, radius_m: f64) -> Gradient {
         let n = g.len();
-        let rows: Vec<(Vec3, Vec3, Vec<(f64, f64)>, [f64; 4])> = (0..n)
+        let rows: Vec<GradientRow> = (0..n)
             .into_par_iter()
             .map(|i| {
                 let p = g.pos[i];
@@ -109,7 +120,9 @@ impl Gradient {
     }
 }
 
-/// Monthly winds (m/s, tangent 3-D vectors) on the climate grid.
+/// Monthly winds (m/s, tangent 3-D vectors) on the climate grid: returns
+/// `(surface, synoptic)` where `synoptic` is the wind before local mountain
+/// blocking (used for large-scale convergence without hill-slope noise).
 #[allow(clippy::too_many_arguments)]
 pub fn dynamic_winds(
     p: &WorldParams,
@@ -119,10 +132,11 @@ pub fn dynamic_winds(
     t_sl: &[Vec<f32>],
     h: &[f64],
     water_frac: &[f64],
-) -> Vec<Vec<Vec3>> {
+) -> (Vec<Vec<Vec3>>, Vec<Vec<Vec3>>) {
     let cp = &p.climate;
     let n = g.len();
     let omega = std::f64::consts::TAU / (p.planet.day_length_h.max(0.5) * 3600.0);
+    let belts = super::climate::wind_belts(p);
 
     // Synoptic smoothing on a coarse sub-grid of the same hierarchy (~450 km cells on Earth).
     let smooth_level = g.level.saturating_sub(3).clamp(2, 4);
@@ -145,10 +159,11 @@ pub fn dynamic_winds(
     const ZB: usize = 60;
     let band = |lat: f64| (((lat.sin() + 1.0) / 2.0 * ZB as f64) as usize).min(ZB - 1);
 
-    (0..12)
+    let pairs: Vec<(Vec<Vec3>, Vec<Vec3>)> = (0..12)
         .into_par_iter()
         .map(|m| {
             let t = &t_sl[m];
+            let cz = super::climate::itcz_lat(p, m);
             let mut zs = [0.0f64; ZB];
             let mut zw = [0.0f64; ZB];
             for i in 0..n {
@@ -157,12 +172,23 @@ pub fn dynamic_winds(
                 zw[b] += g.area[i];
             }
             let zmean: Vec<f64> = (0..ZB).map(|b| if zw[b] > 0.0 { zs[b] / zw[b] } else { 0.0 }).collect();
-            // Thermal pressure anomaly; elevated land amplifies its own anomaly.
+            // Thermal pressure anomaly plus subtropical oceanic anticyclones:
+            // Hadley subsidence concentrates over the subtropical oceans
+            // (strongest in the summer hemisphere), spinning clockwise (NH) /
+            // counterclockwise (SH) to bring moist poleward flow onto eastern
+            // coasts and dry equatorward flow onto western coasts.
             let pres: Vec<f32> = (0..n)
                 .map(|i| {
                     let a = t[i] as f64 - zmean[band(g.lat[i])];
                     let lift = 1.0 + 0.35 * (h[i] / 1000.0) * (1.0 - water_frac[i]);
-                    (-ALPHA_HPA_PER_C * a * lift) as f32
+                    // Cold continental highs are shallow; cool summer oceans are not damped.
+                    let cold = if a < 0.0 { 1.0 - (1.0 - COLD_HIGH) * (1.0 - water_frac[i]) } else { 1.0 };
+                    let lat_deg = g.lat[i].to_degrees();
+                    let hemi_summer = (lat_deg.signum() * cz / 8.0).clamp(-1.0, 1.0);
+                    let high_lat = (belts.hadley + 0.5 * cz * lat_deg.signum()).clamp(15.0, 45.0);
+                    let dlat = (lat_deg.abs() - high_lat) / 10.0;
+                    let oc_high = 4.5 * water_frac[i] * (-dlat * dlat).exp() * (0.65 + 0.55 * hemi_summer);
+                    (-ALPHA_HPA_PER_C * a * lift * cold + oc_high) as f32
                 })
                 .collect();
             // Smooth to synoptic scale.
@@ -190,35 +216,39 @@ pub fn dynamic_winds(
             }
             let (gx3, gy3, gz3) = (xfer.up(&gx3), xfer.up(&gy3), xfer.up(&gz3));
 
-            (0..n)
-                .map(|i| {
-                    let (e, nn) = grad.basis(i);
-                    let gv = Vec3::new(gx3[i] as f64, gy3[i] as f64, gz3[i] as f64);
-                    let (gx, gy) = (gv.dot(e), gv.dot(nn));
-                    let f = 2.0 * omega * g.lat[i].sin();
-                    let den = FRICTION * FRICTION + f * f;
-                    let mut ve = (FRICTION * gx + f * gy) / den;
-                    let mut vn = (FRICTION * gy - f * gx) / den;
-                    let sp = (ve * ve + vn * vn).sqrt();
-                    if sp > MAX_THERMAL_MS {
-                        ve *= MAX_THERMAL_MS / sp;
-                        vn *= MAX_THERMAL_MS / sp;
-                    }
-                    let mut w = base[m][i] * W_REF + (e * ve + nn * vn) * cp.thermal_wind;
+            let mut surf = Vec::with_capacity(n);
+            let mut syn = Vec::with_capacity(n);
+            for i in 0..n {
+                let (e, nn) = grad.basis(i);
+                let gv = Vec3::new(gx3[i] as f64, gy3[i] as f64, gz3[i] as f64);
+                let (gx, gy) = (gv.dot(e), gv.dot(nn));
+                let f = 2.0 * omega * g.lat[i].sin();
+                let den = FRICTION * FRICTION + f * f;
+                let mut ve = (FRICTION * gx + f * gy) / den;
+                let mut vn = (FRICTION * gy - f * gx) / den;
+                let sp = (ve * ve + vn * vn).sqrt();
+                if sp > MAX_THERMAL_MS {
+                    ve *= MAX_THERMAL_MS / sp;
+                    vn *= MAX_THERMAL_MS / sp;
+                }
+                let w_syn = base[m][i] * W_REF + (e * ve + nn * vn) * cp.thermal_wind;
+                syn.push(w_syn);
 
-                    // Mountain blocking: turn part of the upslope component along the contours.
-                    let (up, s_km) = slope[i];
-                    let wn = w.dot(up);
-                    if wn > 0.0 && cp.mountain_blocking > 0.0 {
-                        let b = cp.mountain_blocking.clamp(0.0, 1.0) * (1.0 - (-s_km / 12.0).exp());
-                        let along = w - up * wn;
-                        let al = along.len();
-                        let dir = if al > 1e-9 { along * (1.0 / al) } else { g.pos[i].cross(up).normalized() };
-                        w = along + up * (wn * (1.0 - b)) + dir * (wn * b);
-                    }
-                    w
-                })
-                .collect()
+                // Mountain blocking: turn part of the upslope component along the contours.
+                let mut w = w_syn;
+                let (up, s_km) = slope[i];
+                let wn = w.dot(up);
+                if wn > 0.0 && cp.mountain_blocking > 0.0 {
+                    let b = cp.mountain_blocking.clamp(0.0, 1.0) * (1.0 - (-s_km / 12.0).exp());
+                    let along = w - up * wn;
+                    let al = along.len();
+                    let dir = if al > 1e-9 { along * (1.0 / al) } else { g.pos[i].cross(up).normalized() };
+                    w = along + up * (wn * (1.0 - b)) + dir * (wn * b);
+                }
+                surf.push(w);
+            }
+            (surf, syn)
         })
-        .collect()
+        .collect();
+    pairs.into_iter().unzip()
 }

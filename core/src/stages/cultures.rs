@@ -424,7 +424,7 @@ impl CultureSim {
         let max_bands = (cp.max_bands as usize).max(capacity.iter().filter(|&&k| k > 0.0).count()).max(10);
         let split_pop = 2.0 * k_total / (0.8 * max_bands as f64);
         let nt = cp.traits.clamp(1, 64) as usize;
-        let nv = cp.trait_values.clamp(2, 255) as u32;
+        let nv = cp.trait_values.clamp(2, 255);
         let ticks = cp.ticks.max(1);
 
         // ------------------------------------------------------------ initial bands
@@ -439,7 +439,7 @@ impl CultureSim {
             let here = prov_field.get(cell).and_then(|id| index.get(id)).copied().filter(|&p| capacity[p] > 0.0);
             let p = here.or_else(|| {
                 let v = Vec3::from_lat_lon_deg(pt[0], pt[1]);
-                (0..np).filter(|&q| capacity[q] > 0.0).min_by(|&a, &b| v.angle_to(provs[a].center).partial_cmp(&v.angle_to(provs[b].center)).unwrap())
+                (0..np).filter(|&q| capacity[q] > 0.0).min_by(|&a, &b| v.angle_to(provs[a].center).total_cmp(&v.angle_to(provs[b].center)))
             });
             let Some(p) = p else { continue };
             let tr: Vec<u8> = (0..nt).map(|_| rng.below(nv as usize) as u8).collect();
@@ -454,10 +454,10 @@ impl CultureSim {
                 .filter(|&p| capacity[p] > 0.0 && provs[p].kind == kind::LAND)
                 .map(|p| (-hash_unit(seed, stream::CULTURES, p as u64).max(1e-12).ln() / capacity[p], p))
                 .collect();
-            order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+            order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             for &(_, p) in order.iter().take(cp.initial_bands.max(1) as usize) {
                 let tr: Vec<u8> = (0..nt).map(|_| rng.below(nv as usize) as u8).collect();
-                bands.push(p as u32, (0.5 * split_pop).min(0.5 * capacity[p]), &tr, 0);
+                bands.push(p as u32, (0.5 * split_pop).min(0.5 * capacity[p]).max(1.0), &tr, 0);
                 let ll = deg(provs[p].center);
                 founders.push(serde_json::json!({ "lat": ll[0], "lon": ll[1], "province": provs[p].id, "bands": 1, "pinned": false }));
             }
@@ -560,18 +560,19 @@ impl CultureSim {
     /// Edge cost in an era (None = not passable yet).
     fn edge_cost(provs: &[Prov], cp: &CultureParams, era: usize, a: usize, e: &Border) -> Option<f64> {
         let bw = cp.barrier_weight.max(0.0);
+        let sc = cp.sea_cost.max(0.0);
         let b = &provs[e.to as usize];
         let sea_ok = |p: &Prov| era >= 3 || (era >= 2 && p.band == 0);
         match e.ty {
             border::LAND => Some(e.km * (1.0 + bw * e.barrier)),
             border::IMPASSABLE => Some(3.0 * e.km * (1.0 + bw * e.barrier)),
             border::LAKE => Some(1.5 * e.km),
-            border::STRAIT => (era >= 1).then(|| 2.0 * e.km),
+            border::STRAIT => (era >= 1).then_some(2.0 * e.km),
             border::COAST => {
                 let sea = if provs[a].kind == kind::SEA { &provs[a] } else { b };
-                sea_ok(sea).then(|| cp.sea_cost * e.km)
+                sea_ok(sea).then_some(sc * e.km)
             }
-            _ => (sea_ok(&provs[a]) && sea_ok(b)).then(|| cp.sea_cost * e.km),
+            _ => (sea_ok(&provs[a]) && sea_ok(b)).then_some(sc * e.km),
         }
     }
 
@@ -687,7 +688,12 @@ impl CultureSim {
         // Temporary attraction also changes how many people a province holds.
         for p in 0..np {
             if self.attr_extra[p] != 0.0 {
-                self.cap_mult[p] *= pull_of((self.attr[p] + self.attr_extra[p]).clamp(-1.0, 1.0)) / self.pull[p].max(1e-9);
+                let ratio = if self.pull[p] > 1e-6 {
+                    pull_of((self.attr[p] + self.attr_extra[p]).clamp(-1.0, 1.0)) / self.pull[p]
+                } else {
+                    pull_of(self.attr_extra[p].clamp(-1.0, 1.0))
+                };
+                self.cap_mult[p] *= ratio;
             }
         }
     }
@@ -751,7 +757,7 @@ impl CultureSim {
                 }
                 self.capacity[p] = k;
             }
-        } else if t % 20 == 0 {
+        } else if t.is_multiple_of(20) {
             progress(0.02 + 0.9 * frac as f32, &format!("Generation {t} of {ticks}: {} bands, {} cultures", self.bands.alive.iter().filter(|&&a| a).count(), self.cultures.iter().filter(|c| c.ended.is_none()).count()));
         }
         let cp = &self.cp;
@@ -762,7 +768,13 @@ impl CultureSim {
         let (attr_extra, iso) = (&self.attr_extra, &self.iso);
         let steered = !self.effects.is_empty();
         // Capacity this tick (directives may scale it).
-        let capacity: Vec<f64> = if steered { self.capacity.iter().zip(&self.cap_mult).map(|(k, m)| k * m).collect() } else { self.capacity.clone() };
+        let cap_scaled: Vec<f64>;
+        let capacity: &[f64] = if steered {
+            cap_scaled = self.capacity.iter().zip(&self.cap_mult).map(|(k, m)| k * m).collect();
+            &cap_scaled
+        } else {
+            &self.capacity
+        };
         let (split_pop, max_bands) = (self.split_pop, self.max_bands);
         let scale = cp.contact_scale_km.max(1.0);
         let n0 = bands.len();
@@ -784,11 +796,18 @@ impl CultureSim {
                 bands.pop[b] *= 0.5;
             } else {
                 match self.growth_mult.get(&bands.culture[b]) {
-                    Some(&f) => bands.pop[b] += cp.growth_rate * f * bands.pop[b] * (1.0 - pp[p] / (k * f)),
-                    None => bands.pop[b] += cp.growth_rate * bands.pop[b] * (1.0 - pp[p] / k),
+                    Some(&f) if f > 1e-9 => {
+                        let rate = (cp.growth_rate * f * (1.0 - pp[p] / (k * f))).max(-0.5);
+                        bands.pop[b] *= 1.0 + rate;
+                    }
+                    Some(_) => bands.pop[b] *= 0.5,
+                    None => {
+                        let rate = (cp.growth_rate * (1.0 - pp[p] / k)).max(-0.5);
+                        bands.pop[b] *= 1.0 + rate;
+                    }
                 }
             }
-            if bands.pop[b] < 1.0 {
+            if !bands.pop[b].is_finite() || bands.pop[b] < 1.0 {
                 bands.alive[b] = false;
             }
         }
@@ -888,6 +907,7 @@ impl CultureSim {
         // Per source province: cumulative contact weights over its neighbourhood.
         let mut cum: Vec<Option<Vec<f64>>> = (0..np).map(|_| None).collect();
         let key = |a: usize, b: usize| ((a.min(b) as u64) << 32) | a.max(b) as u64;
+        let mut diff_buf = [0usize; 64];
         for b in 0..n1 {
             if !bands.alive[b] {
                 continue;
@@ -921,7 +941,7 @@ impl CultureSim {
                 if list.is_empty() {
                     continue;
                 }
-                let mut r2 = rng.f64() * list.iter().map(|&c| bands.pop[c as usize]).sum::<f64>();
+                let mut r2 = rng.f64() * pnow[q].max(0.0);
                 let mut c = list[list.len() - 1] as usize;
                 for &x in list {
                     r2 -= bands.pop[x as usize];
@@ -950,9 +970,17 @@ impl CultureSim {
                 if sim < 1.0 {
                     // The smaller band is likelier to take a trait from the larger.
                     let (from, to) = if rng.f64() < bands.pop[c] / (bands.pop[b] + bands.pop[c]) { (c, b) } else { (b, c) };
-                    let diff: Vec<usize> = (0..nt).filter(|&i| bands.traits[from * nt + i] != bands.traits[to * nt + i]).collect();
-                    let i = diff[rng.below(diff.len())];
-                    bands.traits[to * nt + i] = bands.traits[from * nt + i];
+                    let mut nd = 0usize;
+                    for i in 0..nt {
+                        if bands.traits[from * nt + i] != bands.traits[to * nt + i] {
+                            diff_buf[nd] = i;
+                            nd += 1;
+                        }
+                    }
+                    if nd > 0 {
+                        let i = diff_buf[rng.below(nd)];
+                        bands.traits[to * nt + i] = bands.traits[from * nt + i];
+                    }
                 }
             }
         }
@@ -1013,7 +1041,7 @@ impl CultureSim {
         });
 
         // 6. culture check
-        if (t + 1) % cp.check_every.max(1) == 0 || t + 1 == ticks {
+        if (t + 1).is_multiple_of(cp.check_every.max(1)) || t + 1 == ticks {
             self.checks += 1;
             let (comm, graph) = detect(bands, &self.contact, &in_prov, nt, cp);
             let tick = t + 1;
@@ -1179,7 +1207,12 @@ impl CultureSim {
             *prov_cult[bands.prov[b] as usize].entry(bands.culture[b]).or_insert(0.0) += bands.pop[b];
         }
         let majority = |m: &BTreeMap<u32, f64>| m.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap().then(b.0.cmp(a.0))).map(|(&c, _)| c);
-        let prov_major: Vec<u32> = prov_cult.iter().map(|m| majority(m).unwrap_or(0)).collect();
+        let mut prov_major: Vec<u32> = prov_cult.iter().map(|m| majority(m).unwrap_or(0)).collect();
+        for &(p, c) in &edited.lock_provs {
+            if prov_major[p] == 0 {
+                prov_major[p] = c;
+            }
+        }
         let world_pop: f64 = cult_pop.iter().sum();
 
         // Names: cultures, groups, then provinces (majority culture's language, or
@@ -1457,7 +1490,8 @@ fn resolve_edits(ctx: &Ctx, provs: &[Prov], index: &HashMap<u32, usize>, prov_fi
                     let gap = pts[0].angle_to(*pts.last().unwrap());
                     e.closed = pts.len() >= 4 && gap < 0.2 * length;
                     if e.closed {
-                        e.provs = (0..provs.len()).filter(|&p| provs[p].kind <= kind::WASTELAND && inside_loop(&pts, provs[p].center)).collect();
+                        let loop_proj = LoopProj::new(&pts);
+                        e.provs = (0..provs.len()).filter(|&p| provs[p].kind <= kind::WASTELAND && loop_proj.contains(provs[p].center)).collect();
                     } else {
                         e.side = provs.iter().map(|pr| side_of_line(&pts, pr.center)).collect();
                     }
@@ -1475,34 +1509,51 @@ fn resolve_edits(ctx: &Ctx, provs: &[Prov], index: &HashMap<u32, usize>, prov_fi
         .collect()
 }
 
-/// Whether `p` lies inside the closed loop `pts` (gnomonic projection about
-/// the loop's centre, then an even-odd test).
-fn inside_loop(pts: &[Vec3], p: Vec3) -> bool {
-    let mut c = Vec3::ZERO;
-    for &q in pts {
-        c += q;
-    }
-    let c = c.normalized();
-    if p.dot(c) <= 0.0 {
-        return false;
-    }
-    let (e1, e2) = c.east_north();
-    let proj = |q: Vec3| -> (f64, f64) {
-        let d = q.dot(c).max(1e-9);
-        let v = q * (1.0 / d);
-        (v.dot(e1), v.dot(e2))
-    };
-    let (x, y) = proj(p);
-    let poly: Vec<(f64, f64)> = pts.iter().map(|&q| proj(q)).collect();
-    let mut inside = false;
-    for i in 0..poly.len() {
-        let (xa, ya) = poly[i];
-        let (xb, yb) = poly[(i + 1) % poly.len()];
-        if (ya > y) != (yb > y) && x < xa + (y - ya) / (yb - ya) * (xb - xa) {
-            inside = !inside;
+/// Precomputed gnomonic projection of a closed loop for even-odd containment tests.
+struct LoopProj {
+    c: Vec3,
+    e1: Vec3,
+    e2: Vec3,
+    poly: Vec<(f64, f64)>,
+}
+
+impl LoopProj {
+    fn new(pts: &[Vec3]) -> Self {
+        let mut c = Vec3::ZERO;
+        for &q in pts {
+            c += q;
         }
+        let c = c.normalized();
+        let (e1, e2) = c.east_north();
+        let poly = pts
+            .iter()
+            .map(|&q| {
+                let d = q.dot(c).max(1e-9);
+                let v = q * (1.0 / d);
+                (v.dot(e1), v.dot(e2))
+            })
+            .collect();
+        Self { c, e1, e2, poly }
     }
-    inside
+
+    fn contains(&self, p: Vec3) -> bool {
+        if self.poly.len() < 3 || p.dot(self.c) <= 0.0 {
+            return false;
+        }
+        let d = p.dot(self.c).max(1e-9);
+        let v = p * (1.0 / d);
+        let (x, y) = (v.dot(self.e1), v.dot(self.e2));
+        let mut inside = false;
+        let n = self.poly.len();
+        for i in 0..n {
+            let (xa, ya) = self.poly[i];
+            let (xb, yb) = self.poly[(i + 1) % n];
+            if (ya > y) != (yb > y) && x < xa + (y - ya) / (yb - ya) * (xb - xa) {
+                inside = !inside;
+            }
+        }
+        inside
+    }
 }
 
 /// Which side of the line `pts` the point `p` is on, judged against the
@@ -1529,6 +1580,9 @@ struct EditOutcome {
     /// Cultures to give a new name from their language (with a seed).
     new_names: Vec<(u32, u64)>,
     locked: HashSet<u32>,
+    /// Provinces held by a locked culture (province index, culture), so a
+    /// locked province that nobody lives in any more still belongs to it.
+    lock_provs: Vec<(usize, u32)>,
     unapplied: Vec<serde_json::Value>,
 }
 
@@ -1539,7 +1593,7 @@ impl CultureSim {
         for &b in bands {
             *m.entry(self.bands.culture[b]).or_insert(0.0) += self.bands.pop[b];
         }
-        m.into_iter().filter(|x| x.0 > 0).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then(b.0.cmp(&a.0))).map_or(0, |x| x.0)
+        m.into_iter().filter(|x| x.0 > 0).max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0))).map_or(0, |x| x.0)
     }
 
     fn culture_people(&self) -> Vec<f64> {
@@ -1649,10 +1703,12 @@ impl CultureSim {
                     let own: Vec<usize> = (0..np).filter(|&p| !protected[p] && a > 0 && self.majority_of(&prov_bands[p]) == a).collect();
                     let part: Vec<usize> = if e.closed {
                         own.iter().copied().filter(|p| e.provs.binary_search(p).is_ok()).collect()
-                    } else {
+                    } else if e.side.len() == np {
                         let people = |sd: i8| own.iter().filter(|&&p| e.side[p] == sd).map(|&p| prov_bands[p].iter().map(|&k| self.bands.pop[k]).sum::<f64>()).sum::<f64>();
                         let small = if people(1) <= people(-1) { 1 } else { -1 };
                         own.iter().copied().filter(|&p| e.side[p] == small).collect()
+                    } else {
+                        Vec::new()
                     };
                     if a == 0 {
                         fail(&mut out, "no people there");
@@ -1799,6 +1855,7 @@ impl CultureSim {
                         out.names.insert(m, s.name.trim().to_string());
                     }
                     out.locked.insert(m);
+                    out.lock_provs.extend(snap.iter().map(|&p| (p, m)));
                 }
                 _ => {}
             }
@@ -1904,11 +1961,13 @@ fn group_name(culture: &str) -> String {
     format!("{base}ic")
 }
 
+type BandGraph = (Vec<u32>, Vec<(u32, u32, f64)>);
+
 /// Band graph (faded contact × similarity², plus a weak link between bands
 /// sharing a province) and its communities; tiny communities join the one
 /// they are most tied to. Returns the community of each band (NONE if dead)
 /// and the graph (node → band, edges between nodes).
-fn detect(bands: &Bands, contact: &HashMap<u64, f32>, in_prov: &[Vec<u32>], nt: usize, cp: &CultureParams) -> (Vec<u32>, (Vec<u32>, Vec<(u32, u32, f64)>)) {
+fn detect(bands: &Bands, contact: &HashMap<u64, f32>, in_prov: &[Vec<u32>], nt: usize, cp: &CultureParams) -> (Vec<u32>, BandGraph) {
     let nb = bands.len();
     let mut node = vec![NONE; nb];
     let mut node_band = Vec::new();
@@ -1964,7 +2023,7 @@ fn detect(bands: &Bands, contact: &HashMap<u64, f32>, in_prov: &[Vec<u32>], nt: 
         x
     }
     let mut order: Vec<usize> = (0..nc).collect();
-    order.sort_by(|&a, &b| cpop[a].partial_cmp(&cpop[b]).unwrap().then(a.cmp(&b)));
+    order.sort_by(|&a, &b| cpop[a].total_cmp(&cpop[b]).then(a.cmp(&b)));
     for c in order {
         if root(&mut parent, c as u32) != c as u32 || cpop[c] >= min_pop {
             continue;
@@ -1979,7 +2038,7 @@ fn detect(bands: &Bands, contact: &HashMap<u64, f32>, in_prov: &[Vec<u32>], nt: 
             }
         }
         for (&r, &v) in &agg {
-            if best.map_or(true, |(_, bv)| v > bv) {
+            if best.is_none_or(|(_, bv)| v > bv) {
                 best = Some((r, v));
             }
         }
@@ -2037,7 +2096,7 @@ fn update_cultures(
     let world: f64 = cpop.iter().sum();
     let persist = cp.persistence.max(1);
     let home_region = |c: usize| -> (u16, u32) {
-        let p = prov_pop[c].iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap().then(b.0.cmp(a.0))).map_or(0, |(&p, _)| p as usize);
+        let p = prov_pop[c].iter().max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(a.0))).map_or(0, |(&p, _)| p as usize);
         (provs[p].region, provs[p].continent)
     };
     let new_culture = |cultures: &mut Vec<Culture>, parent: u32, c: usize, events: &mut Vec<serde_json::Value>| -> u32 {
@@ -2056,14 +2115,14 @@ fn update_cultures(
     let mut mapped = vec![0u32; nc];
     let before = cultures.len() as u32;
     if cultures.is_empty() {
-        for c in 0..nc {
-            mapped[c] = new_culture(cultures, 0, c, events);
+        for (c, m) in mapped.iter_mut().enumerate() {
+            *m = new_culture(cultures, 0, c, events);
         }
     } else {
         // Leading culture of each community, and which community keeps it.
         let lead: Vec<(u32, f64)> = overlap
             .iter()
-            .map(|m| m.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap().then(b.0.cmp(a.0))).map_or((0, 0.0), |(&k, &v)| (k, v)))
+            .map(|m| m.iter().max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(a.0))).map_or((0, 0.0), |(&k, &v)| (k, v)))
             .collect();
         let mut keeper: BTreeMap<u32, (f64, usize)> = BTreeMap::new();
         for (c, &(l, v)) in lead.iter().enumerate() {
@@ -2092,7 +2151,7 @@ fn update_cultures(
                 }
                 let inter = intersect(&cand.members, &members[c]);
                 let jac = inter as f64 / (cand.members.len() + members[c].len() - inter).max(1) as f64;
-                if jac >= 0.5 && best.map_or(true, |(_, bj)| jac > bj) {
+                if jac >= 0.5 && best.is_none_or(|(_, bj)| jac > bj) {
                     best = Some((j, jac));
                 }
             }

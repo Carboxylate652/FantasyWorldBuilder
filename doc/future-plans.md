@@ -54,7 +54,7 @@ The biggest gap against the proposal.
 ## 7. Planet
 
 - A time-stepped plate-drift mode (supercontinent break-up), as an optional history before Stage 1's relief.
-- Climate refinements for continental interiors (more moisture recycling, seasonal lows) and a reference comparison against real Earth data in a test.
+- Climate refinements where the Earth check (`core/examples/earth_check.rs`) still fails: low-level jets along large ranges (the Andes, East Africa; a first attempt that turned blocked flow along ranges did not reach the Chaco or Somalia), stationary waves that make continental east sides colder in winter than west sides, and Arabia's summer heat (air there is still too humid to heat like a desert).
 
 ## 8. Distribution
 

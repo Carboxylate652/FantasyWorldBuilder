@@ -80,6 +80,9 @@ impl Noise {
 
     /// Fractal Brownian motion, normalised to roughly [-1, 1].
     pub fn fbm(&self, p: Vec3, freq: f64, octaves: u32) -> f64 {
+        if octaves == 0 {
+            return 0.0;
+        }
         let mut sum = 0.0;
         let mut amp = 1.0;
         let mut norm = 0.0;
@@ -97,6 +100,9 @@ impl Noise {
 
     /// Ridged multifractal in [0, 1]: sharp crests, good for mountain detail.
     pub fn ridged(&self, p: Vec3, freq: f64, octaves: u32) -> f64 {
+        if octaves == 0 {
+            return 0.0;
+        }
         let mut sum = 0.0;
         let mut amp = 1.0;
         let mut norm = 0.0;

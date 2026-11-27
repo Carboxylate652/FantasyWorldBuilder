@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+Hardening (from the audit pass merged with the climate refinements).
+
+- **Safer updates and server:** downloads only from this project's GitHub releases, with size and SHA-256 checks and a byte cap; release pages are validated before opening. The local CLI server, the AI guide and the desktop shell were hardened, and CLI flags no longer swallow the argument after them.
+- **Fixes:** simulation, validation and export bugs in the core; state races and layer bugs in the app; faster WebGL rendering. CI now runs clippy with warnings as errors, the CLI tests and a smoke test.
+
+A more realistic climate, tuned on Earth's real terrain.
+
+- **Earth check:** the climate step now has a yardstick. `core/examples/earth_check.rs` runs it on Earth's terrain and scores the result against climate normals of 133 places, observed zonal means and Earth's Köppen shares (`doc/development.md`, *Tuning the climate*; the heightmap is built from public NASA images, not shipped). Against 0.3.1 on Earth: January error 5.4 → 3.9 °C, July 6.3 → 2.9 °C, annual rain off by a typical factor of 2.8 → 2.1, places in the right Köppen group 47% → 63%, and land shares from A 11 / B 46 / C 13 / D 7 / E 24 to A 19 / B 26 / C 22 / D 20 / E 12 (Earth: about 19 / 30 / 14 / 24 / 13).
+- **Temperature:** warmer, more even tropics and a steeper drop across the mid-latitudes. The sea freezes (pack ice makes winters continental), while ice sheets last only on land whose summer stays below freezing, so a polar continent grows an ice cap that builds its own height, and a polar ocean does not. Broad plateaus are warmer than lone peaks of the same height (*Plateau lapse rate*), high-latitude interiors are colder over the year (*Continental cooling*), deserts have hotter summers and colder winters (*Dry-ground heat ×*), and maritime air is followed for each half of the year, so a coast with offshore winter wind has a cold winter and a mild summer.
+- **Monsoons:** the tropical rain belt follows the heat in each longitude sector: far poleward over hot summer land, near the equator over open ocean (*Monsoon ×*). Trade winds that cross the equator to reach it turn into wet westerlies and bring a summer rainy season. Westerlies shift with the seasons, and cold winter highs are weaker.
+- **Rain:** far fewer deserts. Humidity is carried along the wind as flows between cells, which conserves water and removes the grid pattern from the rain. Land returns a share of its rain to the air, so rain reaches deep into wet continents but deserts stay dry. Rain comes from relative humidity (showers in warm rising air, steady rain from saturated air), storms in the westerlies spread moisture widely, and the subtropical highs keep west coasts dry and leave east coasts wetter.
+- **Orographic rain** is gentler: a windward slope now gets about 1.3× the rain of flat ground (1.5–1.9× in 0.3.1) and about 1.5× the rain of the lee slope. Raise *Orographic rain ×* for stronger contrasts.
+- Four new settings in the Climate card: *Plateau lapse rate*, *Continental cooling*, *Dry-ground heat ×*, *Monsoon ×*.
+- The climate step takes about twice as long (about 6 s at climate level 7; Hydrology solves it once more for lakes). Climate and everything after it change for the same seed.
+- **Refined against NOAA ETOPO 2022 terrain** (real land and sea floor):
+  - **Ocean currents from the wind and the basins:** cold water only where the wind drives surface water off an open coast (upwelling: Peru, Benguela, California, the Canaries, and monsoon coasts in season), warm currents along the west side of each basin and across the subpolar ocean, a cold current down subpolar west coasts. Monsoon seas are no longer cold: Mumbai, Hanoi and the Bay of Bengal get their monsoon rain back, and the North Atlantic is mild again.
+  - **Seasons:** land and sea lag the sun by about a month and two months; deep high-latitude interiors form winter inversions (Yakutsk in January is now about right); sea ice is set month by month.
+  - **Subtropics:** oceanic highs make west coasts dry and east coasts wet; air sinking over cold upwelled water dries coastal deserts; continental air beyond a monsoon trough sinks; deserts have hotter summers and colder winters.
+  - **Moisture:** vapour and cloud are carried as mixing ratios; large-scale convergence comes from the winds before mountain blocking (no speckle on hill slopes).
+  - **Mediterranean and Arabia:** seas joined to the ocean only through narrow straits (the Mediterranean, Black Sea, Red Sea, Persian Gulf, Baltic, Caspian, Hudson Bay) moisten the air much less; land showers are a warm-season process (no winter convection in a mild 16 °C winter); cloud under a subsidence inversion hardly rains; air beyond a monsoon trough sinks and forms no cloud, unless moist monsoon air streams on poleward (the Meiyu front). Evaporation demand climbs steeply in heat, so a hot month with a little rain is still dry ground. Rome 1417 → 958 mm, Athens 1094 → 709, Algiers 839 → 588, Riyadh 351 → 142 (its July error −12 → −8 °C).
+  - **Culture locks:** a locked province that nobody lives in after a re-run still belongs to the locked culture.
+  - Earth check on ETOPO at levels 7 and 8: Köppen group 68% of 133 places (exact class 37% and 32%), annual rain off by a typical factor of 1.9, January error 4.4 °C and July 3.2 °C, land shares A 14 / B 36 / C 19 / D 18 / E 13. `doc/climate-sanity-check.md` records the diagnosis and the per-station results.
+- Still off on Earth: Delhi and the Ganges plain, the Chaco and the Horn of Africa (the model has no low-level jets along the Andes or East Africa), Riyadh's summer (8 °C too cool) and the Sahel's rainy season, and the interiors of North America and Kazakhstan in winter (too mild: the westerlies that keep Europe mild reach them too).
 
 - **Latitude lines:** the globe and the flat map mark the equator (solid) and 30° and 60° north and south (dashed) for reference, under rivers, borders and the other overlays. The *Latitudes* toggle in the overlay row turns them off (remembered).
 

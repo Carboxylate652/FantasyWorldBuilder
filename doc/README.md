@@ -15,6 +15,7 @@ The top-level [`README.md`](../README.md) is the quick start (download, build, r
 | [export-import.md](export-import.md) | The export package file by file, the province clean-up, and re-importing edited files |
 | [parameters.md](parameters.md) | Every parameter with its default (generated from the source by `tools/gen_parameters.py`) |
 | [development.md](development.md) | Building, testing, CI and releases; how to add a step, a parameter, a directive or a map layer |
+| [climate-sanity-check.md](climate-sanity-check.md) | The climate on Earth's real terrain: diagnosis of the regional errors and the results of the fixes, station by station |
 | [status.md](status.md) | What is implemented against the proposal's roadmap, what is not, known limitations |
 | [future-plans.md](future-plans.md) | Suggested next steps, in rough priority order |
 | [history.md](history.md) | Development history: what each round of work added |

@@ -156,14 +156,13 @@ fn components<T: PartialEq + Copy>(w: usize, h: usize, v: &[T]) -> (Vec<u32>, Ve
     let mut sizes: Vec<u32> = Vec::new();
     let mut comp = vec![0u32; w * h];
     for y in 0..h {
-        for i in row_start[y]..row_start[y + 1] {
+        for (i, &(x0, x1)) in runs.iter().enumerate().take(row_start[y + 1]).skip(row_start[y]) {
             let r = root(&mut parent, i as u32) as usize;
             if id_of_root[r] == u32::MAX {
                 id_of_root[r] = sizes.len() as u32;
                 sizes.push(0);
             }
             let id = id_of_root[r];
-            let (x0, x1) = runs[i];
             sizes[id as usize] += x1 - x0;
             comp[y * w + x0 as usize..y * w + x1 as usize].fill(id);
         }
@@ -191,10 +190,15 @@ pub fn clean(r: &mut ProvRaster, anchors: &[Anchor], scale: &RowScale, kind_of: 
         let cls = &r.cls;
         let (comp, sizes) = components(w, h, cls);
         let mut backed = vec![false; sizes.len()];
-        let mut row = vec![0usize; sizes.len()];
+        let mut row_sum = vec![0u64; sizes.len()];
         for p in 0..w * h {
-            row[comp[p] as usize] = p / w;
+            row_sum[comp[p] as usize] += (p / w) as u64;
         }
+        let row: Vec<usize> = row_sum
+            .iter()
+            .zip(&sizes)
+            .map(|(&s, &sz)| if sz > 0 { (s / sz as u64) as usize } else { 0 })
+            .collect();
         // Largest raster piece holding an anchor of each grid body, and of each province.
         let mut best: BTreeMap<(u8, u32), u32> = BTreeMap::new();
         let mut best_prov: BTreeMap<u32, u32> = BTreeMap::new();
@@ -416,12 +420,25 @@ pub fn clean(r: &mut ProvRaster, anchors: &[Anchor], scale: &RowScale, kind_of: 
                     for s in srcs {
                         if (r.cls[q[s]] == r.cls[q[t]]) == same_surface && r.ids[q[s]] != r.ids[q[t]] {
                             let (old, old_cls) = (r.ids[q[t]], r.cls[q[t]]);
+                            let px_x = q[t] % w;
+                            let px_y = q[t] / w;
+                            let adj_blocks = [
+                                (px_x, px_y),
+                                ((px_x + w - 1) % w, px_y),
+                                (px_x, px_y.saturating_sub(1)),
+                                ((px_x + w - 1) % w, px_y.saturating_sub(1)),
+                            ];
+                            let before: [bool; 4] = adj_blocks.map(|(bx, by)| by + 1 < h && x_at(r, bx, by).is_some());
                             r.ids[q[t]] = r.ids[q[s]];
                             r.cls[q[t]] = r.cls[q[s]];
-                            // Keep the move only if it clears the crossing and the old
-                            // province still has a pixel next to this one (never erase a province).
+                            // Keep the move only if it clears the crossing, introduces no new crossing
+                            // in an adjacent 2x2 block, and the old province keeps a neighbour here.
                             let still = neighbours(w, h, q[t]).any(|n| r.ids[n] == old);
-                            if still && x_at(r, x, y).is_none() {
+                            let no_new = adj_blocks
+                                .iter()
+                                .zip(before)
+                                .all(|(&(bx, by), had)| had || by + 1 >= h || x_at(r, bx, by).is_none());
+                            if still && no_new && x_at(r, x, y).is_none() {
                                 fixed = true;
                                 break 'try_;
                             }

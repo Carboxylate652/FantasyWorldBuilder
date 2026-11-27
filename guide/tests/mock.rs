@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use worldcore::api::{handle, ProgressState, Reply, Session};
 use worldcore::params::WorldParams;
 
-fn serve(answers: Vec<Value>) -> (String, std::thread::JoinHandle<Vec<(String, Vec<(String, String)>, Value)>>) {
+type SeenRequest = (String, Vec<(String, String)>, Value);
+
+fn serve(answers: Vec<Value>) -> (String, std::thread::JoinHandle<Vec<SeenRequest>>) {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let addr = format!("http://{}", server.server_addr().to_ip().unwrap());
     let h = std::thread::spawn(move || {
@@ -42,10 +44,9 @@ fn guided_turns_with_both_formats() {
         Ok(_) => Value::Null,
         Err(e) => panic!("{cmd}: {e}"),
     };
-    let st = api("sim_start", json!({ "stage": "nations" }));
+    api("sim_start", json!({ "stage": "nations" }));
     let st2 = api("sim_step", json!({ "years": 100 }));
     let n1 = st2["sim"]["nations"][0]["id"].as_u64().expect("a nation");
-    let _ = st;
 
     // Anthropic format: a tool call, a bad tool call, a pace and a chronicle line.
     let (addr, h) = serve(vec![json!({
@@ -65,6 +66,12 @@ fn guided_turns_with_both_formats() {
         assert!(!r.to_string().contains(key) || key.is_empty(), "key never echoed");
     };
     cfg("anthropic", &addr, "claude-opus-5-5", "sk-ant-test-123456");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join("guide.json")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "guide.json must be owner-read/write only");
+    }
     let t = fwm_guide::handle(&session, &progress, "guide_turn", &json!({ "goal": "One great empire in the north", "years": 10 })).unwrap().unwrap();
     let seen = h.join().unwrap();
     let (url, headers, body) = &seen[0];
@@ -92,26 +99,68 @@ fn guided_turns_with_both_formats() {
         assert!(d.iter().all(|x| x.by == "guide" && x.stage == "nations" && x.at == 1610));
     }
 
-    // OpenAI-compatible format (Vercel AI Gateway style), arguments as a JSON string.
+    // OpenAI-compatible format (Vercel AI Gateway style), arguments as a JSON string,
+    // plus set_pace clamping and verifying set_pace does not consume max_actions budget.
     let (addr, h) = serve(vec![json!({
         "model": "anthropic/claude-opus-5-5",
         "choices": [{ "finish_reason": "tool_calls", "message": { "role": "assistant", "content": "A war begins.", "tool_calls": [
-            { "id": "c1", "type": "function", "function": { "name": "stability", "arguments": format!("{{\"nation\": {n1}, \"factor\": 0.3, \"years\": 50}}") } }
+            { "id": "c0", "type": "function", "function": { "name": "set_pace", "arguments": "{\"years\": 99999}" } },
+            { "id": "c1", "type": "function", "function": { "name": "stability", "arguments": format!("{{\"nation\": {n1}, \"factor\": 0.3, \"years\": 50}}") } },
+            { "id": "c2", "type": "function", "function": { "name": "aggression", "arguments": format!("{{\"nation\": {n1}, \"factor\": 2.0, \"years\": 50}}") } }
         ] } }],
         "usage": { "prompt_tokens": 900, "completion_tokens": 40 }
     })]);
     cfg("openai", &format!("{addr}/v1"), "anthropic/claude-opus-5-5", "vck-test-abcdef");
-    let t = fwm_guide::handle(&session, &progress, "guide_turn", &json!({ "goal": "Then it breaks apart", "years": 30 })).unwrap().unwrap();
+    let t = fwm_guide::handle(&session, &progress, "guide_turn", &json!({ "goal": "Then it breaks apart", "years": 30, "max_actions": 1 })).unwrap().unwrap();
     let seen = h.join().unwrap();
     let (url, headers, body) = &seen[0];
     assert_eq!(url, "/v1/chat/completions");
     assert_eq!(headers.iter().find(|h| h.0 == "authorization").map(|h| h.1.as_str()), Some("Bearer vck-test-abcdef"));
+    assert_eq!(body["max_tokens"], 16000);
     assert_eq!(body["messages"][0]["role"], "system");
     assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(t["next_years"], 1000.0, "set_pace clamped to 5..=1000");
+    assert_eq!(t["actions"].as_array().unwrap().len(), 1, "set_pace does not consume max_actions budget, second directive capped");
+    assert_eq!(t["actions"][0]["action"], "stability");
     assert_eq!(t["actions"][0]["ok"], true);
     assert_eq!(t["input_tokens"], 900);
+
+    // Advance to the end so sim["done"] == true, then verify guide_turn returns "status".
+    let done_turn = fwm_guide::handle(&session, &progress, "guide_turn", &json!({ "goal": "Finish history", "years": 2000 })).unwrap().unwrap();
+    assert_eq!(done_turn["done"], true);
+    assert!(done_turn.get("status").is_some_and(|s| s["sim"]["done"] == true), "done turn must include status: {done_turn}");
+
     // The steered run commits and replays.
     let st = api("sim_commit", json!({}));
     assert_eq!(st["replayed"], false);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn openai_200_error_and_malformed_tool_args_fail() {
+    let (addr, h) = serve(vec![
+        json!({ "error": { "message": "upstream overloaded" } }),
+        json!({
+            "model": "gpt-test",
+            "choices": [{ "finish_reason": "tool_calls", "message": { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "c1", "type": "function", "function": { "name": "war", "arguments": "{not valid json" } }
+            ] } }]
+        }),
+    ]);
+    let cfg = fwm_guide::GuideConfig {
+        provider: "openai".into(),
+        base_url: format!("{addr}/v1"),
+        model: "gpt-test".into(),
+        effort: String::new(),
+        api_key: "sk-test".into(),
+    };
+    let err1 = fwm_guide::complete(&cfg, "sys", "usr", &[], 256).unwrap_err();
+    assert!(err1.contains("upstream overloaded"), "got: {err1}");
+
+    let err2 = fwm_guide::complete(&cfg, "sys", "usr", &[], 256).unwrap_err();
+    assert!(err2.contains("malformed tool arguments"), "got: {err2}");
+
+    let seen = h.join().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].2["max_tokens"], 256);
 }

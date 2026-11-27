@@ -103,6 +103,14 @@ pub fn run(ctx: &Ctx) -> StepOutput {
         let c = farthest_candidate(g, &ocean_cells, &seeds, &mut rng, 400);
         seeds.push(Seed { cell: c, major: true, continental: false, rate: rng.range(0.95, 1.35), ocean_reach: 1.0 });
     }
+    if seeds.is_empty() && n > 0 {
+        let all: Vec<u32> = (0..n as u32).collect();
+        let want = (tp.major_plates as usize).max(1);
+        for _ in 0..want {
+            let c = farthest_candidate(g, &all, &seeds, &mut rng, 400);
+            seeds.push(Seed { cell: c, major: true, continental: land[c] == 1, rate: rng.range(0.85, 1.15), ocean_reach: 1.0 });
+        }
+    }
 
     // Weighted random flood fill.
     ctx.progress(0.25, "Growing plates");
@@ -250,8 +258,9 @@ pub fn run(ctx: &Ctx) -> StepOutput {
     for (k, (ax, w, cnt)) in arrow_sum.into_iter().enumerate() {
         if cnt > 0 && ax.len() > 1e-12 {
             let axis = ax.normalized();
+            let mean_w = w / cnt as f64;
             plates[k].pole = [axis.x, axis.y, axis.z];
-            plates[k].omega_deg_myr = ax.len().max(w / cnt as f64 * 0.5);
+            plates[k].omega_deg_myr = (ax.len() / cnt as f64).max(mean_w * 0.5);
             plates[k].user_motion = true;
         }
     }

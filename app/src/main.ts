@@ -135,12 +135,51 @@ async function boot() {
 
 // ------------------------------------------------------------------ status & data
 
+let cacheGen = 0;
+let layerGen = 0;
+let overlayGen = 0;
+let reliefUploadedGen = -1;
+
+function isBusy(): boolean {
+  return S.busy || SIM.busy || SIM.guide.running;
+}
+
+function resetHover() {
+  clearTimeout(hoverTimer);
+  hoverCell = -1;
+  lastProbe = null;
+  const el = document.querySelector('#hover');
+  if (el) {
+    el.textContent = 'Hover the planet for cell details.';
+    el.removeAttribute('title');
+  }
+}
+
+async function ensureReliefUploaded() {
+  if (S.exag <= 0 || reliefUploadedGen === cacheGen || !S.status) return;
+  const gen = cacheGen;
+  const elev = await getField('elevation');
+  if (!elev || gen !== cacheGen) return;
+  const R0 = S.status.params.planet.radius_km * 1000;
+  R.setRelief(Float32Array.from(elev.values as Float32Array, (e) => e / R0));
+  reliefUploadedGen = gen;
+}
+
+async function updateReliefExag(withOverlays: boolean) {
+  R.setExag(S.exag);
+  if (S.exag > 0) await ensureReliefUploaded();
+  if (withOverlays) await refreshOverlays();
+}
+
 async function refreshStatus(st?: Status) {
   S.status = st ?? (await api.json<Status>('status'));
   if (!S.grid || S.grid.n !== S.status.grid.cells) {
     S.grid = new Grid(await api.bin('grid'));
     R.setGrid(S.grid);
     S.cache.clear();
+    cacheGen++;
+    reliefUploadedGen = -1;
+    resetHover();
   }
   renderTopbar();
   renderSteps();
@@ -150,6 +189,8 @@ async function refreshStatus(st?: Status) {
 }
 
 function invalidate() {
+  cacheGen++;
+  reliefUploadedGen = -1;
   S.cache.clear();
   S.shade = null;
   S.political = null;
@@ -159,64 +200,77 @@ async function political(): Promise<Political | null> {
   if (S.political) return S.political;
   const st = S.status?.steps;
   if (!st || (st[STAGE2_START + 1]?.state === 'empty' && st[STAGE2_START + 2]?.state === 'empty')) return null;
+  const gen = cacheGen;
   try {
     const t = await api.json('political');
     if (!t) return null;
     const idx = (a: any[] | undefined) => new Map<number, any>((a ?? []).map((x) => [x.id, x]));
-    S.political = {
+    const pol: Political = {
       states: t.states ?? [], regions: t.regions ?? [], continents: t.continents ?? [], provinces: t.provinces ?? [], adjacencies: t.adjacencies ?? [],
       cultures: t.cultures ?? [], groups: t.culture_groups ?? [], events: t.culture_events ?? [],
       nations: t.nations ?? [], nationEvents: t.nation_events ?? [], railways: t.railways ?? [], cityPins: t.city_pins ?? [],
       byState: idx(t.states), byRegion: idx(t.regions), byProv: idx(t.provinces), byCont: idx(t.continents),
       byCulture: idx(t.cultures), byGroup: idx(t.culture_groups), byNation: idx(t.nations),
     };
+    if (gen === cacheGen) S.political = pol;
+    return pol;
   } catch {
     return null;
   }
-  return S.political;
 }
 
 async function getField(name: string, month: number | null = null): Promise<api.FieldData | null> {
   const key = `${name}|${month}`;
-  if (!S.cache.has(key)) S.cache.set(key, await api.field(name, month ?? undefined));
-  return S.cache.get(key)!;
+  if (S.cache.has(key)) return S.cache.get(key)!;
+  const gen = cacheGen;
+  const data = await api.field(name, month ?? undefined);
+  if (gen === cacheGen) S.cache.set(key, data);
+  return data;
 }
 
 async function refreshLayer() {
-  const g = S.grid!;
-  const def = LAYERS.find((l) => l.id === S.layer)!;
+  const g = S.grid;
+  if (!g || !S.status) return;
+  const gen = ++layerGen;
+  const layer = S.layer;
+  const month = S.month;
+  const def = LAYERS.find((l) => l.id === layer)!;
   const f: Record<string, ArrayLike<number>> = {};
   let stale = false;
   let missing = false;
   for (const name of def.fields) {
     // The drawing outline belongs to worlds grown from a drawing only.
-    if (name === 'drawing' && S.status!.edits.sketch_base !== 'drawing') continue;
-    const d = await getField(name, def.monthly && ['temp', 'precip', 'wind_u', 'wind_v'].includes(name) ? S.month : null);
+    if (name === 'drawing' && S.status.edits.sketch_base !== 'drawing') continue;
+    const d = await getField(name, def.monthly && ['temp', 'precip', 'wind_u', 'wind_v'].includes(name) ? month : null);
+    if (gen !== layerGen || S.grid !== g) return;
     if (d) {
       f[name] = d.values;
       stale ||= d.stale;
     } else if (name === def.fields[0]) missing = true;
   }
-  if (!S.shade && f['elevation']) S.shade = hillshade(g, f['elevation'], S.status!.params.planet.radius_km);
+  if (!S.shade && f['elevation']) S.shade = hillshade(g, f['elevation'], S.status.params.planet.radius_km);
+  let colors: Uint8Array;
+  let legend: Legend;
   if (missing) {
     // Fall back to whatever relief exists so the globe is never blank.
     const e = await getField('elevation');
-    const fb = e ? colorize('elevation', g, { elevation: e.values }, S.shade, null) : colorize('sketch', g, { sketch: (await getField('sketch'))?.values }, null, null);
-    S.colors = fb.rgba;
-    S.legend = { title: `${def.label}: run the ${stepOfLayer(S.layer)} step to see this layer` };
+    const sk = e ? null : await getField('sketch');
+    if (gen !== layerGen || S.grid !== g) return;
+    const fb = e ? colorize('elevation', g, { elevation: e.values }, S.shade, null) : colorize('sketch', g, { sketch: sk?.values }, null, null);
+    colors = fb.rgba;
+    legend = { title: `${def.label}: run the ${stepOfLayer(layer)} step to see this layer` };
   } else {
-    const r = colorize(S.layer, g, f, S.shade, S.month);
-    S.colors = r.rgba;
-    S.legend = r.legend;
+    const r = colorize(layer, g, f, S.shade, month);
+    colors = r.rgba;
+    legend = r.legend;
   }
+  S.colors = colors;
+  S.legend = legend;
   R.smooth = def.smooth;
   R.setColors(S.colors);
-  const elev = await getField('elevation');
-  if (elev && S.exag > 0) {
-    const R0 = S.status!.params.planet.radius_km * 1000;
-    R.setRelief(Float32Array.from(elev.values as Float32Array, (e) => e / R0));
-  }
-  R.exag = S.exag;
+  await ensureReliefUploaded();
+  if (gen !== layerGen || S.grid !== g) return;
+  R.setExag(S.exag);
   renderLegend(stale);
   await refreshOverlays();
 }
@@ -224,7 +278,7 @@ async function refreshLayer() {
 function stepOfLayer(id: LayerId): string {
   const m: Record<string, string> = {
     sketch: 'Continent sketch', plates: 'Plates', crust: 'Plates', boundaries: 'Tectonic relief', elevation: 'Tectonic relief',
-    stress: 'Tectonic relief', old_relief: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', continentality: 'Climate',
+    stress: 'Tectonic relief', old_relief: 'Tectonic relief', ocean_age: 'Tectonic relief', temperature: 'Climate', precipitation: 'Climate', wind: 'Climate', continentality: 'Climate',
     currents: 'Climate', foehn: 'Climate', discharge: 'Hydrology', erosion: 'Hydrology', koppen: 'Biomes', terrain: 'Biomes',
     habitability: 'Habitability & barriers', barrier: 'Habitability & barriers', springs: 'Habitability & barriers', states: 'States', regions: 'States', provinces: 'Provinces',
     resources: 'Provinces',
@@ -232,7 +286,7 @@ function stepOfLayer(id: LayerId): string {
     nations: 'Nations & history', railways: 'Nations & history', transport: 'Nations & history', eras: 'Nations & history',
     institutions: 'Nations & history', realms: 'Nations & history', city_growth: 'Nations & history',
   };
-  return m[id];
+  return m[id] ?? id;
 }
 
 // ------------------------------------------------------------------ overlays
@@ -320,18 +374,26 @@ function drawLatitudes(elev: ArrayLike<number> | undefined) {
 }
 
 async function refreshOverlays() {
-  const g = S.grid!;
+  const g = S.grid;
+  if (!g || !S.status) return;
+  const gen = ++overlayGen;
+  const stale = () => gen !== overlayGen || S.grid !== g;
   const exagLift = (i: number, elev: ArrayLike<number> | undefined) =>
     elev && S.exag > 0 ? (S.exag * Math.max(0, elev[i])) / (S.status!.params.planet.radius_km * 1000) : 0;
 
-  drawLatitudes(S.overlays.latitudes && S.exag > 0 ? (await getField('elevation'))?.values : undefined);
+  const latElev = S.overlays.latitudes && S.exag > 0 ? (await getField('elevation'))?.values : undefined;
+  if (stale()) return;
+  drawLatitudes(latElev);
 
   // Rivers run along cell edges, from cell corner to cell corner (where the
   // borders are drawn), as ribbons whose on-screen width follows the real
   // bankfull width (log scale: ~0.8 px for a 60 m stream, ~5 px for a 2 km great river).
   const width = S.overlays.rivers ? await getField('river_seg_width') : null;
+  if (stale()) return;
   const to = width ? await getField('river_to') : null;
+  if (stale()) return;
   const elevF = width || S.layer === 'barrier' ? (await getField('elevation'))?.values : undefined;
+  if (stale()) return;
   if (width && to && !width.stale) {
     const wv = width.values, tv = to.values;
     const segs: number[] = [];
@@ -345,7 +407,9 @@ async function refreshOverlays() {
 
   // On the barrier layer: border rivers (red) and backbone rivers (green) on their edges.
   const roles = S.layer === 'barrier' ? await getField('river_seg_role') : null;
+  if (stale()) return;
   const rto = roles ? await getField('river_to') : null;
+  if (stale()) return;
   if (roles && rto && !roles.stale) {
     const rv = roles.values, tv = rto.values;
     const segs: number[] = [];
@@ -356,18 +420,27 @@ async function refreshOverlays() {
 
   // Winds (sampled on the first 2,562 cells = the level-4 sub-grid)
   if (S.overlays.wind) {
-    const w = new Float32Array(await api.bin('wind', { month: S.month ?? 0 }));
-    const L = new Lines();
-    const m = Math.min(g.n, 2562);
-    // Winds arrive in m/s; ~8 m/s draws about as long as a grid-4 cell spacing.
-    for (let i = 0; i < m; i++) arrow(L, g.p(i), w[i * 2] * 0.0045, w[i * 2 + 1] * 0.0045, [1, 1, 1, 0.75]);
-    const [a, b] = L.sets();
-    R.setOverlay('wind', a, b);
+    try {
+      const limit = Math.min(g.n, 2562);
+      const w = new Float32Array(await api.bin('wind', { month: S.month ?? 0, limit }));
+      if (stale()) return;
+      const L = new Lines();
+      const m = Math.min(limit, Math.floor(w.length / 2));
+      // Winds arrive in m/s; ~8 m/s draws about as long as a grid-4 cell spacing.
+      for (let i = 0; i < m; i++) arrow(L, g.p(i), w[i * 2] * 0.0045, w[i * 2 + 1] * 0.0045, [1, 1, 1, 0.75]);
+      const [a, b] = L.sets();
+      R.setOverlay('wind', a, b);
+    } catch {
+      if (stale()) return;
+      R.setOverlay('wind', null, null);
+    }
   } else R.setOverlay('wind', null, null);
 
   // Plate motion
   const ve = S.overlays.motion ? await getField('vel_e') : null;
+  if (stale()) return;
   const vn = ve ? await getField('vel_n') : null;
+  if (stale()) return;
   if (ve && vn) {
     const L = new Lines();
     const m = Math.min(g.n, 2562);
@@ -384,15 +457,18 @@ async function refreshOverlays() {
   const cultural = lay === 'cultures' || lay === 'culture_groups';
   const national = lay === 'nations' || lay === 'railways' || lay === 'transport' || lay === 'eras' || lay === 'institutions';
   const stf = lay === 'realms' ? await getField('realm') : national ? await getField('owner') : cultural ? await getField('culture_group') : political || S.overlays.borders ? await getField('state') : null;
+  if (stale()) return;
   if (stf && !stf.stale) {
     const L = new Lines();
     // Culture layers: culture borders as hairlines, group borders as ribbons.
     if (lay === 'cultures') {
       const cu = await getField('culture');
+      if (stale()) return;
       if (cu) for (const [a, b] of cellEdges(g, cu.values, (x, y) => x > 0 && y > 0)) L.seg(a, b, [0.05, 0.05, 0.05, 0.45], 0.0024);
     }
     if (lay === 'states' || lay === 'provinces') {
       const pv = await getField('province'), pk = await getField('province_kind');
+      if (stale()) return;
       if (pv && pk) {
         for (const [a, b, i, j] of cellEdges(g, pv.values, () => true)) {
           const sea = pk.values[i] >= 2 && pk.values[j] >= 2;
@@ -401,11 +477,13 @@ async function refreshOverlays() {
       }
     }
     const main = lay === 'regions' ? await getField('region') : stf;
+    if (stale()) return;
     if (lay === 'regions') for (const [a, b] of cellEdges(g, stf.values, (x, y) => x > 0 && y > 0)) L.seg(a, b, [0.05, 0.05, 0.05, 0.35], 0.0024);
     const [la, lb] = L.sets();
     R.setOverlay('borders', la, lb);
     const segs = main ? cellEdges(g, main.values, (x, y) => x > 0 && y > 0) : [];
     const elev = (await getField('elevation'))?.values;
+    if (stale()) return;
     const mk = (): RibbonSet => ({ a: new Float32Array(segs.length * 3), b: new Float32Array(segs.length * 3), width: new Float32Array(segs.length).fill(1.7), color: new Float32Array(segs.length * 4), count: segs.length });
     const gl3 = mk(), fl = mk();
     segs.forEach(([a, b, i, j], k) => {
@@ -425,13 +503,13 @@ async function refreshOverlays() {
   }
 
   drawEditMarkers();
-  await drawTransportIcons();
+  await drawTransportIcons(gen);
 }
 
 /** Icons over the map in the Transport and Railways layers (stations,
  *  junctions, ports, airports at their province's centre), and the candidate
  *  birthplaces of an institution waiting for the user's choice (gold stars). */
-async function drawTransportIcons() {
+async function drawTransportIcons(gen: number) {
   const lay = S.layer;
   const P = S.political;
   const L = new Lines();
@@ -463,6 +541,7 @@ async function drawTransportIcons() {
   };
   if ((lay === 'transport' || lay === 'railways') && P) {
     const [pf, rw, pt, ap] = await Promise.all(['province', 'railway', 'port', 'airport'].map((x) => getField(x)));
+    if (gen !== overlayGen) return;
     if (pf && !pf.stale) {
       const flags = new Map<number, number>();
       for (let i = 0; i < pf.values.length; i++) {
@@ -497,6 +576,7 @@ async function drawTransportIcons() {
     }
     any = true;
   }
+  if (gen !== overlayGen) return;
   if (any) {
     const [a, b] = L.sets();
     R.setOverlay('transport', a, b);
@@ -676,14 +756,18 @@ function drawBrush(p: Vec3 | null, trail: Vec3[] = []) {
 
 // ------------------------------------------------------------------ running
 
-async function run(to: string) {
-  if (S.busy) return;
+async function run(to: string): Promise<boolean> {
+  if (isBusy()) return false;
   S.busy = true;
+  renderTopbar();
   renderSteps();
   const prog = $('#progress');
+  let stopped = false;
   const poll = setInterval(async () => {
+    if (stopped) return;
     try {
       const p = await api.json('progress');
+      if (stopped) return;
       if (p.running) {
         const st = STEPS.find((s) => s.key === p.step);
         prog.innerHTML = '';
@@ -698,42 +782,80 @@ async function run(to: string) {
     const total = st.steps.filter((s) => st.ran.includes(s.key)).reduce((a, s) => a + s.millis, 0);
     if (st.ran.length) toast(`Ran ${st.ran.length} step${st.ran.length > 1 ? 's' : ''} in ${(total / 1000).toFixed(1)} s`);
     await refreshStatus(st);
+    return true;
   } catch (e) {
     toast(String(e), true);
+    return false;
   } finally {
+    stopped = true;
     clearInterval(poll);
     S.busy = false;
     prog.textContent = '';
+    renderTopbar();
     renderSteps();
   }
 }
 
-async function mutate(cmd: string, args: any, autoStep?: string) {
+async function mutate(cmd: string, args: any, autoStep?: string): Promise<boolean> {
+  if (isBusy()) return false;
+  S.busy = true;
   try {
     const st = await api.json<Status>(cmd, args);
     S.status = st;
+    S.busy = false;
     if (autoStep && S.autoRun) {
       await run(autoStep);
     } else {
       invalidate();
       await refreshStatus(st);
     }
+    return true;
   } catch (e) {
+    S.busy = false;
+    toast(String(e), true);
+    return false;
+  }
+}
+
+async function undoRedo(cmd: 'undo' | 'redo') {
+  if (isBusy()) return;
+  S.busy = true;
+  try {
+    const st = await api.json<Status>(cmd, {});
+    S.status = st;
+    S.busy = false;
+    const target = undoTarget(st);
+    if (target && S.autoRun) {
+      await run(target);
+    } else {
+      invalidate();
+      await refreshStatus(st);
+    }
+  } catch (e) {
+    S.busy = false;
     toast(String(e), true);
   }
 }
 
 let paramTimer: number | undefined;
+let paramSeq = 0;
 function setParam(group: string, key: string, value: number) {
-  const params = structuredClone(S.status!.params);
+  if (!Number.isFinite(value) || !S.status) return;
+  const params = structuredClone(S.status.params);
   params[group][key] = value;
-  S.status!.params = params;
+  S.status.params = params;
   clearTimeout(paramTimer);
+  const seq = ++paramSeq;
   paramTimer = window.setTimeout(async () => {
-    const st = await api.json<Status>('set_params', { params });
-    const levelChanged = S.grid && st.grid.cells !== S.grid.n;
-    if (levelChanged) invalidate();
-    await refreshStatus(st);
+    try {
+      const st = await api.json<Status>('set_params', { params });
+      if (seq !== paramSeq) return;
+      const levelChanged = S.grid && st.grid.cells !== S.grid.n;
+      if (levelChanged) invalidate();
+      await refreshStatus(st);
+    } catch (e) {
+      if (seq === paramSeq) toast(String(e), true);
+    }
   }, 250);
 }
 
@@ -744,6 +866,7 @@ function renderTopbar() {
   const bar = $('#topbar');
   bar.innerHTML = '';
   const name = st.path ? st.path.split(/[\\/]/).filter(Boolean).pop() : 'Untitled world';
+  const busy = isBusy();
   const btn = (label: string, on: () => void, opts: Record<string, any> = {}) => h('button', { onclick: on, ...opts }, label);
   const layerSel = h('select', { title: 'Map layer', onchange: (e: Event) => setLayer((e.target as HTMLSelectElement).value as LayerId) });
   let lastGroup = '';
@@ -772,10 +895,10 @@ function renderTopbar() {
   bar.append(
     h('div', { class: 'brand' }, h('span', { class: 'logo' }), h('b', {}, 'Fantasy World Maker'), h('span', { class: 'proj', title: st.path ?? '' }, name + (st.dirty ? ' •' : ''))),
     h('div', { class: 'group' },
-      btn('New', onNew), btn('Open…', onOpen), btn('Save', onSave, { title: 'Ctrl+S' }), btn('Save as…', () => onSave(true)), btn('Export…', onExport)),
+      btn('New', onNew, { disabled: busy }), btn('Open…', onOpen, { disabled: busy }), btn('Save', onSave, { title: 'Ctrl+S' }), btn('Save as…', () => onSave(true)), btn('Export…', onExport, { disabled: busy })),
     h('div', { class: 'group' },
-      btn('Undo', () => mutate('undo', {}, undoTarget()), { disabled: !st.can_undo, title: 'Ctrl+Z' }),
-      btn('Redo', () => mutate('redo', {}, undoTarget()), { disabled: !st.can_redo, title: 'Ctrl+Y' })),
+      btn('Undo', () => undoRedo('undo'), { disabled: !st.can_undo || busy, title: 'Ctrl+Z' }),
+      btn('Redo', () => undoRedo('redo'), { disabled: !st.can_redo || busy, title: 'Ctrl+Y' })),
     h('div', { class: 'group seg' },
       btn('Globe', () => setView(0), { class: R.mode === 0 ? 'on' : '' }),
       btn('Flat map', () => setView(1), { class: R.mode === 1 ? 'on' : '' })),
@@ -783,7 +906,11 @@ function renderTopbar() {
     h('div', { class: 'group' }, ov('rivers', 'Rivers'), ov('borders', 'Borders'), ov('wind', 'Wind'), ov('motion', 'Plate motion'), ov('edits', 'Pins'),
       ov('latitudes', 'Latitudes', 'Reference lines: the equator (solid) and 30° and 60° north and south (dashed)'),
       h('label', { class: 'check', title: 'Relief exaggeration on the globe' }, 'Relief',
-        h('input', { type: 'range', min: 0, max: 40, step: 1, value: S.exag, oninput: (e: Event) => { S.exag = Number((e.target as HTMLInputElement).value); refreshLayer(); } }))),
+        h('input', {
+          type: 'range', min: 0, max: 40, step: 1, value: S.exag,
+          oninput: (e: Event) => { S.exag = Number((e.target as HTMLInputElement).value); void updateReliefExag(false); },
+          onchange: (e: Event) => { S.exag = Number((e.target as HTMLInputElement).value); void updateReliefExag(true); },
+        }))),
     h('div', { class: 'spacer' }),
     btn(st.override_edits ? `Overrides (${st.override_edits})` : 'Overrides', onOverrides, { title: 'Override layers: every hand edit, by layer; export them to reuse in another world' }),
     btn('Edit map', () => {
@@ -803,33 +930,37 @@ function stageButtons(st: Status): HTMLElement {
   const done = (step: string) => st.steps.find((s) => s.key === step)?.state === 'done';
   const next = STAGE_ENDS.find((s) => !done(s.step));
   const stale = st.steps.filter((s) => s.state === 'stale').length;
+  const busy = isBusy();
   return h('div', { class: 'group' },
-    next ? h('button', { class: 'primary', disabled: S.busy, title: `Generate everything up to the end of Stage ${next.stage}`, onclick: () => run(next.step) }, `Next: Stage ${next.stage}`) : null,
-    ...STAGE_ENDS.map((s) => h('button', { disabled: S.busy, class: done(s.step) ? 'done' : '', title: `Generate up to the end of Stage ${s.stage}`, onclick: () => run(s.step) }, done(s.step) ? `Stage ${s.stage} ✓` : `Stage ${s.stage}`)),
-    h('button', { class: next ? '' : 'primary', disabled: S.busy, onclick: () => run(STAGE_ENDS[STAGE_ENDS.length - 1].step) }, 'Generate all'),
-    stale ? h('button', { class: 'warn', disabled: S.busy, title: 'Remove the results whose inputs changed since they ran (they no longer match your sketch, edits or parameters); your edits stay', onclick: () => clearResults(null, stale) }, `Clear stale (${stale})`) : null);
+    next ? h('button', { class: 'primary', disabled: busy, title: `Generate everything up to the end of Stage ${next.stage}`, onclick: () => run(next.step) }, `Next: Stage ${next.stage}`) : null,
+    ...STAGE_ENDS.map((s) => h('button', { disabled: busy, class: done(s.step) ? 'done' : '', title: `Generate up to the end of Stage ${s.stage}`, onclick: () => run(s.step) }, done(s.step) ? `Stage ${s.stage} ✓` : `Stage ${s.stage}`)),
+    h('button', { class: next ? '' : 'primary', disabled: busy, onclick: () => run(STAGE_ENDS[STAGE_ENDS.length - 1].step) }, 'Generate all'),
+    stale ? h('button', { class: 'warn', disabled: busy, title: 'Remove the results whose inputs changed since they ran (they no longer match your sketch, edits or parameters); your edits stay', onclick: () => clearResults(null, stale) }, `Clear stale (${stale})`) : null);
 }
 
 /** Remove results from a step on (or every stale result); edits stay, the next run rebuilds them. */
 async function clearResults(from: string | null, count: number) {
+  if (isBusy()) return;
   const what = from ? `the results of "${STEPS.find((s) => s.key === from)?.title}" and every later step (${count})` : `${count} stale result${count > 1 ? 's' : ''} (steps whose inputs changed since they ran)`;
   if (!confirm(`Remove ${what}? Your sketch, edits and parameters stay; run again to rebuild.`)) return;
+  S.busy = true;
   try {
     const st = await api.json<Status & { cleared: number }>('clear_results', from ? { from } : {});
     invalidate();
-    if (!st.live) SIM.state = null;
+    if (!st.live) resetSimState();
+    S.busy = false;
     toast(`Removed ${st.cleared} result${st.cleared === 1 ? '' : 's'}`);
     await refreshStatus(st);
   } catch (e) {
+    S.busy = false;
     toast(String(e), true);
   }
 }
 
-function undoTarget(): string | undefined {
+function undoTarget(st: Status): string | undefined {
   // Re-run the earliest stale step that is cheap to refresh.
-  const st = S.status!;
   const firstStale = st.steps.find((s) => s.state !== 'done');
-  return firstStale && ['sketch'].includes(firstStale.key) ? 'sketch' : undefined;
+  return firstStale && firstStale.key === 'sketch' ? 'sketch' : undefined;
 }
 
 function setView(m: 0 | 1) {
@@ -844,25 +975,56 @@ function setLayer(id: LayerId) {
   refreshLayer();
 }
 
+function resetSimState() {
+  guideGen++;
+  SIM.state = null;
+  SIM.playing = false;
+  SIM.guide.running = false;
+  SIM.nations.clear();
+  SIM.cultures.clear();
+  SIM.guide.log = [];
+  SIM.guide.tokens = [0, 0];
+}
+
 async function onNew() {
+  if (isBusy()) return;
   if (S.status?.dirty && !confirm('Discard unsaved changes and start a new world?')) return;
-  const st = await api.json<Status>('new', {});
-  invalidate();
-  S.grid = null;
-  await refreshStatus(st);
-  await run('sketch');
+  S.busy = true;
+  renderTopbar();
+  try {
+    const st = await api.json<Status>('new', {});
+    resetSimState();
+    resetHover();
+    invalidate();
+    S.grid = null;
+    S.busy = false;
+    await refreshStatus(st);
+    await run('sketch');
+  } catch (e) {
+    S.busy = false;
+    renderTopbar();
+    toast(String(e), true);
+  }
 }
 
 async function onOpen() {
+  if (isBusy()) return;
   const path = await api.pickFolder('Open world project folder', false);
-  if (!path) return;
+  if (!path || isBusy()) return;
+  S.busy = true;
+  renderTopbar();
   try {
     const st = await api.json<Status>('open', { path });
+    resetSimState();
+    resetHover();
     invalidate();
     S.grid = null;
+    S.busy = false;
     await refreshStatus(st);
     toast(`Opened ${path}`);
   } catch (e) {
+    S.busy = false;
+    renderTopbar();
     toast(String(e), true);
   }
 }
@@ -884,10 +1046,16 @@ async function onSave(as = false) {
 }
 
 function onExport() {
+  if (isBusy()) return;
   const st = S.status!;
   const o = { width: 8192, height: 4096, lat_min: -90, lat_max: 90, sea_level_value: 20, max_elevation_m: 6500, max_depth_m: 6000, detail_noise: true };
   const num = (k: keyof typeof o, label: string, step = 1) =>
-    h('label', {}, h('span', {}, label), h('input', { type: 'number', value: o[k] as number, step, onchange: (e: Event) => ((o as any)[k] = Number((e.target as HTMLInputElement).value)) }));
+    h('label', {}, h('span', {}, label), h('input', { type: 'number', value: o[k] as number, step, onchange: (e: Event) => {
+      const el = e.target as HTMLInputElement;
+      const v = Number(el.value);
+      if (Number.isFinite(v)) (o as any)[k] = v;
+      else el.value = String(o[k]);
+    } }));
   const dirInput = h('input', { type: 'text', value: st.path ? `${st.path}${st.path.includes('\\') ? '\\' : '/'}export` : '', placeholder: 'Export folder' }) as HTMLInputElement;
   const result = h('div', { class: 'result' });
   const dlg = h('div', { class: 'modal-back' },
@@ -905,15 +1073,27 @@ function onExport() {
       h('div', { class: 'actions' },
         h('button', { onclick: () => dlg.remove() }, 'Close'),
         h('button', { class: 'primary', onclick: async (e: Event) => {
+          if (isBusy()) return;
           const b = e.target as HTMLButtonElement;
           b.disabled = true;
           result.textContent = 'Generating missing steps…';
           try {
-            await run('provinces');
+            if (!(await run('provinces'))) {
+              result.textContent = 'Export aborted: generating steps failed or was busy.';
+              b.disabled = false;
+              return;
+            }
             result.textContent = 'Rasterising…';
-            const r = await api.json('export', { path: dirInput.value || null, options: o });
-            result.innerHTML = '';
-            result.append(h('b', {}, `Exported ${r.files.length} files (${r.width}×${r.height}) in ${(r.millis / 1000).toFixed(1)} s`), h('div', { class: 'muted' }, r.dir), h('div', { class: 'files' }, r.files.join(' · ')));
+            S.busy = true;
+            renderTopbar();
+            try {
+              const r = await api.json('export', { path: dirInput.value || null, options: o });
+              result.innerHTML = '';
+              result.append(h('b', {}, `Exported ${r.files.length} files (${r.width}×${r.height}) in ${(r.millis / 1000).toFixed(1)} s`), h('div', { class: 'muted' }, r.dir), h('div', { class: 'files' }, r.files.join(' · ')));
+            } finally {
+              S.busy = false;
+              renderTopbar();
+            }
           } catch (err) {
             result.textContent = String(err);
           }
@@ -1087,9 +1267,12 @@ async function installUpdate(c: UpdateCheck) {
   }
   if (S.status?.dirty && !confirm(`The app closes to install ${rel.version}, and unsaved changes to this world will be lost.\n\nChoose Cancel to save first.`)) return;
   const prog = $('#progress');
+  let stopped = false;
   const poll = setInterval(async () => {
+    if (stopped) return;
     try {
       const p = await api.json('progress');
+      if (stopped) return;
       if (p.running && p.task === 'update') {
         prog.innerHTML = '';
         prog.append(h('span', {}, `Update: ${p.msg}`), h('progress', { max: 1, value: p.frac }));
@@ -1102,6 +1285,7 @@ async function installUpdate(c: UpdateCheck) {
   } catch (e) {
     toast(`Update failed: ${e}`, true);
   } finally {
+    stopped = true;
     clearInterval(poll);
     prog.textContent = '';
   }
@@ -1156,6 +1340,8 @@ function onAbout() {
 
 type GuideLog = { position: number; narration: string; actions: { action: string; args: any; ok: boolean; error?: string | null }[] };
 
+let guideGen = 0;
+
 const SIM = {
   /** Summary of the live run (sim_* replies). */
   state: null as any | null,
@@ -1174,7 +1360,9 @@ const SIM = {
   cultures: new Map<number, any>(),
   guide: {
     running: false, goal: '', years: { cultures: 500, nations: 50 } as Record<string, number>, maxActions: 4,
-    log: [] as GuideLog[], tokens: [0, 0], settings: null as any | null, presets: [] as any[], showSettings: false, keyDraft: '',
+    log: [] as GuideLog[], tokens: [0, 0], settings: null as any | null,
+    settingsDraft: null as { provider: string; base_url: string; model: string; effort: string } | null,
+    presets: [] as any[], showSettings: false, keyDraft: '',
   },
 };
 
@@ -1182,8 +1370,14 @@ function loadGuidePrefs() {
   try {
     const g = JSON.parse(localStorage.getItem('fwm.guide') ?? '{}');
     if (typeof g.goal === 'string') SIM.guide.goal = g.goal;
-    if (g.years) Object.assign(SIM.guide.years, g.years);
-    if (g.maxActions) SIM.guide.maxActions = g.maxActions;
+    if (g.years && typeof g.years === 'object') {
+      for (const k of ['cultures', 'nations']) {
+        const v = Number(g.years[k]);
+        if (Number.isFinite(v) && v >= 5) SIM.guide.years[k] = Math.round(v);
+      }
+    }
+    const ma = Number(g.maxActions);
+    if (Number.isFinite(ma) && ma >= 1) SIM.guide.maxActions = Math.max(1, Math.min(12, Math.round(ma)));
   } catch { /* ignore */ }
 }
 
@@ -1196,9 +1390,12 @@ function saveGuidePrefs() {
 /** Show progress messages while a long command runs. */
 function pollProgress(): () => void {
   const prog = $('#progress');
+  let stopped = false;
   const t = setInterval(async () => {
+    if (stopped) return;
     try {
       const p = await api.json('progress');
+      if (stopped) return;
       if (p.running) {
         prog.innerHTML = '';
         prog.append(h('span', {}, p.msg || p.step || '…'), h('progress', { max: 1, value: p.frac || 0 }));
@@ -1206,6 +1403,7 @@ function pollProgress(): () => void {
     } catch { /* ignore */ }
   }, 200);
   return () => {
+    stopped = true;
     clearInterval(t);
     prog.textContent = '';
   };
@@ -1225,11 +1423,12 @@ async function applySim(r: any) {
 }
 
 async function simCall(cmd: string, args: any = {}): Promise<any | null> {
-  if (SIM.busy) {
-    toast('The simulation is busy; try again in a moment.', true);
+  if (S.busy || SIM.busy) {
+    toast('The engine is busy; try again in a moment.', true);
     return null;
   }
   SIM.busy = true;
+  renderTopbar();
   renderSim();
   const stop = pollProgress();
   try {
@@ -1243,6 +1442,7 @@ async function simCall(cmd: string, args: any = {}): Promise<any | null> {
   } finally {
     stop();
     SIM.busy = false;
+    renderTopbar();
     renderSim();
   }
 }
@@ -1257,7 +1457,7 @@ const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Se
 
 /** A year, with its month (1–12) when it is not January. */
 function fmtYear(y: number, month?: number): string {
-  return month && month > 1 ? `${MONTH_NAMES[month - 1]} ${y}` : String(y);
+  return month && month > 1 ? `${MONTH_NAMES[month - 1] ?? ''} ${y}` : String(y);
 }
 
 /** A step length in months, as years when it is a whole number of them. */
@@ -1266,6 +1466,8 @@ function fmtStep(m: number): string {
 }
 
 async function simStart(stage: string) {
+  if (isBusy()) return;
+  guideGen++;
   S.layer = stage === 'cultures' ? 'cultures' : 'nations';
   SIM.guide.log = [];
   SIM.guide.tokens = [0, 0];
@@ -1287,8 +1489,10 @@ async function simPlay() {
 async function simCommit() {
   SIM.playing = false;
   SIM.guide.running = false;
-  if (SIM.busy) return;
+  guideGen++;
+  if (S.busy || SIM.busy) return;
   SIM.busy = true;
+  renderTopbar();
   renderSim();
   const stop = pollProgress();
   try {
@@ -1304,20 +1508,34 @@ async function simCommit() {
   } finally {
     stop();
     SIM.busy = false;
+    renderTopbar();
     renderSim();
   }
 }
 
 async function simCancel() {
+  if (S.busy || SIM.busy) return;
   if (!confirm('Stop the live run? Its directives stay in the world (Overrides panel); the step keeps its previous result.')) return;
+  guideGen++;
   SIM.playing = false;
   SIM.guide.running = false;
-  SIM.state = null;
-  SIM.nations.clear();
-  SIM.cultures.clear();
-  const st = await api.json<Status>('sim_cancel', {});
-  invalidate();
-  await refreshStatus(st);
+  SIM.busy = true;
+  renderTopbar();
+  renderSim();
+  try {
+    const st = await api.json<Status>('sim_cancel', {});
+    SIM.state = null;
+    SIM.nations.clear();
+    SIM.cultures.clear();
+    invalidate();
+    SIM.busy = false;
+    await refreshStatus(st);
+  } catch (e) {
+    SIM.busy = false;
+    renderTopbar();
+    renderSim();
+    toast(String(e), true);
+  }
 }
 
 async function simActions(stage: string): Promise<any[]> {
@@ -1344,6 +1562,7 @@ function formArgs(schema: any): any {
 async function guideSettingsLoad() {
   try {
     SIM.guide.settings = await api.json('guide_config_get', {});
+    SIM.guide.settingsDraft = null;
     if (!SIM.guide.presets.length) SIM.guide.presets = await api.json('guide_presets', {});
   } catch (e) {
     SIM.guide.settings = { error: String(e) };
@@ -1354,35 +1573,45 @@ async function guideSettingsLoad() {
 async function guideRun() {
   const g = SIM.guide;
   const live = S.status?.live;
-  if (!live) return;
+  if (!live || isBusy()) return;
   if (!g.goal.trim()) return toast('Describe the history you want to see first', true);
   saveGuidePrefs();
+  const myGen = ++guideGen;
   g.running = true;
   SIM.playing = false;
+  renderTopbar();
   renderSim();
   const atStart = SIM.state && (SIM.state.stage === 'cultures' ? SIM.state.tick === 0 : SIM.state.year === SIM.state.start_year);
-  let years = atStart && !g.log.length ? 0 : g.years[live.stage];
-  while (g.running) {
-    const stop = pollProgress();
-    let r: any;
-    try {
-      r = await api.json('guide_turn', { goal: g.goal, years, max_actions: g.maxActions });
-    } catch (e) {
-      toast(`Guide: ${e}`, true);
+  const configuredYears = Number.isFinite(g.years[live.stage]) ? Math.max(5, Math.round(g.years[live.stage])) : 50;
+  let years = atStart && !g.log.length ? 0 : configuredYears;
+  try {
+    while (g.running && myGen === guideGen) {
+      const stop = pollProgress();
+      let r: any;
+      try {
+        r = await api.json('guide_turn', { goal: g.goal, years, max_actions: g.maxActions });
+      } catch (e) {
+        toast(`Guide: ${e}`, true);
+        stop();
+        break;
+      }
       stop();
-      break;
+      if (myGen !== guideGen || !S.status?.live) break;
+      g.tokens[0] += r.input_tokens ?? 0;
+      g.tokens[1] += r.output_tokens ?? 0;
+      if (r.status) await applySim(r.status);
+      if (myGen !== guideGen || !S.status?.live) break;
+      if (r.done) break;
+      g.log.push({ position: r.position, narration: r.narration, actions: r.actions ?? [] });
+      const nextRaw = typeof r.next_years === 'number' && Number.isFinite(r.next_years) ? r.next_years : g.years[live.stage];
+      years = Math.max(5, Math.round(Number.isFinite(nextRaw) ? nextRaw : 50));
+      renderSim();
     }
-    stop();
-    g.tokens[0] += r.input_tokens ?? 0;
-    g.tokens[1] += r.output_tokens ?? 0;
-    if (r.status) await applySim(r.status);
-    if (r.done) break;
-    g.log.push({ position: r.position, narration: r.narration, actions: r.actions ?? [] });
-    years = r.next_years ?? g.years[live.stage];
+  } finally {
+    if (myGen === guideGen) g.running = false;
+    renderTopbar();
     renderSim();
   }
-  g.running = false;
-  renderSim();
 }
 
 /** City pins on the map in a live Stage 4 run: click to add, drag a pin to move it, or remove. */
@@ -1435,7 +1664,7 @@ function renderSim() {
   if (!live) {
     box.append(h('div', { class: 'sim-head' }, h('b', {}, `Step by step · ${stageName}`)),
       h('p', { class: 'muted' }, 'Run the simulation a step at a time, watch it on the map, steer it with directives, or let an AI guide steer it toward the history you describe. Directives are saved with the world, so re-running the stage replays the same history.'),
-      h('div', { class: 'row' }, h('button', { class: 'primary', disabled: SIM.busy || S.busy, onclick: () => simStart(stage) }, 'Start step by step')));
+      h('div', { class: 'row' }, h('button', { class: 'primary', disabled: isBusy(), onclick: () => simStart(stage) }, 'Start step by step')));
     return;
   }
   const st = SIM.state;
@@ -1443,22 +1672,29 @@ function renderSim() {
     ? `${fmtYear(live.position, live.month ?? undefined)} of ${st?.start_year ?? ''}–${live.end}${st?.era ? ' · ' + st.era + ' era' : ''}${st?.step_months ? ' · ' + fmtStep(st.step_months) : ''}`
     : `Generation ${live.position} of ${live.end}${st ? ' · year ' + Math.round(st.year).toLocaleString() + ' · era ' + st.era : ''}`;
   const frac = live.unit === 'year' && st ? (live.position + ((live.month ?? 1) - 1) / 12 - st.start_year) / Math.max(1, live.end - st.start_year) : live.position / Math.max(1, live.end);
-  const busy = SIM.busy || SIM.guide.running;
+  const busy = isBusy();
   const adv = SIM.advance[stage];
+  const advBtn = h('button', { disabled: busy || live.done, onclick: () => simStep({ years: SIM.advance[stage] }) }, `+${adv} years`);
   box.append(
     h('div', { class: 'sim-head' }, h('b', {}, stageName), h('span', { class: 'muted' }, live.done ? 'finished' : 'live')),
     h('div', {}, pos), h('progress', { class: 'sim-prog', max: 1, value: Math.min(1, Math.max(0, frac)) }),
     h('div', { class: 'row wrap' },
       h('button', { disabled: busy || live.done, title: live.unit === 'year' ? 'One step' : 'One generation', onclick: () => simStep({ steps: 1 }) }, 'Step'),
-      h('input', { type: 'number', class: 'years', min: 1, step: 1, value: adv, title: 'Years to advance', onchange: (e: Event) => (SIM.advance[stage] = Math.max(1, Number((e.target as HTMLInputElement).value))) }),
-      h('button', { disabled: busy || live.done, onclick: () => simStep({ years: SIM.advance[stage] }) }, `+${adv} years`),
+      h('input', { type: 'number', class: 'years', min: 1, step: 1, value: adv, title: 'Years to advance', onchange: (e: Event) => {
+        const el = e.target as HTMLInputElement;
+        const v = Number(el.value);
+        SIM.advance[stage] = Number.isFinite(v) && v >= 1 ? Math.round(v) : SIM.advance[stage];
+        el.value = String(SIM.advance[stage]);
+        advBtn.textContent = `+${SIM.advance[stage]} years`;
+      } }),
+      advBtn,
       h('button', { disabled: busy || live.done, onclick: () => simStep({ to: 'era' }) }, 'Next era'),
-      h('button', { disabled: (SIM.busy && !SIM.playing) || SIM.guide.running || live.done, class: SIM.playing ? 'on' : '', onclick: simPlay }, SIM.playing ? 'Pause' : 'Play'),
+      h('button', { disabled: S.busy || (SIM.busy && !SIM.playing) || SIM.guide.running || live.done, class: SIM.playing ? 'on' : '', onclick: simPlay }, SIM.playing ? 'Pause' : 'Play'),
       h('button', { disabled: busy || live.done, onclick: () => simStep({ to: 'end' }) }, 'To the end')),
     h('div', { class: 'row wrap' },
       h('button', { class: 'primary', disabled: busy, title: 'Run to the end and keep this history as the stage result', onclick: simCommit }, live.done ? 'Keep this history' : 'Finish and keep'),
       h('button', { disabled: busy, title: 'Start again from the beginning (directives so far are replayed)', onclick: () => simStart(stage) }, 'Restart'),
-      h('button', { disabled: SIM.busy, onclick: simCancel }, 'Stop')),
+      h('button', { disabled: S.busy || SIM.busy, onclick: simCancel }, 'Stop')),
     h('div', { class: 'seg tabs' },
       ...(['world', 'steer', 'guide'] as const).map((t) => h('button', { class: SIM.tab === t ? 'on' : '', onclick: () => { SIM.tab = t; if (t === 'guide' && !SIM.guide.settings) guideSettingsLoad(); renderSim(); } }, t === 'world' ? 'World' : t === 'steer' ? 'Steer' : 'AI guide'))),
   );
@@ -1530,6 +1766,7 @@ function renderSim() {
     const sel = h('select', { onchange: (e: Event) => { SIM.action = (e.target as HTMLSelectElement).value; SIM.form = {}; renderSim(); } }) as HTMLSelectElement;
     body.append(h('p', { class: 'muted small' }, 'A directive applies from the next step and is saved with the world. Ids are shown when you hover the map (province, state, region, culture, nation).'), sel);
     simActions(stage).then((acts) => {
+      if (!sel.isConnected) return;
       if (!SIM.action || !acts.some((a) => a.name === SIM.action)) SIM.action = acts[0]?.name ?? '';
       sel.append(...acts.map((a) => h('option', { value: a.name, selected: a.name === SIM.action }, a.name.replace(/_/g, ' '))));
       const a = acts.find((x) => x.name === SIM.action);
@@ -1551,6 +1788,8 @@ function renderSim() {
           const r = await simCall('sim_directive', { action: a.name, args: formArgs(a.schema), note: SIM.note });
           if (r) { SIM.note = ''; toast(`${a.name.replace(/_/g, ' ')} applies from the next step`); }
         } }, 'Apply')));
+    }).catch((e) => {
+      toast(`Failed to load directives: ${e}`, true);
     });
     const applied = [...(st.queued ?? []).map((d: any) => ({ ...d, queued: true })), ...(st.directives ?? []).slice(-14).reverse()];
     if (applied.length) {
@@ -1568,22 +1807,31 @@ function renderSim() {
     body.append(
       h('div', { class: 'row' },
         h('span', { class: 'muted small', style: 'flex:1' }, cfg?.error ? cfg.error : cfg ? `${cfg.provider === 'anthropic' ? 'Anthropic' : 'OpenAI-compatible'} · ${cfg.model || 'no model'} · ${cfg.has_key ? 'key ' + (cfg.key_source === 'settings' ? cfg.key_hint : 'from ' + cfg.key_source) : 'no key'}` : 'Loading settings…'),
-        h('button', { class: 'small', onclick: () => { g.showSettings = !g.showSettings; renderSim(); } }, g.showSettings ? 'Hide settings' : 'Settings')),
+        h('button', { class: 'small', onclick: () => {
+          g.showSettings = !g.showSettings;
+          if (g.showSettings && cfg && !cfg.error) {
+            g.settingsDraft = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model, effort: cfg.effort };
+          } else {
+            g.settingsDraft = null;
+            g.keyDraft = '';
+          }
+          renderSim();
+        } }, g.showSettings ? 'Hide settings' : 'Settings')),
     );
     if (g.showSettings && cfg && !cfg.error) {
-      const f = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model, effort: cfg.effort };
+      const draft = g.settingsDraft ?? (g.settingsDraft = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model, effort: cfg.effort });
       const preset = h('select', { onchange: (e: Event) => {
         const pr = g.presets.find((x) => x.id === (e.target as HTMLSelectElement).value);
-        if (pr) { Object.assign(cfg, { provider: pr.provider, base_url: pr.base_url, model: pr.model }); renderSim(); }
-      } }, h('option', { value: '' }, 'Choose a provider…'), ...g.presets.map((pr) => h('option', { value: pr.id, selected: !!pr.base_url && pr.base_url === cfg.base_url && pr.provider === cfg.provider }, pr.label)));
-      const hint = g.presets.find((pr) => pr.base_url && pr.base_url === cfg.base_url)?.hint ?? '';
-      const inp = (k: keyof typeof f, label: string, ph = '') => h('label', {}, h('span', {}, label), h('input', { type: 'text', value: (cfg as any)[k] ?? '', placeholder: ph, oninput: (e: Event) => ((cfg as any)[k] = (e.target as HTMLInputElement).value) }));
+        if (pr) { Object.assign(draft, { provider: pr.provider, base_url: pr.base_url, model: pr.model }); renderSim(); }
+      } }, h('option', { value: '' }, 'Choose a provider…'), ...g.presets.map((pr) => h('option', { value: pr.id, selected: !!pr.base_url && pr.base_url === draft.base_url && pr.provider === draft.provider }, pr.label)));
+      const hint = g.presets.find((pr) => pr.base_url && pr.base_url === draft.base_url)?.hint ?? '';
+      const inp = (k: keyof typeof draft, label: string, ph = '') => h('label', {}, h('span', {}, label), h('input', { type: 'text', value: draft[k] ?? '', placeholder: ph, oninput: (e: Event) => (draft[k] = (e.target as HTMLInputElement).value) }));
       body.append(h('div', { class: 'form sim-form' },
         h('label', { class: 'wide' }, h('span', {}, 'Preset'), preset),
-        h('label', {}, h('span', {}, 'Format'), h('select', { onchange: (e: Event) => { cfg.provider = (e.target as HTMLSelectElement).value; renderSim(); } },
-          h('option', { value: 'anthropic', selected: cfg.provider === 'anthropic' }, 'Anthropic Messages API'), h('option', { value: 'openai', selected: cfg.provider === 'openai' }, 'OpenAI-compatible'))),
-        cfg.provider === 'anthropic' ? h('label', {}, h('span', {}, 'Effort'), h('select', { onchange: (e: Event) => (cfg.effort = (e.target as HTMLSelectElement).value) },
-          ...['low', 'medium', 'high'].map((x) => h('option', { value: x, selected: cfg.effort === x }, x)))) : h('span', {}),
+        h('label', {}, h('span', {}, 'Format'), h('select', { onchange: (e: Event) => { draft.provider = (e.target as HTMLSelectElement).value; renderSim(); } },
+          h('option', { value: 'anthropic', selected: draft.provider === 'anthropic' }, 'Anthropic Messages API'), h('option', { value: 'openai', selected: draft.provider === 'openai' }, 'OpenAI-compatible'))),
+        draft.provider === 'anthropic' ? h('label', {}, h('span', {}, 'Effort'), h('select', { onchange: (e: Event) => (draft.effort = (e.target as HTMLSelectElement).value) },
+          ...['low', 'medium', 'high'].map((x) => h('option', { value: x, selected: draft.effort === x }, x)))) : h('span', {}),
         inp('base_url', 'Base URL', 'https://…'), inp('model', 'Model', 'model id'),
         h('label', { class: 'wide' }, h('span', {}, 'API key'), h('input', { type: 'password', autocomplete: 'off', value: g.keyDraft, placeholder: cfg.has_key ? (cfg.key_source === 'settings' ? `saved (${cfg.key_hint}); type to replace` : `using ${cfg.key_source}`) : 'paste your key', oninput: (e: Event) => (g.keyDraft = (e.target as HTMLInputElement).value) })),
       ), hint ? h('div', { class: 'muted small' }, hint) : '',
@@ -1591,9 +1839,10 @@ function renderSim() {
       h('div', { class: 'row' },
         h('button', { onclick: async () => {
           try {
-            const args: any = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model, effort: cfg.effort };
+            const args: any = { provider: draft.provider, base_url: draft.base_url, model: draft.model, effort: draft.effort };
             if (g.keyDraft) args.api_key = g.keyDraft;
             g.settings = await api.json('guide_config_set', args);
+            g.settingsDraft = { provider: g.settings.provider, base_url: g.settings.base_url, model: g.settings.model, effort: g.settings.effort };
             g.keyDraft = '';
             toast('Guide settings saved');
           } catch (e) { toast(String(e), true); }
@@ -1604,18 +1853,35 @@ function renderSim() {
           try { const r = await api.json('guide_test', {}); toast(`${r.model}: ${r.text}`); } catch (e) { toast(String(e), true); }
           stop();
         } }, 'Test'),
-        cfg.key_source === 'settings' ? h('button', { onclick: async () => { g.settings = await api.json('guide_config_set', { api_key: '' }); renderSim(); } }, 'Forget key') : null));
+        cfg.key_source === 'settings' ? h('button', { onclick: async () => {
+          try {
+            g.settings = await api.json('guide_config_set', { api_key: '' });
+            g.settingsDraft = { provider: g.settings.provider, base_url: g.settings.base_url, model: g.settings.model, effort: g.settings.effort };
+            toast('Saved API key removed');
+          } catch (e) { toast(String(e), true); }
+          renderSim();
+        } }, 'Forget key') : null));
     }
     body.append(
       h('label', { class: 'sim-goal' }, h('span', { class: 'muted small' }, 'The history you want to see'),
         h('textarea', { rows: 4, placeholder: stage === 'cultures' ? 'e.g. Two great peoples: one on the western continent, one spread over the islands; the steppe people should split into many tribes.' : 'e.g. A sea empire grows in the south and colonises the east; by 1800 it breaks into three kingdoms. The northern city-states stay independent.', oninput: (e: Event) => { g.goal = (e.target as HTMLTextAreaElement).value; } }, g.goal)),
       h('div', { class: 'row wrap' },
-        h('label', { class: 'check' }, 'Years per turn ', h('input', { type: 'number', class: 'years', min: 5, value: g.years[stage], onchange: (e: Event) => (g.years[stage] = Math.max(5, Number((e.target as HTMLInputElement).value))) })),
-        h('label', { class: 'check' }, 'Max directives ', h('input', { type: 'number', class: 'years', min: 1, max: 12, value: g.maxActions, onchange: (e: Event) => (g.maxActions = Math.max(1, Number((e.target as HTMLInputElement).value))) }))),
+        h('label', { class: 'check' }, 'Years per turn ', h('input', { type: 'number', class: 'years', min: 5, value: g.years[stage], onchange: (e: Event) => {
+          const el = e.target as HTMLInputElement;
+          const v = Number(el.value);
+          g.years[stage] = Number.isFinite(v) && v >= 5 ? Math.round(v) : g.years[stage];
+          el.value = String(g.years[stage]);
+        } })),
+        h('label', { class: 'check' }, 'Max directives ', h('input', { type: 'number', class: 'years', min: 1, max: 12, value: g.maxActions, onchange: (e: Event) => {
+          const el = e.target as HTMLInputElement;
+          const v = Number(el.value);
+          g.maxActions = Number.isFinite(v) ? Math.max(1, Math.min(12, Math.round(v))) : g.maxActions;
+          el.value = String(g.maxActions);
+        } }))),
       h('div', { class: 'row' },
         g.running
           ? h('button', { class: 'on', onclick: () => { g.running = false; renderSim(); } }, 'Pause after this turn')
-          : h('button', { class: 'primary', disabled: SIM.busy || live.done || !ready, title: ready ? '' : 'Set up a provider, model and key first', onclick: guideRun }, g.log.length ? 'Continue guiding' : 'Start guiding'),
+          : h('button', { class: 'primary', disabled: S.busy || SIM.busy || live.done || !ready, title: ready ? '' : 'Set up a provider, model and key first', onclick: guideRun }, g.log.length ? 'Continue guiding' : 'Start guiding'),
         h('span', { class: 'muted small' }, g.tokens[0] ? `${g.tokens[0].toLocaleString()} tokens in · ${g.tokens[1].toLocaleString()} out` : '')),
       h('p', { class: 'muted small' }, 'Each turn the simulation advances, the model reads a summary of the world and your goal, then issues directives and writes a line for the chronicle. It needs the model only while guiding: the directives are saved, so re-runs replay without it.'),
     );
@@ -1730,7 +1996,7 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
   }
   if (LIVE_STEPS.includes(ui.key)) {
     body.append(h('div', { class: 'row' }, h('span', { class: 'muted', style: 'flex:1' }, 'Step by step, directives and the AI guide: panel on the map.'),
-      h('button', { class: 'small', disabled: !!S.status!.live || S.busy, onclick: () => simStart(ui.key) }, 'Step by step')));
+      h('button', { class: 'small', disabled: !!S.status!.live || isBusy(), onclick: () => simStart(ui.key) }, 'Step by step')));
   }
   if (ui.key === 'cultures') {
     const pins = e.band_pins ?? [];
@@ -1773,17 +2039,19 @@ function stepCard(ui: StepUI, idx: number, ss: StepStatus): HTMLElement {
   }
 
   const later = S.status!.steps.slice(idx).filter((x) => x.state !== 'empty').length;
+  const busy = isBusy();
   body.append(h('div', { class: 'actions' },
-    idx > 0 && later ? h('button', { class: 'small', disabled: S.busy, title: `Remove the results of this step and the ${later > 1 ? 'later ones' : 'next'} (your edits stay); run again to rebuild them`,
+    idx > 0 && later ? h('button', { class: 'small', disabled: busy, title: `Remove the results of this step and the ${later > 1 ? 'later ones' : 'next'} (your edits stay); run again to rebuild them`,
       onclick: () => clearResults(ui.key, later) }, 'Clear from here') : null,
-    h('button', { class: 'primary', disabled: S.busy || ss.state === 'done', onclick: () => run(ui.key) },
-      S.busy ? 'Working…' : ss.state === 'done' ? 'Up to date' : idx === 0 ? 'Build grid' : `Run to step ${idx + 1}`)));
+    h('button', { class: 'primary', disabled: busy || ss.state === 'done', onclick: () => run(ui.key) },
+      busy ? 'Working…' : ss.state === 'done' ? 'Up to date' : idx === 0 ? 'Build grid' : `Run to step ${idx + 1}`)));
   if (ss.meta && ss.state !== 'empty') body.append(summary(ui.key, ss.meta));
   card.append(body);
   return card;
 }
 
 async function importHeightmap(path?: string, encoding?: any) {
+  if (isBusy()) return;
   const p = path ?? (await api.pickPng('Import heightmap (equirectangular PNG)'));
   if (!p) return;
   let enc = encoding;
@@ -1794,7 +2062,12 @@ async function importHeightmap(path?: string, encoding?: any) {
     else if (kind === 'linear') {
       const r = window.prompt('Linear range: black and white in metres', '-11000, 9000');
       if (!r) return;
-      const [a, b] = r.split(',').map(Number);
+      const parts = r.split(',').map((s) => Number(s.trim()));
+      const [a, b] = parts;
+      if (parts.length !== 2 || !Number.isFinite(a) || !Number.isFinite(b) || a >= b) {
+        toast('Enter two finite numbers "min, max" with min < max (e.g. -11000, 9000).', true);
+        return;
+      }
       enc = { kind: 'linear', min_m: a, max_m: b };
     } else enc = { kind: 'heightmap16' };
   }
@@ -1802,20 +2075,25 @@ async function importHeightmap(path?: string, encoding?: any) {
 }
 
 async function importProvinces(png?: string, csv?: string | null) {
+  if (isBusy()) return;
   const p = png ?? (await api.pickPng('Import provinces.png (one colour per province)'));
-  if (!p) return;
+  if (!p || isBusy()) return;
   const c = png ? csv ?? null : await api.pickFile('Its definition.csv (cancel to number the colours automatically)', 'definition.csv', ['csv']);
+  if (isBusy()) return;
+  S.busy = true;
   try {
     const st = await api.json<Status & { report?: any }>('import_provinces', { png: p, csv: c });
     const w: string[] = st.report?.warnings ?? [];
     toast(w.length ? `Imported ${st.report.provinces} provinces with ${w.length} warning(s): ${w[0]}` : `Imported ${st.report?.provinces ?? ''} provinces`);
     S.status = st;
+    S.busy = false;
     if (S.autoRun) await run('provinces');
     else {
       invalidate();
       await refreshStatus(st);
     }
   } catch (err) {
+    S.busy = false;
     toast(String(err), true);
   }
 }
@@ -1831,8 +2109,13 @@ function paramInput(p: Param): HTMLElement {
   const num = h('input', { type: 'number', min: p.min, max: p.max, step: p.step, value: v }) as HTMLInputElement;
   const slider = range ? (h('input', { type: 'range', min: p.min, max: p.max, step: p.step, value: v }) as HTMLInputElement) : null;
   num.addEventListener('change', () => {
+    const nv = Number(num.value);
+    if (!Number.isFinite(nv)) {
+      num.value = String(S.status!.params[p.group][p.key]);
+      return;
+    }
     if (slider) slider.value = num.value;
-    setParam(p.group, p.key, Number(num.value));
+    setParam(p.group, p.key, nv);
   });
   slider?.addEventListener('input', () => {
     num.value = slider.value;
@@ -1848,16 +2131,20 @@ function paramInput(p: Param): HTMLElement {
 
 /** Turn the random founders of the last run into pins (one band each), so they can be moved, resized or removed. */
 async function pinFounders(founders: { lat: number; lon: number; bands: number }[]) {
+  if (isBusy()) return;
+  S.busy = true;
   try {
     for (const f of founders) {
       await api.json('add_stroke', { stroke: { tool: 'band_pin', value: f.bands, radius_km: 100, points: [[f.lat, f.lon]] } });
     }
     const st = await api.json<Status>('status', {});
     S.status = st;
+    S.busy = false;
     invalidate();
     await refreshStatus(st);
     toast(`Pinned ${founders.length} founders`);
   } catch (err) {
+    S.busy = false;
     toast(String(err), true);
   }
 }
@@ -1893,7 +2180,10 @@ function summary(key: string, m: any): HTMLElement {
       const b = m.boundary_km ?? {};
       const names: [string, number][] = [['continent_continent', 1], ['ocean_continent', 2], ['ocean_ocean', 3], ['ocean_rift', 4], ['continental_rift', 5], ['transform', 6]];
       const total = names.reduce((a, [k]) => a + (b[k] ?? 0), 0) || 1;
-      box.append(h('div', { class: 'bars' }, ...names.map(([k, i]) => bar(BOUNDARY[i][0], (b[k] ?? 0) / total, BOUNDARY[i][1], `${fmt((b[k] ?? 0) / 1000)}k km`))));
+      box.append(h('div', { class: 'bars' }, ...names.map(([k, i]) => {
+        const entry = BOUNDARY[i] ?? [k, [128, 128, 128]];
+        return bar(entry[0], (b[k] ?? 0) / total, entry[1], `${fmt((b[k] ?? 0) / 1000)}k km`);
+      })));
       break;
     }
     case 'climate':
@@ -1925,11 +2215,14 @@ function summary(key: string, m: any): HTMLElement {
     case 'biomes': {
       const ks = Object.entries(m.koppen_share ?? {}).sort((a: any, b: any) => b[1] - a[1]).slice(0, 10) as [string, number][];
       box.append(h('h4', {}, 'Köppen share of land'), h('div', { class: 'bars' }, ...ks.map(([k, v]) => {
-        const e = KOPPEN.find((x) => x[0] === k)!;
-        return bar(`${k} ${e[2]}`, v, e[1], `${fmt(v * 100, 1)} %`);
+        const e = KOPPEN.find((x) => x[0] === k);
+        return bar(e ? `${k} ${e[2]}` : k, v, e ? e[1] : [128, 128, 128], `${fmt(v * 100, 1)} %`);
       })));
       const ts = Object.entries(m.terrain_share ?? {}).sort((a: any, b: any) => b[1] - a[1]).slice(0, 8) as [string, number][];
-      box.append(h('h4', {}, 'Terrain'), h('div', { class: 'bars' }, ...ts.map(([k, v]) => bar(k, v, TERRAIN.find((x) => x[0] === k)![1], `${fmt(v * 100, 1)} %`))));
+      box.append(h('h4', {}, 'Terrain'), h('div', { class: 'bars' }, ...ts.map(([k, v]) => {
+        const te = TERRAIN.find((x) => x[0] === k);
+        return bar(k, v, te ? te[1] : [128, 128, 128], `${fmt(v * 100, 1)} %`);
+      })));
       break;
     }
     case 'habitability':
@@ -2130,7 +2423,7 @@ function renderToolbar() {
   if (t.value === 'bands') bb.append(h('label', {}, h('span', {}, 'Bands'), h('input', { type: 'number', step: 1, min: 1, max: 200, value: val, onchange: (e: Event) => setVal(Number((e.target as HTMLInputElement).value)) })));
   if (t.value === 'goods') {
     const goods = TRADE_GOODS.map(([g], i) => [g, i + 1] as const).filter(([g]) => g !== 'none');
-    const crops = new Set(['cotton', 'sugar', 'coffee', 'tea', 'tobacco', 'rubber', 'silk']);
+    const crops = new Set(['cotton', 'sugar', 'coffee', 'tea', 'tobacco', 'rubber', 'silk', 'spices', 'dates', 'wine']);
     const deps = DEPOSITS;
     const opt = ([g, v]: readonly [string, number]) => h('option', { value: v, selected: val === v }, g);
     bb.append(h('label', {}, h('span', {}, 'Paint'), h('select', { onchange: (e: Event) => setVal(Number((e.target as HTMLSelectElement).value)) },
@@ -2205,7 +2498,7 @@ function toast(msg: string, err = false) {
 type Drag =
   | { kind: 'nav'; x: number; y: number }
   | { kind: 'link'; start: Vec3; end: Vec3 }
-  | { kind: 'stroke'; points: Vec3[]; base: Map<number, number>; dmin: Map<number, number>; noise: Map<number, number>; seed: number; gen: Noise | null }
+  | { kind: 'stroke'; points: Vec3[]; base: Map<number, number>; target: Float32Array | null; dmin: Map<number, number>; noise: Map<number, number>; seed: number; gen: Noise | null }
   | { kind: 'arrow'; start: Vec3 };
 
 function bindCanvas() {
@@ -2214,6 +2507,7 @@ function bindCanvas() {
   let space = false;
   window.addEventListener('keydown', (e) => { if (e.code === 'Space' && e.target === document.body) { space = true; e.preventDefault(); } });
   window.addEventListener('keyup', (e) => { if (e.code === 'Space') space = false; });
+  window.addEventListener('blur', () => { space = false; });
   cv.addEventListener('contextmenu', (e) => e.preventDefault());
 
   const pos = (e: PointerEvent | WheelEvent) => {
@@ -2226,7 +2520,7 @@ function bindCanvas() {
     cv.setPointerCapture(e.pointerId);
     const [x, y] = pos(e);
     const p = R.pick(x, y);
-    if (e.button !== 0 || S.tool === 'navigate' || space || !p || S.busy) {
+    if (e.button !== 0 || S.tool === 'navigate' || space || !p || isBusy()) {
       drag = { kind: 'nav', x: e.clientX, y: e.clientY };
       cv.style.cursor = 'grabbing';
       return;
@@ -2246,7 +2540,7 @@ function bindCanvas() {
       return;
     }
     const seed = Math.floor(Math.random() * 2 ** 32);
-    drag = { kind: 'stroke', points: [p], base: new Map(), dmin: new Map(), noise: new Map(), seed, gen: tdef.scatter ? new Noise(seed, SCATTER_STREAM) : null };
+    drag = { kind: 'stroke', points: [p], base: new Map(), target: null, dmin: new Map(), noise: new Map(), seed, gen: tdef.scatter ? new Noise(seed, SCATTER_STREAM) : null };
     paintPreview(drag, p);
   });
 
@@ -2320,7 +2614,8 @@ function bindCanvas() {
         points: d.points.map((p) => toLatLon(p).map((v) => +((v * 180) / Math.PI).toFixed(4))),
       };
       drawBrush(null);
-      await mutate('add_stroke', { stroke }, t.step);
+      const ok = await mutate('add_stroke', { stroke }, t.step);
+      if (!ok) restoreStrokePreview(d);
     } else if (d.kind === 'link') {
       R.setOverlay('brush', null, null);
       const t = TOOLS.find((x) => x.id === S.tool)!;
@@ -2368,8 +2663,20 @@ function bindCanvas() {
       await mutate('add_arrow', { arrow: { lat: (lat * 180) / Math.PI, lon: (lon * 180) / Math.PI, bearing_deg: +bearing.toFixed(1), speed_mm_yr: S.toolValue['arrow'] ?? 50 } }, 'plates');
     }
   };
+  const cancel = () => {
+    const d = drag;
+    drag = null;
+    cv.style.cursor = '';
+    if (!d) return;
+    if (d.kind === 'stroke') {
+      restoreStrokePreview(d);
+      drawBrush(null);
+    } else if (d.kind === 'link' || d.kind === 'arrow') {
+      R.setOverlay('brush', null, null);
+    }
+  };
   cv.addEventListener('pointerup', end);
-  cv.addEventListener('pointercancel', end);
+  cv.addEventListener('pointercancel', cancel);
   cv.addEventListener('pointerleave', () => { if (!drag) drawBrush(null); });
 
   cv.addEventListener('wheel', (e) => {
@@ -2379,6 +2686,33 @@ function bindCanvas() {
     else R.zoom = Math.max(0.5, Math.min(60, R.zoom / k));
     R.requestDraw();
   }, { passive: false });
+}
+
+/** Restore cached sketch values and colours modified by paintPreview() if a stroke is cancelled or fails. */
+function restoreStrokePreview(d: Extract<Drag, { kind: 'stroke' }>) {
+  if (!d.target || !d.base.size) return;
+  for (const [c, v] of d.base) {
+    if (c < d.target.length) d.target[c] = v;
+  }
+  const g = S.grid;
+  if (!g || S.layer !== 'sketch' || !S.colors || !S.status) return;
+  const sk = S.cache.get('sketch|null')?.values as Float32Array | undefined;
+  const hint = S.cache.get('mountain_hint|null')?.values as Float32Array | undefined;
+  const land = S.cache.get('land|null')?.values as Uint8Array | undefined;
+  const drawing = S.status.edits.sketch_base === 'drawing' ? S.cache.get('drawing|null')?.values as Float32Array | undefined : undefined;
+  const fields = { sketch: sk, land: drawing ? land : undefined, mountain_hint: hint, drawing };
+  const touched = new Set<number>();
+  for (const c of d.base.keys()) {
+    touched.add(c);
+    if (drawing) for (const j of g.neighbors(c)) touched.add(j);
+  }
+  for (const c of touched) {
+    const col = sketchColor(g, fields, c);
+    S.colors[c * 4] = Math.min(255, col[0]);
+    S.colors[c * 4 + 1] = Math.min(255, col[1]);
+    S.colors[c * 4 + 2] = Math.min(255, col[2]);
+  }
+  R.setColors(S.colors);
 }
 
 /** Instant local feedback while painting the sketch; the core recomputes on release.
@@ -2398,6 +2732,7 @@ function paintPreview(d: Extract<Drag, { kind: 'stroke' }>, p: Vec3) {
   const drawing = S.status!.edits.sketch_base === 'drawing' ? S.cache.get('drawing|null')?.values as Float32Array | undefined : undefined;
   const target = tool === 'land' || tool === 'sea' ? drawing ?? sk : hint;
   if (!target) return;
+  d.target = target;
   const fields = { sketch: sk, land: drawing ? land : undefined, mountain_hint: hint, drawing };
   const goal = tool === 'land' ? 1 : tool === 'sea' ? -1 : tool === 'mountain' ? 1 : 0;
   const inner = Math.min(0.98, S.brush.hardness);
@@ -2444,12 +2779,13 @@ let hoverTimer: number | undefined;
 let hoverCell = -1;
 function hover(p: Vec3 | null) {
   if (!p || !S.grid) return;
+  if (hoverCell >= S.grid.n) hoverCell = -1;
   const c = S.grid.nearest(p, hoverCell >= 0 ? hoverCell : undefined);
   if (c === hoverCell) return;
   hoverCell = c;
   clearTimeout(hoverTimer);
   hoverTimer = window.setTimeout(async () => {
-    if (S.busy) return;
+    if (isBusy()) return;
     try {
       const d = await api.json('probe', { cell: c, month: S.month });
       if (d.state !== undefined) await political();
@@ -2554,21 +2890,24 @@ function describe(d: any): [string, string][] {
   tag = 'relief';
   if (d.elevation !== undefined) parts.push(`${Math.round(d.elevation).toLocaleString()} m`);
   if (d.plate !== undefined) parts.push(`plate #${d.plate}${d.crust === 1 ? ' (continental)' : d.crust === 0 ? ' (oceanic)' : ''}`);
-  if (d.boundary) parts.push(BOUNDARY[d.boundary][0]);
+  if (d.boundary > 0 && d.boundary < BOUNDARY.length) parts.push(BOUNDARY[d.boundary][0]);
   tag = 'climate';
   const adj = d.temp_adjust ?? 0;
   if (Array.isArray(d.temp)) {
     const mean = d.temp.reduce((a: number, b: number) => a + b, 0) / 12 + adj;
     parts.push(`${mean.toFixed(1)} °C (${(Math.min(...d.temp) + adj).toFixed(0)} to ${(Math.max(...d.temp) + adj).toFixed(0)})`);
-  } else if (typeof d.temp === 'number') parts.push(`${(d.temp + adj).toFixed(1)} °C in ${MONTHS[S.month ?? 0]}`);
+  } else if (typeof d.temp === 'number') parts.push(`${(d.temp + adj).toFixed(1)} °C in ${MONTHS[S.month ?? 0] ?? ''}`);
   if (d.foehn >= 0.1) parts.push(`Foehn +${d.foehn.toFixed(1)} °C`);
   if (d.p_ann !== undefined) parts.push(`${Math.round(d.p_ann).toLocaleString()} mm/yr`);
-  if (d.koppen) parts.push(`${KOPPEN[d.koppen][0]} ${KOPPEN[d.koppen][2]}`);
+  if (d.koppen > 0 && d.koppen < KOPPEN.length) parts.push(`${KOPPEN[d.koppen][0]} ${KOPPEN[d.koppen][2]}`);
   tag = 'land';
-  if (d.terrain !== undefined) parts.push(TERRAIN[d.terrain][0]);
+  if (d.terrain !== undefined && d.terrain >= 0 && d.terrain < TERRAIN.length) parts.push(TERRAIN[d.terrain][0]);
   tag = 'water';
   if (d.river) parts.push(`beside a ${riverClass(d.river_width)} ${Math.round(d.river_width).toLocaleString()} m wide, order ${d.river}`);
-  if (d.lake) parts.push(['', 'fresh lake', 'salt lake', 'dry lake'][d.lake]);
+  if (d.lake) {
+    const lk = ['', 'fresh lake', 'salt lake', 'dry lake'][d.lake];
+    if (lk) parts.push(lk);
+  }
   tag = 'land';
   if (d.site_kind) parts.push(d.site_kind === 3 ? 'site pin' : `spring (${d.site_kind === 2 ? 'basin floor' : 'mountain foot'}, ${d.groundwater?.toFixed(1)} m³/s)`);
   if (d.habitability !== undefined && d.water === 0) parts.push(`habitability ${d.habitability.toFixed(2)}${d.river_role === 1 ? ', border river' : d.river_role === 2 ? ', backbone river' : ''}`);
@@ -2605,7 +2944,7 @@ function describe(d: any): [string, string][] {
     const r = SIM.nations.get(d.realm) ?? S.political?.byNation.get(d.realm);
     parts.push(`realm of ${r ? r.name : '#' + d.realm}${d.imperial ? ' (imperial territory)' : ''}`);
   }
-  if (d.nation_era) parts.push(`${ERA_NAMES[d.nation_era - 1]} era`);
+  if (d.nation_era >= 1 && d.nation_era <= ERA_NAMES.length) parts.push(`${ERA_NAMES[d.nation_era - 1]} era`);
   tag = 'culture';
   if (d.culture) {
     const c = SIM.cultures.get(d.culture) ?? P?.byCulture.get(d.culture), g = c && P ? P.byGroup.get(c.group) : null;
@@ -2620,8 +2959,8 @@ function bindKeys() {
     const tag = (e.target as HTMLElement).tagName;
     if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
     if (e.ctrlKey || e.metaKey) {
-      if (e.key === 'z') { e.preventDefault(); if (S.status?.can_undo) mutate('undo', {}, undoTarget()); }
-      if (e.key === 'y' || (e.key === 'Z' && e.shiftKey)) { e.preventDefault(); if (S.status?.can_redo) mutate('redo', {}, undoTarget()); }
+      if (e.key === 'z') { e.preventDefault(); if (!isBusy() && S.status?.can_undo) void undoRedo('undo'); }
+      if (e.key === 'y' || (e.key === 'Z' && e.shiftKey)) { e.preventDefault(); if (!isBusy() && S.status?.can_redo) void undoRedo('redo'); }
       if (e.key === 's') { e.preventDefault(); onSave(); }
       return;
     }

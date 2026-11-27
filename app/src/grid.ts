@@ -66,7 +66,7 @@ export class Grid {
   }
 
   private walk(p: Vec3, start: number): number {
-    let cur = start;
+    let cur = start >= 0 && start < this.n ? start : 0;
     let best = this.dot(cur, p);
     for (;;) {
       let next = cur;
@@ -85,7 +85,7 @@ export class Grid {
   }
 
   nearest(p: Vec3, hint?: number): number {
-    let start = hint;
+    let start = hint !== undefined && hint >= 0 && hint < this.n ? hint : undefined;
     if (start === undefined) {
       const la = Math.asin(Math.max(-1, Math.min(1, p[1])));
       const lo = Math.atan2(p[0], p[2]);
