@@ -71,18 +71,18 @@ gdal_translate -of PNG -ot UInt16 -scale -11000 9000 0 65535 -outsize 4096 2048 
 cargo run --release -p worldcore --example earth_check -- earth16.png out/ 7
 ```
 
-Without GDAL, a rougher map (NASA Blue Marble land heights, made-up sea floor) comes from an npm package:
+An 8-bit export of the same data works too, but turns land below about 20 m into sea (the Nile delta, so "Cairo" is on the coast; the Ganges delta). Without GDAL, a rougher map (NASA Blue Marble land heights, made-up sea floor) comes from an npm package:
 
 ```bash
 npm pack three-globe && tar xzf three-globe-*.tgz
 python3 doc/tools/make_earth_heightmap.py package/example/img/earth-topology.png package/example/img/earth-water.png earth16.png
 ```
 
-Scores depend on the map (an 8-bit map loses land below about 20 m to the sea, the Ganges delta among it), so compare runs on the same file.
+Scores depend on the map, so compare runs on the same file.
 
 `out/report.txt` starts with the scores: January and July temperature errors at 133 places, the typical factor by which annual rain is off, the share of places in the right Köppen group and class, errors of the zonal means, and the Köppen shares of all land beside Earth's. Below is one line per place. The maps (`koppen.png`, `p_ann.png`, `p_jan.png` and `p_jul.png` with wind arrows, `t_jan.png`, `t_jul.png`, `cont.png`) show where the errors are. `FWM_PROBE="Moscow,Delhi"` prints those places month by month. Pass `-` for the heightmap and a seed as the fourth argument to run a generated world (then only the Köppen land shares mean anything).
 
-With the current model on ETOPO at level 7: January error 4.3 °C and July 3.2 °C (mean absolute), rain off by a typical factor of 1.9, 71% of places in the right Köppen group (36% in the exact class), zonal temperature error 2.2 °C, land shares A 15 / B 33 / C 20 / D 18 / E 13 (Earth about 19 / 30 / 14 / 24 / 13). Compare runs station by station, not only by the totals: a change can raise the totals while breaking a whole region. Check both a change's Earth scores and a few generated seeds: a constant that helps Earth can still give odd worlds elsewhere. Bump the climate entry of `MODEL_VERSION` with any change.
+With the current model on ETOPO at level 7: January error 4.3 °C and July 3.2 °C (mean absolute), rain off by a typical factor of 1.9, 68% of places in the right Köppen group (35% in the exact class), zonal temperature error 2.2 °C, land shares A 14 / B 35 / C 19 / D 18 / E 13 (Earth about 19 / 30 / 14 / 24 / 13). Compare runs station by station, not only by the totals: a change can raise the totals while breaking a whole region. Check both a change's Earth scores and a few generated seeds: a constant that helps Earth can still give odd worlds elsewhere. Bump the climate entry of `MODEL_VERSION` with any change.
 
 ### Tuning Stage 4
 Run a world once to nations, then re-run only Stage 4 with changed parameters: drop the `nations` entry from `world.json`'s `steps` (or bump `MODEL_VERSION`) and `worldgen run <project> --to nations`. `worldgen info <project> --json` and the `nations` meta (eras, transport, leader, counts) are the quickest summary.

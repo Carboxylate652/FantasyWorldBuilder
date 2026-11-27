@@ -754,6 +754,53 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
         }
         d
     };
+    // Seas joined to the open ocean only through narrow straits (narrower
+    // than about twice STRAIT_KM): take the sea cells farther than STRAIT_KM
+    // from land, find the pieces they form, and give every sea cell the piece
+    // nearest to it. Pieces smaller than a share of the planet are enclosed
+    // seas, as are seas too narrow to have any such cell.
+    let enclosed: Vec<bool> = {
+        let core: Vec<bool> = (0..nc).map(|i| ocean_c[i] && coast_km[i] > STRAIT_KM).collect();
+        let mut piece = vec![u32::MAX; nc];
+        let mut piece_area: Vec<f64> = Vec::new();
+        for start in 0..nc {
+            if !core[start] || piece[start] != u32::MAX {
+                continue;
+            }
+            let id = piece_area.len() as u32;
+            let mut area = 0.0;
+            let mut stack = vec![start];
+            piece[start] = id;
+            while let Some(i) = stack.pop() {
+                area += coarse.area[i];
+                for &nb in coarse.neighbors(i) {
+                    let j = nb as usize;
+                    if core[j] && piece[j] == u32::MAX {
+                        piece[j] = id;
+                        stack.push(j);
+                    }
+                }
+            }
+            piece_area.push(area);
+        }
+        // Grow the pieces back out over the rest of the sea.
+        let mut front: Vec<usize> = (0..nc).filter(|&i| piece[i] != u32::MAX).collect();
+        while !front.is_empty() {
+            let mut next = Vec::new();
+            for &i in &front {
+                for &nb in coarse.neighbors(i) {
+                    let j = nb as usize;
+                    if ocean_c[j] && piece[j] == u32::MAX {
+                        piece[j] = piece[i];
+                        next.push(j);
+                    }
+                }
+            }
+            front = next;
+        }
+        let total: f64 = coarse.area.iter().sum();
+        (0..nc).map(|i| ocean_c[i] && (piece[i] == u32::MAX || piece_area[piece[i] as usize] < ENCLOSED_SEA_SHARE * total)).collect()
+    };
     let offshore: Vec<Vec3> = {
         let passes = (UPWELL_KM / spacing_km).powi(2).ceil().clamp(2.0, 40.0) as usize;
         let mut v = sea_frac.clone();
@@ -1170,6 +1217,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 let conv_raw: Vec<f64> = (0..nc).map(|i| -grad.divergence(coarse, i, &wind_syn[m])).collect();
                 let conv = smooth(coarse, &smooth(coarse, &conv_raw));
                 let temp: Vec<f64> = (0..nc).map(|i| t_sl[m][i] as f64 - drop_c[i]).collect();
+                let t_year: Vec<f64> = (0..nc).map(|i| (0..12).map(|k| t_sl[k][i] as f64).sum::<f64>() / 12.0).collect();
                 // Share of each cell's water that leaves through each of its
                 // edges in one pass: the wind's flux through the edge (taken at
                 // the edge, so what one cell sends its neighbour receives),
@@ -1237,6 +1285,7 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 let mut lift = vec![0.0; nc];
                 let mut dissolve = vec![0.0; nc];
                 let mut cond_eff = vec![1.0; nc];
+                let mut sink = vec![0.0; nc];
                 let mut sub_dry = vec![1.0; nc];
                 for i in 0..nc {
                     let mut up = 0.0;
@@ -1327,11 +1376,16 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                     // continental air sinks (the far side of a monsoon trough).
                     let beyond = if a_zonal < belts.hadley {
                         let side = if line >= cz { 1.0 } else { -1.0 };
-                        FAR_CAP * smoothstep(2.0, 8.0, side * (lat - line)) * (1.0 - wf) * (1.0 - smoothstep(0.25, 0.6, mar_m))
+                        // (Moist monsoon air streaming on poleward past the trough
+                        // does not sink: the Meiyu front.)
+                        let moist_poleward = (poleward / 0.2).clamp(0.0, 1.0) * smoothstep(0.2, 0.45, mar_m);
+                        FAR_CAP * smoothstep(2.0, 8.0, side * (lat - line)) * (1.0 - wf) * (1.0 - smoothstep(0.25, 0.6, mar_m)) * (1.0 - moist_poleward)
                     } else {
                         0.0
                     };
                     lm *= 1.0 - beyond;
+                    // (It sinks: no cloud forms in it either.)
+                    let subside = 1.0 - (1.0 - subside) * (1.0 - beyond);
                     lm *= 1.0 + STORM_RAIN * gauss(a, storm_center, 14.0);
                     // Cold air is wrung out by fronts, modestly so mid-latitude
                     // interiors keep summer-peaking rain instead of dry summers.
@@ -1348,7 +1402,10 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                     dissolve[i] = 1.0 - (-down / CLOUD_DRY_M).exp();
                     let shadow = (-down / 900.0).exp();
                     // Summer convection over warm land, strongly capped by subtropical subsidence.
-                    let convect = 1.0 + 1.2 * (1.0 - wf) * (1.0 - subside).powi(2) * smoothstep(4.0, 24.0, temp[i]);
+                    // (Land heats the air from below in its warm season; in the
+                    // always-hot tropics all year.)
+                    let warm_season = smoothstep(-1.0, 3.0, t_sl[m][i] as f64 - t_year[i]).max(smoothstep(22.0, 26.0, temp[i]));
+                    let convect = 1.0 + 1.2 * (1.0 - wf) * (1.0 - subside).powi(2) * smoothstep(4.0, 24.0, temp[i]) * warm_season;
                     // Over parched ground the air is dry far up: showers
                     // evaporate before they land.
                     let parched = 1.0 - DRY_GROUND_CAP * dry_v * (1.0 - wf);
@@ -1365,10 +1422,11 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                     cond_eff[i] = (1.0 - 0.55 * dry_v * (1.0 - wf)) * (1.0 - subside).powi(2) * cold_coast.powi(3);
                     // Subsiding subtropical highs entrain drier air from aloft.
                     sub_dry[i] = 1.0 - 0.012 * subside * (1.0 - wf);
+                    sink[i] = subside;
                     // Open water (ocean and lakes) moistens the air toward
                     // saturation, faster in wind; narrow enclosed seas moisten
                     // only a shallower boundary layer than the open ocean.
-                    evap[i] = wf * (0.35 + 0.65 * smoothstep(UPWELL_OPEN.0 - 0.15, UPWELL_OPEN.0 + 0.05, sea_wide[i])) * EVAPORATION_RATE * (0.4 + 0.6 * wind[i].len().min(2.0));
+                    evap[i] = wf * (0.35 + 0.65 * if enclosed[i] { ENCLOSED_SEA_EVAP } else { smoothstep(UPWELL_OPEN.0 - 0.15, UPWELL_OPEN.0 + 0.05, sea_wide[i]) }) * EVAPORATION_RATE * (0.4 + 0.6 * wind[i].len().min(2.0));
                     // Land gives back part of its rain, more where it is warm
                     // and vegetated (never all: the rest runs off, so rain
                     // inland needs moisture from the sea; parched deserts have
@@ -1430,7 +1488,8 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                             c += (v - sat[i]) * cond_eff[i];
                             v = sat[i];
                         }
-                        let rc = c * CLOUD_FALLOUT;
+                        // Cloud under a subsidence inversion (stratocumulus) hardly rains.
+                        let rc = c * CLOUD_FALLOUT * (1.0 - 0.8 * sink[i]);
                         let rain = r + rc;
                         w_next[i] = v;
                         cl_next[i] = c - rc;
@@ -1696,6 +1755,12 @@ const UPWELL_KM: f64 = 500.0;
 /// Share of sea within ~OCEAN_WIDE_KM below which a coast has no upwelling, and above which it has it in full.
 const UPWELL_OPEN: (f64, f64) = (0.35, 0.55);
 const OCEAN_WIDE_KM: f64 = 1500.0;
+/// Seas joined to the ocean only through straits narrower than about twice
+/// this (km), and smaller than this share of the planet, are enclosed seas.
+const STRAIT_KM: f64 = 120.0;
+const ENCLOSED_SEA_SHARE: f64 = 0.02;
+/// How readily an enclosed sea moistens the air, against the open ocean's 1.
+const ENCLOSED_SEA_EVAP: f64 = 0.15;
 /// Gyre currents, in units of *Coastal currents*: the warm western-boundary
 /// current (Gulf Stream, Kuroshio), the warm subpolar drift and the cold
 /// current down subpolar west coasts (Labrador, Oyashio).

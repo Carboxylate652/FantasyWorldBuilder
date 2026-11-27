@@ -1207,7 +1207,12 @@ impl CultureSim {
             *prov_cult[bands.prov[b] as usize].entry(bands.culture[b]).or_insert(0.0) += bands.pop[b];
         }
         let majority = |m: &BTreeMap<u32, f64>| m.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap().then(b.0.cmp(a.0))).map(|(&c, _)| c);
-        let prov_major: Vec<u32> = prov_cult.iter().map(|m| majority(m).unwrap_or(0)).collect();
+        let mut prov_major: Vec<u32> = prov_cult.iter().map(|m| majority(m).unwrap_or(0)).collect();
+        for &(p, c) in &edited.lock_provs {
+            if prov_major[p] == 0 {
+                prov_major[p] = c;
+            }
+        }
         let world_pop: f64 = cult_pop.iter().sum();
 
         // Names: cultures, groups, then provinces (majority culture's language, or
@@ -1575,6 +1580,9 @@ struct EditOutcome {
     /// Cultures to give a new name from their language (with a seed).
     new_names: Vec<(u32, u64)>,
     locked: HashSet<u32>,
+    /// Provinces held by a locked culture (province index, culture), so a
+    /// locked province that nobody lives in any more still belongs to it.
+    lock_provs: Vec<(usize, u32)>,
     unapplied: Vec<serde_json::Value>,
 }
 
@@ -1847,6 +1855,7 @@ impl CultureSim {
                         out.names.insert(m, s.name.trim().to_string());
                     }
                     out.locked.insert(m);
+                    out.lock_provs.extend(snap.iter().map(|&p| (p, m)));
                 }
                 _ => {}
             }
