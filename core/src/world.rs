@@ -63,9 +63,12 @@ impl World {
         stages::input_hashes(&self.params, &self.edits)
     }
 
+    pub fn is_fresh_with(&self, step: Step, hashes: &[u64; stages::N_STEPS]) -> bool {
+        matches!(&self.steps[step.index()], Some(d) if d.hash == hashes[step.index()])
+    }
+
     pub fn is_fresh(&self, step: Step) -> bool {
-        let h = self.expected_hashes();
-        matches!(&self.steps[step.index()], Some(d) if d.hash == h[step.index()])
+        self.is_fresh_with(step, &self.expected_hashes())
     }
 
     pub fn status(&self) -> Vec<StepStatus> {
@@ -192,8 +195,13 @@ impl World {
         std::fs::create_dir_all(dir.join("fields"))?;
         let mut steps_json = Vec::new();
         for &s in STEPS.iter() {
-            let Some(d) = &self.steps[s.index()] else { continue };
             let sdir = dir.join("fields").join(s.key());
+            let Some(d) = &self.steps[s.index()] else {
+                if sdir.exists() {
+                    let _ = std::fs::remove_dir_all(&sdir);
+                }
+                continue;
+            };
             std::fs::create_dir_all(&sdir)?;
             let mut fields_json = Vec::new();
             for (name, f) in &d.fields.0 {
@@ -265,8 +273,14 @@ impl World {
             'steps: for sj in steps {
                 let Some(step) = sj["step"].as_str().and_then(Step::from_key) else { continue };
                 let Some(h) = sj["hash"].as_str().and_then(|s| u64::from_str_radix(s, 16).ok()) else { continue };
+                let Some(fields_arr) = sj["fields"].as_array() else {
+                    continue;
+                };
+                if step != Step::Planet && fields_arr.is_empty() {
+                    continue;
+                }
                 let mut fields = Fields::default();
-                for fj in sj["fields"].as_array().into_iter().flatten() {
+                for fj in fields_arr {
                     let (Some(name), Some(ty), Some(file)) = (fj["name"].as_str(), fj["type"].as_str(), fj["file"].as_str()) else {
                         continue 'steps;
                     };

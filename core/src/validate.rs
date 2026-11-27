@@ -42,9 +42,12 @@ impl Report {
 pub fn validate(w: &mut World) -> Report {
     let mut r = Report::default();
     let mut seen = HashMap::new();
+    // Ensure the grid is built so World::field() can verify grid fields on loaded projects.
+    let _ = w.grid();
 
+    let hashes = w.expected_hashes();
     for st in STEPS {
-        if w.steps[st.index()].is_some() && !w.is_fresh(st) {
+        if w.steps[st.index()].is_some() && !w.is_fresh_with(st, &hashes) {
             r.warnings.push(format!("step {} is stale: run it again to bring it up to date", st.key()));
         }
     }
@@ -88,7 +91,7 @@ fn political(w: &mut World, t: &Value, r: &mut Report, seen: &mut HashMap<String
     let states = t["states"].as_array().unwrap_or(&empty);
 
     r.check("province ids and colours unique");
-    let mut pid: HashMap<u64, &Value> = HashMap::new();
+    let mut pid: std::collections::BTreeMap<u64, &Value> = std::collections::BTreeMap::new();
     let mut colors = HashSet::new();
     for p in provs {
         let id = p["id"].as_u64().unwrap_or(0);
@@ -138,7 +141,7 @@ fn political(w: &mut World, t: &Value, r: &mut Report, seen: &mut HashMap<String
 
     r.check("province field matches the table");
     if let Some((Field::U32(field), _, _)) = w.field("province") {
-        let mut cells: HashMap<u64, usize> = HashMap::new();
+        let mut cells: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
         for &v in field.iter() {
             if v != 0 {
                 *cells.entry(v as u64).or_insert(0) += 1;
@@ -179,7 +182,7 @@ fn nations(w: &World, t: &Value, r: &mut Report, seen: &mut HashMap<String, usiz
     r.check("nations: owners, capitals and province counts");
     let empty = vec![];
     let nations = t["nations"].as_array().unwrap_or(&empty);
-    let alive: HashMap<u64, &Value> = nations.iter().filter(|n| n["ended"].is_null()).map(|n| (n["id"].as_u64().unwrap_or(0), n)).collect();
+    let alive: std::collections::BTreeMap<u64, &Value> = nations.iter().filter(|n| n["ended"].is_null()).map(|n| (n["id"].as_u64().unwrap_or(0), n)).collect();
     let mut count: HashMap<u64, u64> = HashMap::new();
     let mut owner_of: HashMap<u64, u64> = HashMap::new();
     for p in t["provinces"].as_array().unwrap_or(&empty) {
@@ -202,7 +205,9 @@ fn nations(w: &World, t: &Value, r: &mut Report, seen: &mut HashMap<String, usiz
     }
     r.check("nations: owner field matches the table");
     if let (Some((Field::U16(of), _, _)), Some((Field::U32(pf), _, _))) = (w.field("owner"), w.field("province")) {
-        if let Some(i) = pf.iter().enumerate().find(|(i, id)| owner_of.get(&(**id as u64)).is_some_and(|&o| of[*i] as u64 != o)).map(|x| x.0) {
+        if of.len() != pf.len() {
+            r.err("owner field", format!("owner field length {} differs from province field length {}", of.len(), pf.len()), seen);
+        } else if let Some(i) = pf.iter().enumerate().find(|(i, id)| owner_of.get(&(**id as u64)).is_some_and(|&o| of[*i] as u64 != o)).map(|x| x.0) {
             r.err("owner field", format!("grid cell {i} has owner {} but its province's owner differs", of[i]), seen);
         }
     }
@@ -211,7 +216,7 @@ fn nations(w: &World, t: &Value, r: &mut Report, seen: &mut HashMap<String, usiz
 fn cultures(t: &Value, c: &Value, r: &mut Report, seen: &mut HashMap<String, usize>) {
     r.check("cultures and groups consistent");
     let empty = vec![];
-    let alive: HashMap<u64, u64> = c["cultures"]
+    let alive: std::collections::BTreeMap<u64, u64> = c["cultures"]
         .as_array()
         .unwrap_or(&empty)
         .iter()

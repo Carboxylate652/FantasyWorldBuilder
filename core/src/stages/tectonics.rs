@@ -469,6 +469,9 @@ fn apply_elevation_overrides(ctx: &Ctx, elev: &mut [f32]) {
     let g = ctx.grid;
     let mut scratch = Vec::new();
     for s in &ctx.edits.overrides.elevation {
+        if !matches!(s.tool, Tool::Raise | Tool::Lower | Tool::Flatten | Tool::Smooth) {
+            continue;
+        }
         let cov = stroke_coverage(g, s, ctx.params.planet.radius_km, &mut scratch);
         match s.tool {
             Tool::Raise => cov.iter().for_each(|&(c, w)| elev[c as usize] += w * s.value as f32),
