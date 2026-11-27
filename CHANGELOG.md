@@ -11,7 +11,13 @@ A more realistic climate, tuned on Earth's real terrain.
 - **Orographic rain** is gentler: a windward slope now gets about 1.3× the rain of flat ground (1.5–1.9× in 0.3.1) and about 1.5× the rain of the lee slope. Raise *Orographic rain ×* for stronger contrasts.
 - Four new settings in the Climate card: *Plateau lapse rate*, *Continental cooling*, *Dry-ground heat ×*, *Monsoon ×*.
 - The climate step takes about twice as long (about 6 s at climate level 7; Hydrology solves it once more for lakes). Climate and everything after it change for the same seed.
-- Still off on Earth: humid subtropical east coasts and their hinterland are too dry, deserts beside the monsoon belt too wet, mountainous west coasts too wet, and the coldest continental winters too mild (eastern Siberia by 15–25 °C).
+- **Refined against NOAA ETOPO 2022 terrain** (real land and sea floor):
+  - **Ocean currents from the wind and the basins:** cold water only where the wind drives surface water off an open coast (upwelling: Peru, Benguela, California, the Canaries, and monsoon coasts in season), warm currents along the west side of each basin and across the subpolar ocean, a cold current down subpolar west coasts. Monsoon seas are no longer cold: Mumbai, Hanoi and the Bay of Bengal get their monsoon rain back, and the North Atlantic is mild again.
+  - **Seasons:** land and sea lag the sun by about a month and two months; deep high-latitude interiors form winter inversions (Yakutsk in January is now about right); sea ice is set month by month.
+  - **Subtropics:** oceanic highs make west coasts dry and east coasts wet; air sinking over cold upwelled water dries coastal deserts; continental air beyond a monsoon trough sinks; deserts have hotter summers and colder winters.
+  - **Moisture:** vapour and cloud are carried as mixing ratios; large-scale convergence comes from the winds before mountain blocking (no speckle on hill slopes); narrow enclosed seas evaporate less.
+  - Earth check on ETOPO at level 7: Köppen group 71% of 133 places (exact class 36%), annual rain off by a typical factor of 1.9, January error 4.3 °C and July 3.2 °C, land shares A 15 / B 33 / C 20 / D 18 / E 13.
+- Still off on Earth: Delhi and the Ganges plain, the Chaco and the Horn of Africa (the model has no low-level jets along the Andes or East Africa), the Mediterranean and Arabia (too wet; Riyadh's summer too cool), and the interiors of North America and Kazakhstan in winter (too mild: the westerlies that keep Europe mild reach them too).
 
 - **Latitude lines:** the globe and the flat map mark the equator (solid) and 30° and 60° north and south (dashed) for reference, under rivers, borders and the other overlays. The *Latitudes* toggle in the overlay row turns them off (remembered).
 

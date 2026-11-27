@@ -133,7 +133,9 @@ pub struct ClimateParams {
     pub lapse_rate_c_per_km: f64,
     /// Global mean precipitation at Earth temperature (mm/year).
     pub global_precip_mm: f64,
-    /// Strength of warm/cold coastal current offsets (°C at full effect).
+    /// Strength of ocean currents (°C at full effect): warm western-boundary
+    /// currents and subpolar drift, cold water where the wind drives upwelling
+    /// on open coasts.
     pub ocean_current_c: f64,
     /// How far maritime air reaches inland along the wind (km).
     pub maritime_reach_km: f64,
@@ -142,7 +144,7 @@ pub struct ClimateParams {
     /// fades to nothing at 30°).
     pub continental_cooling: f64,
     /// Dry ground swings further with the seasons than moist ground (1 = a
-    /// desert summer about 5.5 °C hotter and its winter 2.5 °C colder).
+    /// desert summer about 9 °C hotter and its winter 4 °C colder).
     pub dry_heat: f64,
     /// Temperature drop per km of height of broad highlands and plateaus,
     /// which warm the air above them (peaks and valleys within them follow

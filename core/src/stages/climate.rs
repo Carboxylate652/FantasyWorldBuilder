@@ -86,8 +86,8 @@ const DAY_S: f64 = 86400.0;
 /// Parched ground and the dry air over it swing further with the seasons
 /// (°C at `dry_heat` = 1): this much warmer over the year, and this much
 /// more again at the height of summer, less in the depth of winter.
-const DRY_HEAT_MEAN_C: f64 = 1.5;
-const DRY_HEAT_SWING_C: f64 = 4.0;
+const DRY_HEAT_MEAN_C: f64 = 2.5;
+const DRY_HEAT_SWING_C: f64 = 6.5;
 /// Moist ground, cooled by evaporation and cloud, is this much cooler than the sea at its latitude.
 const WET_LAND_COOL_C: f64 = 1.2;
 /// Scale over which heights are averaged into "broad" highlands (km).
@@ -1299,9 +1299,18 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                     } else {
                         0.0
                     };
+                    // Over cold upwelled water, air that spreads out near the
+                    // ground is replaced by air sinking from above, which
+                    // warms and dries as it comes down and caps the cool
+                    // marine layer (the coastal deserts of Peru, Namibia and
+                    // Baja) - but not moist air streaming poleward or in from
+                    // the sea as a monsoon.
+                    let cold_coast = (1.0 + 0.2 * cur[i].min(0.0) * mar[i]).clamp(0.15, 1.0);
+                    let div = (-conv[i] / 3.0e-6).clamp(0.0, 1.0) * (1.0 - (poleward / 0.15).clamp(0.0, 1.0).max(monsoon_w)) * smoothstep(0.0, 0.4, 1.0 - cold_coast);
                     let sub_wind = (0.80 - 3.2 * poleward).clamp(0.0, 1.0) * (1.0 - monsoon_w.max(moist_conv));
                     let sub_env = (1.15 * gauss(a_zonal, belts.hadley, 10.5)).min(1.0);
                     let subside = 0.94 * sub_env * sub_wind;
+                    let subside = (subside + DIVERGE_SINK * div * (1.0 - subside)).min(0.95);
                     lm *= 1.0 - subside;
                     lm *= 1.0 + 1.2 * gauss(a_zonal, belts.hadley, 12.0) * (poleward / 0.25).clamp(0.0, 1.0);
                     // The trade-wind belts between the rain band and the highs
@@ -1314,11 +1323,19 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                         0.0
                     };
                     lm *= 1.0 - tsub;
+                    // Beyond the convergence line, over land in the hot season,
+                    // continental air sinks (the far side of a monsoon trough).
+                    let beyond = if a_zonal < belts.hadley {
+                        let side = if line >= cz { 1.0 } else { -1.0 };
+                        FAR_CAP * smoothstep(2.0, 8.0, side * (lat - line)) * (1.0 - wf) * (1.0 - smoothstep(0.25, 0.6, mar_m))
+                    } else {
+                        0.0
+                    };
+                    lm *= 1.0 - beyond;
                     lm *= 1.0 + STORM_RAIN * gauss(a, storm_center, 14.0);
                     // Cold air is wrung out by fronts, modestly so mid-latitude
                     // interiors keep summer-peaking rain instead of dry summers.
                     lm *= 1.0 + 0.35 * smoothstep(-15.0, 5.0, -temp[i]);
-                    let cold_coast = (1.0 + 0.2 * cur[i].min(0.0) * mar[i]).clamp(0.15, 1.0);
                     // Air forced up a slope rains more readily; air coming down
                     // the far side hardly at all. Under strong subsidence or
                     // cold coastal inversions, coastal hills form marine stratus
@@ -1669,6 +1686,11 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
 /// of offshore Ekman drive (wind speed² in belt-wind units, yearly mean), its
 /// cap, and the distance from the coast over which it fades (km).
 const UPWELL_GAIN: f64 = 3.0;
+/// Share of rain readiness that continental air beyond the convergence line
+/// loses (it sinks on the far side of a monsoon trough).
+const FAR_CAP: f64 = 0.6;
+/// Share of full subsidence that strong low-level divergence brings.
+const DIVERGE_SINK: f64 = 0.65;
 const UPWELL_MAX: f64 = 1.5;
 const UPWELL_KM: f64 = 500.0;
 /// Share of sea within ~OCEAN_WIDE_KM below which a coast has no upwelling, and above which it has it in full.
