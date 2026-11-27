@@ -24,6 +24,7 @@ cargo test --release -p worldcore -p fwm-update -p fwm-guide
 - **Pipeline tests** (`core/tests/pipeline.rs`, small worlds): grid topology and location; Köppen against real stations; insolation; determinism and save/load; staleness; climate plausibility; heightmap round trip; Stage 2 completeness and the provinces.png round trip; cultures and the family tree; override bundles and unapplied edits; validation; cash crops and oil; the goods editor; attraction; springs and site pins; nations consistency; cities rising and falling with pins; transport, economy and eras (`transport_economy_and_eras`); live runs with directives equal fresh runs.
 - **Guide mock test** (`guide/tests/mock.rs`): a local mock provider in both formats.
 - **Determinism:** `worldgen check`.
+- **Earth check** (`core/examples/earth_check.rs`): the climate step on Earth's real terrain, scored against 133 places. See *Tuning the climate* below.
 - **Consistency:** `worldgen validate <project> --run`.
 
 ## Continuous integration and releases
@@ -60,6 +61,19 @@ cargo test --release -p worldcore -p fwm-update -p fwm-guide
 
 ### Add a step
 Add a variant to `Step` and `STEPS`, a parameter struct, a module under `stages/`, its inputs to the cache key, a `MODEL_VERSION` entry, a card in `schema.ts`, export and validation as needed. This changes `N_STEPS` and the project format; prefer extending an existing step when possible.
+
+### Tuning the climate
+The climate constants are tuned on Earth: real terrain in, and the result compared with what Earth's climate is. No Earth data ships with the repository, so build the heightmap once:
+
+```bash
+npm pack three-globe && tar xzf three-globe-*.tgz        # NASA Blue Marble height image and water mask
+python3 doc/tools/make_earth_heightmap.py package/example/img/earth-topology.png package/example/img/earth-water.png earth16.png
+cargo run --release -p worldcore --example earth_check -- earth16.png out/ 7
+```
+
+`out/report.txt` starts with the scores: January and July temperature errors at 133 places, the typical factor by which annual rain is off, the share of places in the right Köppen group and class, errors of the zonal means, and the Köppen shares of all land beside Earth's. Below is one line per place. The maps (`koppen.png`, `p_ann.png`, `p_jan.png` and `p_jul.png` with wind arrows, `t_jan.png`, `t_jul.png`, `cont.png`) show where the errors are. `FWM_PROBE="Moscow,Delhi"` prints those places month by month. Pass `-` for the heightmap and a seed as the fourth argument to run a generated world (then only the Köppen land shares mean anything).
+
+With the current model at level 7: January error 3.9 °C and July 2.9 °C (mean absolute), rain off by a typical factor of 2.1, 63% of places in the right Köppen group, zonal temperature error 1.9 °C, land shares A 19 / B 26 / C 22 / D 20 / E 12 (Earth about 19 / 30 / 14 / 24 / 13). Check both a change's Earth scores and a few generated seeds: a constant that helps Earth can still give odd worlds elsewhere. Bump the climate entry of `MODEL_VERSION` with any change.
 
 ### Tuning Stage 4
 Run a world once to nations, then re-run only Stage 4 with changed parameters: drop the `nations` entry from `world.json`'s `steps` (or bump `MODEL_VERSION`) and `worldgen run <project> --to nations`. `worldgen info <project> --json` and the `nations` meta (eras, transport, leader, counts) are the quickest summary.

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+A more realistic climate, tuned on Earth's real terrain.
+
+- **Earth check:** the climate step now has a yardstick. `core/examples/earth_check.rs` runs it on Earth's terrain and scores the result against climate normals of 133 places, observed zonal means and Earth's Köppen shares (`doc/development.md`, *Tuning the climate*; the heightmap is built from public NASA images, not shipped). Against 0.3.1 on Earth: January error 5.4 → 3.9 °C, July 6.3 → 2.9 °C, annual rain off by a typical factor of 2.8 → 2.1, places in the right Köppen group 47% → 63%, and land shares from A 11 / B 46 / C 13 / D 7 / E 24 to A 19 / B 26 / C 22 / D 20 / E 12 (Earth: about 19 / 30 / 14 / 24 / 13).
+- **Temperature:** warmer, more even tropics and a steeper drop across the mid-latitudes. The sea freezes (pack ice makes winters continental), while ice sheets last only on land whose summer stays below freezing, so a polar continent grows an ice cap that builds its own height, and a polar ocean does not. Broad plateaus are warmer than lone peaks of the same height (*Plateau lapse rate*), high-latitude interiors are colder over the year (*Continental cooling*), deserts have hotter summers and colder winters (*Dry-ground heat ×*), and maritime air is followed for each half of the year, so a coast with offshore winter wind has a cold winter and a mild summer.
+- **Monsoons:** the tropical rain belt follows the heat in each longitude sector: far poleward over hot summer land, near the equator over open ocean (*Monsoon ×*). Trade winds that cross the equator to reach it turn into wet westerlies and bring a summer rainy season. Westerlies shift with the seasons, and cold winter highs are weaker.
+- **Rain:** far fewer deserts. Humidity is carried along the wind as flows between cells, which conserves water and removes the grid pattern from the rain. Land returns a share of its rain to the air, so rain reaches deep into wet continents but deserts stay dry. Rain comes from relative humidity (showers in warm rising air, steady rain from saturated air), storms in the westerlies spread moisture widely, and the subtropical highs keep west coasts dry and leave east coasts wetter.
+- **Orographic rain** is gentler: a windward slope now gets about 1.3× the rain of flat ground (1.5–1.9× in 0.3.1) and about 1.5× the rain of the lee slope. Raise *Orographic rain ×* for stronger contrasts.
+- Four new settings in the Climate card: *Plateau lapse rate*, *Continental cooling*, *Dry-ground heat ×*, *Monsoon ×*.
+- The climate step takes about twice as long (about 6 s at climate level 7; Hydrology solves it once more for lakes). Climate and everything after it change for the same seed.
+- Still off on Earth: humid subtropical east coasts and their hinterland are too dry, deserts beside the monsoon belt too wet, mountainous west coasts too wet, and the coldest continental winters too mild (eastern Siberia by 15–25 °C).
+
 - **Latitude lines:** the globe and the flat map mark the equator (solid) and 30° and 60° north and south (dashed) for reference, under rivers, borders and the other overlays. The *Latitudes* toggle in the overlay row turns them off (remembered).
 
 Continents from your drawing, in one step.

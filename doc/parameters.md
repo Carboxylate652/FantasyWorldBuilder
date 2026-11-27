@@ -57,14 +57,18 @@ Every parameter of the twelve steps, with its default and meaning. This file is 
 | Name | UI label | Default | Meaning |
 | --- | --- | --- | --- |
 | `climate_level` | — | `7` | Grid level the climate is solved on (capped at the world level). |
-| `lapse_rate_c_per_km` | Lapse rate (°C/km) (0–12) | `6.5` | — |
+| `lapse_rate_c_per_km` | Lapse rate (°C/km) (0–12) | `6.5` | Temperature drop per km of height on peaks and slopes that stand in the free air. |
 | `global_precip_mm` | Global precipitation (mm/yr) (100–3000) | `1000.0` | Global mean precipitation at Earth temperature (mm/year). |
 | `ocean_current_c` | Coastal currents (°C) (0–15) | `5.0` | Strength of warm/cold coastal current offsets (°C at full effect). |
 | `maritime_reach_km` | Maritime reach (km) (100–5000) | `1400.0` | How far maritime air reaches inland along the wind (km). |
+| `continental_cooling` | Continental cooling (°C) (0–25) | `12.0` | How much colder over the year a continental interior is than a sea-facing place at the same high latitude (°C, from 62° poleward; fades to nothing at 30°). |
+| `dry_heat` | Dry-ground heat × (0–3) | `1.0` | Dry ground swings further with the seasons than moist ground (1 = a desert summer about 5.5 °C hotter and its winter 2.5 °C colder). |
+| `plateau_lapse_c_per_km` | Plateau lapse rate (°C/km) (0–12) | `4.5` | Temperature drop per km of height of broad highlands and plateaus, which warm the air above them (peaks and valleys within them follow the free-air lapse rate). |
 | `orographic` | Orographic rain × (0–4) | `1.0` | Orographic rain strength: wet air forced up a slope condenses part of its vapour into cloud that rains out over the slope and the crest (1 = 63% within 800 m of climb), and rain shifts onto slopes facing the wind on the world grid. |
 | `moisture_passes` | Moisture passes (20–300) | `90` | — |
 | `heat_diffusion` | Poleward heat transport (0.1–2) | `0.68` | Heat transport toward the poles (W/m²/K, North's D). |
 | `thermal_wind` | Thermal winds × (0–3) | `1.0` | Strength of winds driven by thermal pressure systems (monsoons, continental highs). |
+| `monsoon` | Monsoon × (0–1) | `1.0` | How far the tropical rain belt follows the summer heat of the continents (0 = the same latitude all round the planet, 1 = fully: monsoons). |
 | `mountain_blocking` | Mountain blocking (0–1) | `0.7` | Fraction of upslope wind turned along the contours of steep terrain. |
 | `sea_air_blocking` | Mountains block sea air (0–3) | `1.0` | How strongly mountains hold back maritime air (1 = air coming down the lee side loses about half its maritime influence per 2 km of descent). |
 | `foehn` | Foehn × (0–3) | `1.0` | Foehn strength: air that rains out climbing a range comes down the far side warmer (1 = 1.5 °C per km of wet climb, at most about 4 °C in a month, fading downwind). |

@@ -137,6 +137,17 @@ pub struct ClimateParams {
     pub ocean_current_c: f64,
     /// How far maritime air reaches inland along the wind (km).
     pub maritime_reach_km: f64,
+    /// How much colder over the year a continental interior is than a
+    /// sea-facing place at the same high latitude (°C, from 62° poleward;
+    /// fades to nothing at 30°).
+    pub continental_cooling: f64,
+    /// Dry ground swings further with the seasons than moist ground (1 = a
+    /// desert summer about 5.5 °C hotter and its winter 2.5 °C colder).
+    pub dry_heat: f64,
+    /// Temperature drop per km of height of broad highlands and plateaus,
+    /// which warm the air above them (peaks and valleys within them follow
+    /// the free-air lapse rate).
+    pub plateau_lapse_c_per_km: f64,
     /// Orographic rain strength: wet air forced up a slope condenses part of
     /// its vapour into cloud that rains out over the slope and the crest (1 =
     /// 63% within 800 m of climb), and rain shifts onto slopes facing the wind
@@ -147,6 +158,9 @@ pub struct ClimateParams {
     pub heat_diffusion: f64,
     /// Strength of winds driven by thermal pressure systems (monsoons, continental highs).
     pub thermal_wind: f64,
+    /// How far the tropical rain belt follows the summer heat of the continents
+    /// (0 = the same latitude all round the planet, 1 = fully: monsoons).
+    pub monsoon: f64,
     /// Fraction of upslope wind turned along the contours of steep terrain.
     pub mountain_blocking: f64,
     /// How strongly mountains hold back maritime air (1 = air coming down the
@@ -166,10 +180,14 @@ impl Default for ClimateParams {
             global_precip_mm: 1000.0,
             ocean_current_c: 5.0,
             maritime_reach_km: 1400.0,
+            continental_cooling: 12.0,
+            dry_heat: 1.0,
+            plateau_lapse_c_per_km: 4.5,
             orographic: 1.0,
             moisture_passes: 90,
             heat_diffusion: 0.68,
             thermal_wind: 1.0,
+            monsoon: 1.0,
             mountain_blocking: 0.7,
             sea_air_blocking: 1.0,
             foehn: 1.0,

@@ -222,7 +222,7 @@ pub(crate) fn unapplied(layer: &str, index: usize, s: &crate::edits::Stroke, rea
     serde_json::json!({ "layer": layer, "index": index, "tool": s.tool, "at": s.points.first(), "reason": reason })
 }
 
-pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 3, 2, 6, 7, 2, 6, 4, 7, 6, 7];
+pub const MODEL_VERSION: [u64; N_STEPS] = [1, 2, 3, 2, 7, 7, 2, 6, 4, 7, 6, 7];
 
 /// Cache keys: each step hashes only the inputs it actually reads, chained to
 /// the previous step's key, so a change only invalidates what depends on it.

@@ -1290,8 +1290,17 @@ fn orographic_rain_on_windward_slopes() {
         r[r.len() / 2]
     };
     let (g_wind, g_lee) = (gain(&windward), gain(&lee));
-    assert!(g_wind > 1.7, "windward slopes gain x{g_wind:.2}");
-    assert!(g_wind > g_lee + 0.35, "windward x{g_wind:.2} vs lee x{g_lee:.2}");
+    let median = |cells: &[usize], pa: &[f32]| {
+        let mut r: Vec<f32> = cells.iter().map(|&i| pa[i]).collect();
+        r.sort_by(|a, b| a.total_cmp(b));
+        r[r.len() / 2] as f64
+    };
+    // Windward slopes gain rain (some of it spills over the crest), and are
+    // clearly wetter than lee slopes and than the land at large.
+    assert!(g_wind > 1.2, "windward slopes gain x{g_wind:.2}");
+    assert!(g_wind > g_lee + 0.08, "windward x{g_wind:.2} vs lee x{g_lee:.2}");
+    let (wet, dry, all) = (median(&windward, &p1), median(&lee, &p1), median(&land, &p1));
+    assert!(wet > 1.35 * dry && wet > 1.5 * all, "windward {wet:.0} mm, lee {dry:.0} mm, all land {all:.0} mm");
     // The global total barely moves: orographic rain only moves rain around.
     let total = |pa: &[f32]| (0..n).map(|i| pa[i] as f64 * grid.area[i]).sum::<f64>();
     let ratio = total(&p1) / total(&p0);
@@ -1448,8 +1457,13 @@ fn culture_editor_and_locks() {
     let cb = culture_at(&mut w, pb[0]);
     let old_b = row(&w, cb)["name"].clone();
     edit(&mut w, Stroke { tool: Tool::CultureNewName, points: vec![pb[0]], ..Default::default() }).unwrap();
-    let target = *pb.last().unwrap();
-    edit(&mut w, Stroke { tool: Tool::CulturePaint, points: vec![pc[0], target], radius_km: 60.0, ..Default::default() }).unwrap();
+    // The brush must cover most of a province to repaint it, so pick B's smallest
+    // one (its least populous can be a vast polar province) and size the brush to it.
+    let areas: Vec<([f64; 2], f64)> = w.meta(Step::Provinces).unwrap()["table"]["provinces"].as_array().unwrap().iter().map(|r| (centres[&r["id"].as_u64().unwrap()], r["area_km2"].as_f64().unwrap())).collect();
+    let area_of = |ll: [f64; 2]| areas.iter().find(|x| x.0 == ll).unwrap().1;
+    let target = *pb.iter().skip(1).min_by(|x, y| area_of(**x).total_cmp(&area_of(**y))).unwrap();
+    let brush = (1.2 * (area_of(target) / std::f64::consts::PI).sqrt()).max(60.0);
+    edit(&mut w, Stroke { tool: Tool::CulturePaint, points: vec![pc[0], target], radius_km: brush, ..Default::default() }).unwrap();
     run(&mut w);
     assert_eq!(row(&w, daughter)["parent"].as_u64(), Some(c as u64), "re-parented under C");
     let bnow = culture_at(&mut w, pb[0]);

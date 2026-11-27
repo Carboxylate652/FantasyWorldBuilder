@@ -1,9 +1,11 @@
 //! Longitude-dependent surface winds for the climate step.
 //!
-//! The zonal three-cell belts (climate::wind_at) are the base flow. On top:
+//! The three-cell belts (climate::belt_wind, around the convergence line of
+//! each longitude sector) are the base flow. On top:
 //!
 //! * Thermal pressure: a surface-pressure anomaly p′ = −α·(T − zonal mean T),
 //!   so cold continents in winter become highs and hot ones in summer lows.
+//!   A cold anomaly counts half (COLD_HIGH): winter highs are shallow.
 //!   T is the sea-level temperature, with the land anomaly amplified by height:
 //!   an elevated surface heats or cools the air above it more than the free
 //!   atmosphere at that height, which makes plateaus heat lows in summer.
@@ -30,7 +32,9 @@ const ALPHA_HPA_PER_C: f64 = 1.0;
 /// Boundary-layer friction (1/s), about a one-day spin-down.
 const FRICTION: f64 = 2.5e-5;
 const RHO_AIR: f64 = 1.2;
-const MAX_THERMAL_MS: f64 = 20.0;
+const MAX_THERMAL_MS: f64 = 10.0;
+/// Pressure effect of a cold anomaly relative to a warm one.
+const COLD_HIGH: f64 = 0.5;
 
 /// Least-squares gradients in each cell's local east/north frame.
 pub struct Gradient {
@@ -162,7 +166,9 @@ pub fn dynamic_winds(
                 .map(|i| {
                     let a = t[i] as f64 - zmean[band(g.lat[i])];
                     let lift = 1.0 + 0.35 * (h[i] / 1000.0) * (1.0 - water_frac[i]);
-                    (-ALPHA_HPA_PER_C * a * lift) as f32
+                    // Cold air makes a shallow high that steers the wind less
+                    // than a heat low of the same strength.
+                    (-ALPHA_HPA_PER_C * a * lift * if a < 0.0 { COLD_HIGH } else { 1.0 }) as f32
                 })
                 .collect();
             // Smooth to synoptic scale.
