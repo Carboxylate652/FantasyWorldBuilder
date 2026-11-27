@@ -1564,7 +1564,10 @@ pub fn solve(ctx: &Ctx, elev_f: &[f32], water_f: &[u8]) -> StepOutput {
                 (0..nc)
                     .map(|i| {
                         let rain = 0.5 * precip[m][i] + 0.3 * precip[(m + 11) % 12][i] + 0.2 * precip[(m + 10) % 12][i];
-                        let demand = 4.0 + 5.0 * (t_sl[m][i] - drop_c[i] as f32).max(0.0);
+                        let t = (t_sl[m][i] - drop_c[i] as f32).max(0.0);
+                        // (Evaporation demand climbs steeply in heat: a hot month
+                        // can dry out 200 mm or more.)
+                        let demand = 4.0 + 5.0 * t + HOT_DEMAND * (t - 18.0).max(0.0).powi(2);
                         1.0 - smoothstep(0.05, 0.4, (rain / demand) as f64) as f32
                     })
                     .collect()
@@ -1761,6 +1764,8 @@ const STRAIT_KM: f64 = 120.0;
 const ENCLOSED_SEA_SHARE: f64 = 0.02;
 /// How readily an enclosed sea moistens the air, against the open ocean's 1.
 const ENCLOSED_SEA_EVAP: f64 = 0.15;
+/// Extra evaporation demand per (°C above 18)² in a month (mm), for dryness.
+const HOT_DEMAND: f32 = 1.0;
 /// Gyre currents, in units of *Coastal currents*: the warm western-boundary
 /// current (Gulf Stream, Kuroshio), the warm subpolar drift and the cold
 /// current down subpolar west coasts (Labrador, Oyashio).
